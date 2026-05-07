@@ -37,6 +37,7 @@ vi.mock('../../src/mcp/core/lbug-adapter.js', async (importOriginal) => {
 vi.mock('../../src/storage/repo-manager.js', () => ({
   listRegisteredRepos: vi.fn().mockResolvedValue([]),
   cleanupOldKuzuFiles: vi.fn().mockResolvedValue({ found: false, needsReindex: false }),
+  loadMeta: vi.fn().mockResolvedValue(null),
   findSiblingClones: vi.fn().mockResolvedValue([]),
 }));
 
@@ -67,6 +68,7 @@ import {
   isLbugReady,
   closeLbug,
 } from '../../src/mcp/core/lbug-adapter.js';
+import { checkStaleness } from '../../src/core/git-staleness.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -945,13 +947,41 @@ describe('LocalBackend.listRepos', () => {
     );
   });
 
-  it('re-reads registry on each listRepos call', async () => {
+  it('caches listRepos results until the backend refreshes', async () => {
     setupSingleRepo();
     await backend.init();
     await backend.callTool('list_repos', {});
     await backend.callTool('list_repos', {});
-    // listRegisteredRepos called: once in init, once per listRepos
-    expect(listRegisteredRepos).toHaveBeenCalledTimes(3);
+    // listRegisteredRepos called: once in init, once for first listRepos.
+    expect(listRegisteredRepos).toHaveBeenCalledTimes(2);
+    expect(checkStaleness).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes an existing listRepos cache when backend init runs again', async () => {
+    setupSingleRepo();
+    await backend.init();
+    const cachedRepos = await backend.callTool('list_repos', {});
+
+    (listRegisteredRepos as any).mockResolvedValue([
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'fresh-project',
+        path: 'C:\\work\\fresh-project',
+      },
+    ]);
+
+    expect(await backend.callTool('list_repos', {})).toEqual(cachedRepos);
+
+    await backend.init();
+    const refreshedRepos = await backend.callTool('list_repos', {});
+
+    expect(refreshedRepos).toHaveLength(1);
+    expect(refreshedRepos[0]).toEqual(
+      expect.objectContaining({
+        name: 'fresh-project',
+        path: 'C:\\work\\fresh-project',
+      }),
+    );
   });
 });
 

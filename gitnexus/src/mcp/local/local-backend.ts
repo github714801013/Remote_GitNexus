@@ -205,12 +205,25 @@ interface RepoHandle {
   stats?: RegistryEntry['stats'];
 }
 
+type ListRepoEntry = {
+  name: string;
+  path: string;
+  indexedAt: string;
+  lastCommit: string;
+  remoteUrl?: string;
+  branch?: string;
+  stats?: any;
+  staleness?: { commitsBehind: number; hint?: string };
+  siblings?: Array<{ name: string; path: string; lastCommit: string }>;
+};
+
 export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
   private contextCache: Map<string, CodebaseContext> = new Map();
   private initializedRepos: Set<string> = new Set();
   private reinitPromises: Map<string, Promise<void>> = new Map();
   private lastStalenessCheck: Map<string, number> = new Map();
+  private listReposCache: ListRepoEntry[] | null = null;
   private groupToolSvc: GroupService | null = null;
   /**
    * One-shot stderr warnings for sibling-clone drift, keyed by
@@ -250,6 +263,9 @@ export class LocalBackend {
    */
   async init(): Promise<boolean> {
     await this.refreshRepos();
+    if (this.listReposCache) {
+      await this.refreshListReposCache();
+    }
     return this.repos.size > 0;
   }
 
@@ -514,19 +530,15 @@ export class LocalBackend {
    *     that another clone of the same logical repo is registered).
    *   - `remoteUrl`: the canonical origin URL recorded at index time.
    */
-  async listRepos(): Promise<
-    Array<{
-      name: string;
-      path: string;
-      indexedAt: string;
-      lastCommit: string;
-      remoteUrl?: string;
-      branch?: string;
-      stats?: any;
-      staleness?: { commitsBehind: number; hint?: string };
-      siblings?: Array<{ name: string; path: string; lastCommit: string }>;
-    }>
-  > {
+  async listRepos(): Promise<ListRepoEntry[]> {
+    if (this.listReposCache) {
+      return this.listReposCache;
+    }
+
+    return this.refreshListReposCache();
+  }
+
+  async refreshListReposCache(): Promise<ListRepoEntry[]> {
     await this.refreshRepos();
     const handles = [...this.repos.values()];
 
@@ -545,7 +557,7 @@ export class LocalBackend {
       byRemote.set(h.remoteUrl, list);
     }
 
-    return handles.map((h) => {
+    const repos = handles.map((h) => {
       const stale = checkStaleness(h.repoPath, h.lastCommit);
       const selfNorm = norm(h.repoPath);
       const siblings = h.remoteUrl
@@ -581,6 +593,9 @@ export class LocalBackend {
             : undefined,
       };
     });
+
+    this.listReposCache = repos;
+    return repos;
   }
 
   /**

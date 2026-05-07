@@ -1278,10 +1278,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 });
               } else if (msg.type === 'complete') {
                 releaseRepoLock(analyzeLockKey);
-                // Reinitialize backend BEFORE marking complete — ensures the new
+                // Refresh backend repo cache BEFORE marking complete — ensures the new
                 // repo is queryable when the client receives the SSE complete event.
                 backend
-                  .init()
+                  .refreshListReposCache()
                   .then(() => {
                     jobManager.updateJob(job.id, {
                       status: 'complete',
