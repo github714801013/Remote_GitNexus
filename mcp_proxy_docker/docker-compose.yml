@@ -20,12 +20,30 @@ services:
           zoekt-git-index -index "$$INDEX_DIR" "$$repo_dir" 2>/dev/null || true
         }
 
-        # 启动时全量索引
+        # 清理已删除仓库的孤立 shard：shard 文件名含 URL 编码路径，
+        # 从 shard 名反推仓库路径，若目录不存在则删除对应 shard
+        prune_deleted_repos() {
+          for shard in "$$INDEX_DIR"/*.zoekt; do
+            [ -f "$$shard" ] || continue
+            # shard 文件名格式: <url-encoded-repo-path>_v<N>.<seq>.zoekt
+            encoded=$$(basename "$$shard" | sed 's/_v[0-9]*\.[0-9]*.zoekt$$//')
+            # URL 解码（%2F -> /）
+            repo_path=$$(printf '%b' "$$(echo "$$encoded" | sed 's/%/\\x/g')")
+            # repo_path 形如 code.9ji.com/group/repo，取最后两段作为本地路径
+            local_rel=$$(echo "$$repo_path" | sed 's|^[^/]*/||')
+            if [ -n "$$local_rel" ] && [ ! -d "$$REPOS_DIR/$$local_rel/.git" ]; then
+              rm -f "$$shard"
+            fi
+          done
+        }
+
+        # 启动时：先清理孤立 shard，再全量索引
+        prune_deleted_repos
         find "$$REPOS_DIR" -maxdepth 4 -name HEAD -path "*/.git/HEAD" | while read h; do
           index_repo "$$(dirname $$(dirname "$$h"))"
         done
 
-        # 持续监听触发文件，每 30 分钟兜底全量扫描
+        # 持续监听触发文件，每 30 分钟兜底全量扫描 + 清理
         last_full=$$(date +%s)
         while true; do
           find "$$TRIGGER_DIR" -maxdepth 1 -name "*.reindex" | while read t; do
@@ -36,6 +54,7 @@ services:
           done
           now=$$(date +%s)
           if [ $$((now - last_full)) -ge 1800 ]; then
+            prune_deleted_repos
             find "$$REPOS_DIR" -maxdepth 4 -name HEAD -path "*/.git/HEAD" | while read h; do
               index_repo "$$(dirname $$(dirname "$$h"))"
             done
