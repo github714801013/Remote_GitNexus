@@ -525,7 +525,10 @@ Configure endpoints via ZOEKT_ENDPOINTS (comma-separated) or ZOEKT_URL env vars.
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Search query (Zoekt syntax)' },
-        repo: { type: 'string', description: 'Restrict search to this Zoekt repo name' },
+        repo: {
+          type: 'string',
+          description: 'Restrict search to this Zoekt repo name. Omit to search all indexed repos.',
+        },
         regex: { type: 'boolean', description: 'Treat query as regex (prepends r: prefix)' },
         case_sensitive: { type: 'boolean', description: 'Case-sensitive search' },
         max_results: { type: 'number', description: 'Max file matches to return (default 50)' },
@@ -551,7 +554,10 @@ WHEN TO USE: Finding where a specific symbol is defined — more precise than fu
           enum: ['function', 'class', 'method', 'interface', 'all'],
           description: 'Symbol kind filter (default: all)',
         },
-        repo: { type: 'string', description: 'Restrict search to this Zoekt repo name' },
+        repo: {
+          type: 'string',
+          description: 'Restrict search to this Zoekt repo name. Omit to search all indexed repos.',
+        },
         max_results: { type: 'number', description: 'Max file matches to return (default 50)' },
       },
       required: ['symbol'],

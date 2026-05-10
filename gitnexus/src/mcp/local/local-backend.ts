@@ -666,6 +666,11 @@ export class LocalBackend {
       return this.handleGroupTool(method, params || {});
     }
 
+    // Zoekt tools are repo-optional: Zoekt searches all indexed repos when no
+    // repo filter is given, so they must bypass resolveRepo() entirely.
+    if (method === 'zoekt_search') return this.zoektSearch(params || {});
+    if (method === 'zoekt_symbol') return this.zoektSymbol(params || {});
+
     const p = params && typeof params === 'object' ? (params as Record<string, unknown>) : {};
     if (
       (method === 'impact' || method === 'query' || method === 'context') &&
@@ -708,10 +713,6 @@ export class LocalBackend {
         return this.toolMap(repo, params);
       case 'api_impact':
         return this.apiImpact(repo, params);
-      case 'zoekt_search':
-        return this.zoektSearch(params);
-      case 'zoekt_symbol':
-        return this.zoektSymbol(params);
       default:
         throw new Error(`Unknown tool: ${method}`);
     }
