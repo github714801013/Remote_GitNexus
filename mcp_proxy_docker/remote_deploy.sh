@@ -71,10 +71,14 @@ ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
     echo "启动辅助引擎 (vLLM)..."
     docker compose -f docker-compose-vllm.yml up -d
 
+    echo "停止并清理旧的独立容器 (如有)..."
+    docker stop -t 30 "${IMAGE_NAME}" 2>/dev/null || true
+    docker rm "${IMAGE_NAME}" 2>/dev/null || true
+
     echo "启动 GitNexus + Zoekt (docker compose)..."
     GITEA_TOKEN="${gitnexus_gitea_token}" \
     GITNEXUS_EMBEDDING_BATCH_SIZE="${GITNEXUS_EMBEDDING_BATCH_SIZE:-1}" \
-    docker compose -f docker-compose.yml up -d --remove-orphans
+    docker compose -f docker-compose.yml up -d
 
     echo "--- 执行自动验证 ---"
     python3 auto_verify.py
