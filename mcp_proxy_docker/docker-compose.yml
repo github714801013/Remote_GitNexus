@@ -1,35 +1,75 @@
 services:
-  mcp_proxy:
-    image: ${REMOTE_IMAGE:-gitnexus-mcp-proxy:latest}
-    build:
-      context: ..
-      dockerfile: mcp_proxy_docker/Dockerfile
-      args:
-        - VITE_BACKEND_URL=${VITE_BACKEND_URL:-http://localhost:4747}
+  # ─── Zoekt 全文索引服务 ────────────────────────────────────────────────────────
+  zoekt-indexserver:
+    image: sourcegraph/zoekt-indexserver:latest
+    container_name: zoekt-indexserver
+    volumes:
+      - /home/ji99/gitnexus:/repos:ro
+      - zoekt-index:/data/index
+    entrypoint:
+      - sh
+      - -c
+      - |
+        # 对 /repos 下所有 git 仓库建立 zoekt 索引，每 30 分钟增量更新
+        while true; do
+          find /repos -maxdepth 3 -name HEAD -path "*/.git/HEAD" | while read h; do
+            repo_dir=$$(dirname $$(dirname "$$h"))
+            repo_name=$$(echo "$$repo_dir" | sed 's|/repos/||')
+            zoekt-git-index -index /data/index -name "$$repo_name" "$$repo_dir" 2>/dev/null || true
+          done
+          sleep 1800
+        done
+    restart: always
+
+  zoekt-webserver:
+    image: sourcegraph/zoekt-webserver:latest
+    container_name: zoekt-webserver
+    ports:
+      - '6070:6070'
+    volumes:
+      - zoekt-index:/data/index:ro
+    command: ['-index', '/data/index', '-listen', ':6070']
+    depends_on:
+      - zoekt-indexserver
+    restart: always
+
+  # ─── GitNexus MCP 代理 ────────────────────────────────────────────────────────
+  gitnexus-mcp-proxy:
+    image: gitnexus-mcp-proxy:latest
     container_name: gitnexus-mcp-proxy
     ports:
-      - "1347:1347"
-      - "1348:1348"
-      - "1349:1349"
-      - "1350:1350"
-    environment:
-      - GITEA_SECRET=${GITEA_SECRET}
-      - GITEA_TOKEN=${GITEA_TOKEN}
-      - PROJECTS_ROOT=${PROJECTS_ROOT}
-      - HOME=/root
+      - '1347:1347'
+      - '1348:1348'
+      - '1349:1349'
+      - '1350:1350'
     volumes:
-      # Map host PROJECTS_ROOT to the SAME path in container
-      - ${PROJECTS_ROOT}:${PROJECTS_ROOT}
-      # Map host .gitnexus config/indices to the same path for persistence
-      - ${HOME}/.gitnexus:/root/.gitnexus
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+      - /home/ji99/gitnexus:/projects
+      - /home/ji99/Project/mcp_gitnexus_server/models:/app/models
+      - /home/ji99/.gitnexus:/root/.gitnexus
+      - /home/ji99/.lbdb:/root/.lbdb
+    environment:
+      - GITEA_TOKEN=${GITEA_TOKEN}
+      - INDEXING_CONCURRENCY=3
+      - GITNEXUS_EMBEDDING_URL=http://10.1.14.177:8001/v1
+      - GITNEXUS_INDEX_EMBEDDING_URL=http://10.1.14.177:8002/v1
+      - GITNEXUS_EMBEDDING_MODEL=Alibaba-NLP/gte-Qwen2-1.5B-instruct
+      - GITNEXUS_EMBEDDING_DIMS=1536
+      - GITNEXUS_EMBEDDING_TIMEOUT_MS=3600000
+      - GITNEXUS_EMBEDDING_BATCH_SIZE=${GITNEXUS_EMBEDDING_BATCH_SIZE:-1}
+      - GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS=3600000
+      - GITNEXUS_MAX_FILE_SIZE_BYTES=5242880
+      - GITNEXUS_MAX_PROCESSES=1000
+      - GITNEXUS_EMBEDDING_LIMIT=20000000
+      - GITNEXUS_ALLOW_REMOTE_MODELS=true
+      - ZOEKT_ENDPOINTS=http://zoekt-webserver:6070
+    depends_on:
+      - zoekt-webserver
+    stop_grace_period: 5m
+    restart: always
+
+volumes:
+  zoekt-index:
+    driver: local
 
 networks:
   default:

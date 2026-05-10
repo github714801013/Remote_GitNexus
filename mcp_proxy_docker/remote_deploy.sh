@@ -54,51 +54,28 @@ ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
         echo "WARN: ${IMAGE_NAME}:latest 不存在，跳过 meta.json 容器内备份"
     fi
 EOF
-scp "${TAR_FILE}" mcp_proxy_docker/auto_verify.py repos.json mcp_proxy_docker/docker-compose-vllm.yml "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/"
+scp "${TAR_FILE}" mcp_proxy_docker/auto_verify.py repos.json mcp_proxy_docker/docker-compose-vllm.yml mcp_proxy_docker/docker-compose.yml "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/"
 
 echo ""
 echo "=== 步骤 4: 远程部署与启动 ==="
 ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
     set -e
     cd "${REMOTE_PATH}"
-    
+
     echo "正在加载镜像..."
     gunzip -c "${TAR_FILE}" | docker load
-    
+
     echo "清理传输文件..."
     rm "${TAR_FILE}"
-
-    echo "停止旧容器..."
-    docker stop -t 30 "${IMAGE_NAME}" 2>/dev/null || true
-    docker rm "${IMAGE_NAME}" 2>/dev/null || true
 
     echo "启动辅助引擎 (vLLM)..."
     docker compose -f docker-compose-vllm.yml up -d
 
-    echo "启动主代理容器..."
-    docker run -d --name "${IMAGE_NAME}" \
-        --stop-timeout 300 \
-        -p 1347:1347 -p 1348:1348 -p 1349:1349 -p 1350:1350 \
-        -v /home/ji99/gitnexus:/projects \
-        -v "${REMOTE_PATH}/models:/app/models" \
-        -v "/home/ji99/.gitnexus:/root/.gitnexus" \
-        -v "/home/ji99/.lbdb:/root/.lbdb" \
-        --restart always \
-        -e GITEA_TOKEN="${gitnexus_gitea_token}" \
-        -e INDEXING_CONCURRENCY="3" \
-        -e GITNEXUS_EMBEDDING_URL="http://${REMOTE_HOST}:8001/v1" \
-        -e GITNEXUS_INDEX_EMBEDDING_URL="http://${REMOTE_HOST}:8002/v1" \
-        -e GITNEXUS_EMBEDDING_MODEL="Alibaba-NLP/gte-Qwen2-1.5B-instruct" \
-        -e GITNEXUS_EMBEDDING_DIMS="1536" \
-        -e GITNEXUS_EMBEDDING_TIMEOUT_MS="3600000" \
-        -e GITNEXUS_EMBEDDING_BATCH_SIZE="${GITNEXUS_EMBEDDING_BATCH_SIZE:-1}" \
-        -e GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS="3600000" \
-        -e GITNEXUS_MAX_FILE_SIZE_BYTES="5242880" \
-        -e GITNEXUS_MAX_PROCESSES="1000" \
-        -e GITNEXUS_EMBEDDING_LIMIT="20000000" \
-        -e GITNEXUS_ALLOW_REMOTE_MODELS="true" \
-        "${IMAGE_NAME}:latest"
-    
+    echo "启动 GitNexus + Zoekt (docker compose)..."
+    GITEA_TOKEN="${gitnexus_gitea_token}" \
+    GITNEXUS_EMBEDDING_BATCH_SIZE="${GITNEXUS_EMBEDDING_BATCH_SIZE:-1}" \
+    docker compose -f docker-compose.yml up -d --remove-orphans
+
     echo "--- 执行自动验证 ---"
     python3 auto_verify.py
 EOF
