@@ -26,6 +26,15 @@ def get_indexing_concurrency():
 def get_deferred_retry_delay():
     return int(os.getenv("GITNEXUS_DEFERRED_ANALYZE_RETRY_SECONDS", "60"))
 
+def _touch_zoekt_trigger(repo_path: str) -> None:
+    """在仓库目录写入触发文件，通知 zoekt-indexserver 对该仓库重新索引。"""
+    trigger = os.path.join(repo_path, ".zoekt-reindex")
+    try:
+        with open(trigger, "w") as f:
+            f.write("")
+    except Exception as e:
+        logger.debug(f"Failed to write zoekt trigger for {repo_path}: {e}")
+
 _concurrency = get_indexing_concurrency()
 _analyze_semaphore: asyncio.Semaphore = asyncio.Semaphore(_concurrency)
 _queued_repo_paths: set[str] = set()
@@ -73,6 +82,9 @@ async def run_guarded_analyze(repo_path: str, clone_url: Optional[str] = None, b
             logger.info(f"Indexing task started for {repo_path}")
             result = await asyncio.to_thread(run_analyze, repo_path, clone_url, branch)
             logger.info(f"Indexing task finished for {repo_path}")
+            # GitNexus 索引完成后通知 zoekt-indexserver 对该仓库重新索引
+            if result != DEFER_ANALYZE:
+                _touch_zoekt_trigger(repo_path)
     except Exception:
         logger.error(f"Indexing task failed for {repo_path}", exc_info=True)
     finally:

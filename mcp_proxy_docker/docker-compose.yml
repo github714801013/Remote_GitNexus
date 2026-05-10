@@ -4,20 +4,43 @@ services:
     image: sourcegraph/zoekt-indexserver:latest
     container_name: zoekt-indexserver
     volumes:
-      - /home/ji99/gitnexus:/repos:ro
+      - /home/ji99/gitnexus:/repos
       - zoekt-index:/data/index
     entrypoint:
       - sh
       - -c
       - |
-        # 对 /repos 下所有 git 仓库建立 zoekt 索引，每 30 分钟增量更新
+        INDEX_DIR=/data/index
+        REPOS_DIR=/repos
+
+        index_repo() {
+          repo_dir="$$1"
+          repo_name=$$(echo "$$repo_dir" | sed "s|$${REPOS_DIR}/||")
+          zoekt-git-index -index "$$INDEX_DIR" -name "$$repo_name" "$$repo_dir" 2>/dev/null || true
+          rm -f "$$repo_dir/.zoekt-reindex"
+        }
+
+        # 启动时全量索引
+        find "$$REPOS_DIR" -maxdepth 3 -name HEAD -path "*/.git/HEAD" | while read h; do
+          index_repo "$$(dirname $$(dirname "$$h"))"
+        done
+
+        # 持续监听触发文件，同时每 30 分钟全量扫描一次
+        last_full=0
         while true; do
-          find /repos -maxdepth 3 -name HEAD -path "*/.git/HEAD" | while read h; do
-            repo_dir=$$(dirname $$(dirname "$$h"))
-            repo_name=$$(echo "$$repo_dir" | sed 's|/repos/||')
-            zoekt-git-index -index /data/index -name "$$repo_name" "$$repo_dir" 2>/dev/null || true
+          # 检查触发文件
+          find "$$REPOS_DIR" -maxdepth 3 -name ".zoekt-reindex" | while read t; do
+            index_repo "$$(dirname "$$t")"
           done
-          sleep 1800
+          # 每 1800 秒全量扫描
+          now=$$(date +%s)
+          if [ $$((now - last_full)) -ge 1800 ]; then
+            find "$$REPOS_DIR" -maxdepth 3 -name HEAD -path "*/.git/HEAD" | while read h; do
+              index_repo "$$(dirname $$(dirname "$$h"))"
+            done
+            last_full=$$now
+          fi
+          sleep 5
         done
     restart: always
 
