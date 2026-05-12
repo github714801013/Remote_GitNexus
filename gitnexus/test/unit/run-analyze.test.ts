@@ -40,4 +40,34 @@ describe('run-analyze module', () => {
       ),
     ).toBe(true);
   });
+
+  it('inherits embedding generation when the existing index has embeddings', async () => {
+    const mod = await import('../../src/core/run-analyze.js');
+
+    expect(
+      mod.shouldGenerateEmbeddingsForAnalysis(
+        { stats: { embeddings: 42 } },
+        { embeddings: undefined },
+      ),
+    ).toBe(true);
+  });
+
+  it('does not generate embeddings by default for indexes without embeddings', async () => {
+    const mod = await import('../../src/core/run-analyze.js');
+
+    expect(
+      mod.shouldGenerateEmbeddingsForAnalysis(
+        { stats: { embeddings: 0 } },
+        { embeddings: undefined },
+      ),
+    ).toBe(false);
+  });
+
+  it('respects an explicit request to skip embeddings', async () => {
+    const mod = await import('../../src/core/run-analyze.js');
+
+    expect(
+      mod.shouldGenerateEmbeddingsForAnalysis({ stats: { embeddings: 42 } }, { embeddings: false }),
+    ).toBe(false);
+  });
 });

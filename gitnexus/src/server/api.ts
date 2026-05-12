@@ -1352,7 +1352,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             child.send({
               type: 'start',
               repoPath: targetPath,
-              options: { force: !!force, embeddings: !!embeddings },
+              options: {
+                force: !!force,
+                embeddings: embeddings === undefined ? undefined : !!embeddings,
+              },
             });
           };
 

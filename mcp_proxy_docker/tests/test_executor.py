@@ -40,6 +40,35 @@ def test_run_analyze_runs_structure_first_then_starts_embedding_phase(monkeypatc
     assert started_embedding
 
 
+def test_run_analyze_sets_configurable_node_heap(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".gitnexus").mkdir()
+
+    analyze_env = {}
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["git", "rev-parse"]:
+            return SimpleNamespace(returncode=0, stdout="new\n", stderr="")
+        if cmd[:2] == ["node", executor.GITNEXUS_BIN] and "analyze" in cmd:
+            analyze_env.update(kwargs["env"])
+            return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("GITNEXUS_ANALYZE_MAX_OLD_SPACE_MB", "24576")
+    monkeypatch.setattr(executor.subprocess, "run", fake_run)
+    monkeypatch.setattr(executor, "_start_embedding_phase", lambda *_args: None)
+
+    assert executor.run_analyze(str(repo), branch="main") is True
+    assert "--max-old-space-size=24576" in analyze_env["NODE_OPTIONS"]
+
+
+def test_node_heap_env_preserves_existing_heap_setting():
+    env = {"NODE_OPTIONS": "--trace-warnings --max-old-space-size=32768"}
+
+    assert executor._with_node_heap_env(env)["NODE_OPTIONS"] == "--trace-warnings --max-old-space-size=32768"
+
+
 def test_run_analyze_does_not_start_embedding_phase_when_structure_fails(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     (repo / ".git").mkdir(parents=True)

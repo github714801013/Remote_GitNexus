@@ -134,6 +134,13 @@ export function shouldReturnAlreadyUpToDate(
   return true;
 }
 
+export function shouldGenerateEmbeddingsForAnalysis(
+  existingMeta: ExistingAnalyzeMeta | null | undefined,
+  options: Pick<AnalyzeOptions, 'embeddings'>,
+): boolean {
+  return options.embeddings ?? (existingMeta?.stats?.embeddings ?? 0) > 0;
+}
+
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
 const EMBEDDING_NODE_LIMIT = process.env.GITNEXUS_EMBEDDING_LIMIT
   ? parseInt(process.env.GITNEXUS_EMBEDDING_LIMIT, 10)
@@ -191,9 +198,15 @@ export async function runFullAnalysis(
   const repoHasGit = hasGitDir(repoPath);
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
   const existingMeta = await loadMeta(storagePath);
+  const shouldGenerateEmbeddings = shouldGenerateEmbeddingsForAnalysis(existingMeta, options);
 
   // ── Early-return: already up to date ──────────────────────────────
-  if (shouldReturnAlreadyUpToDate(existingMeta, currentCommit, options)) {
+  if (
+    shouldReturnAlreadyUpToDate(existingMeta, currentCommit, {
+      ...options,
+      embeddings: shouldGenerateEmbeddings,
+    })
+  ) {
     return {
       repoName: options.registryName ?? getInferredRepoName(repoPath) ?? path.basename(repoPath),
       repoPath,
@@ -206,7 +219,7 @@ export async function runFullAnalysis(
   let cachedEmbeddingNodeIds = new Set<string>();
   let cachedEmbeddings: CachedEmbedding[] = [];
 
-  if (options.embeddings && existingMeta && !options.force) {
+  if (shouldGenerateEmbeddings && existingMeta) {
     try {
       progress('embeddings', 0, 'Caching embeddings...');
       await initLbug(lbugPath);
@@ -298,7 +311,7 @@ export async function runFullAnalysis(
     const stats = await getLbugStats();
     let embeddingSkipped = true;
 
-    if (options.embeddings) {
+    if (shouldGenerateEmbeddings) {
       if (stats.nodes <= EMBEDDING_NODE_LIMIT) {
         embeddingSkipped = false;
       }

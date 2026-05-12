@@ -13,6 +13,16 @@ logger = logging.getLogger("mcp_proxy.executor")
 GITNEXUS_BIN = "/app/gitnexus/dist/gitnexus/src/cli/index.js"
 EMBEDDING_LOG_FILE = "/app/mcp_proxy/logs/gitnexus_embedding_phase.log"
 DEFER_ANALYZE = "deferred"
+DEFAULT_ANALYZE_MAX_OLD_SPACE_MB = "16384"
+
+def _with_node_heap_env(env: dict) -> dict:
+    node_options = env.get("NODE_OPTIONS", "")
+    if "--max-old-space-size" in node_options:
+        return env
+
+    heap_mb = env.get("GITNEXUS_ANALYZE_MAX_OLD_SPACE_MB", DEFAULT_ANALYZE_MAX_OLD_SPACE_MB)
+    env["NODE_OPTIONS"] = f"{node_options} --max-old-space-size={heap_mb}".strip()
+    return env
 
 def _is_lock_error(message: str) -> bool:
     return "Could not set lock" in message or "lock" in message.lower()
@@ -297,7 +307,7 @@ def run_analyze(repo_path: str, git_url: Optional[str] = None, branch: Optional[
             gitnexus_bin = GITNEXUS_BIN
 
             # EXPLICITLY pass proxy env vars to ensure fetch works in container runtime
-            env = os.environ.copy()
+            env = _with_node_heap_env(os.environ.copy())
             if os.getenv("https_proxy"):
                 env["HTTPS_PROXY"] = os.getenv("https_proxy")
             if os.getenv("http_proxy"):
