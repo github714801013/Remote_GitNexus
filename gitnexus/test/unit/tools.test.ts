@@ -96,6 +96,20 @@ describe('GITNEXUS_TOOLS', () => {
     }
   });
 
+  it('documents Zoekt repo as an optional narrowing filter, not a multi-repo requirement', () => {
+    const listReposTool = GITNEXUS_TOOLS.find((t) => t.name === 'list_repos')!;
+    expect(listReposTool.description).toContain('Exception: zoekt_search and zoekt_symbol');
+    expect(listReposTool.description).toContain('omit "repo" to search all indexed repositories');
+
+    for (const name of ['zoekt_search', 'zoekt_symbol'] as const) {
+      const tool = GITNEXUS_TOOLS.find((t) => t.name === name)!;
+      expect(tool.description).toContain('GLOBAL BY DEFAULT');
+      expect(tool.description).toContain('The graph-tool multi-repo rule does not apply here');
+      expect(tool.inputSchema.properties.repo.description).toContain('Optional filter');
+      expect(tool.inputSchema.required).not.toContain('repo');
+    }
+  });
+
   it('group tools without backend repo param omit repo property', () => {
     for (const name of ['group_list', 'group_sync'] as const) {
       const tool = GITNEXUS_TOOLS.find((t) => t.name === name)!;

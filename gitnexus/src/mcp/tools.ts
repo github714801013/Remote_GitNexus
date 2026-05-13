@@ -37,8 +37,13 @@ Returns each repo's name, path, branch, indexed date, last commit, and stats.
 WHEN TO USE: First step when multiple repos are indexed, or to discover available repos.
 AFTER THIS: READ gitnexus://repo/{name}/context for the repo you want to work with.
 
-When multiple repos are indexed, you MUST specify the "repo" parameter
-on other tools (query, context, impact, etc.) to target the correct one.`,
+When multiple repos are indexed, graph-backed tools must specify "repo"
+to target the correct one (query, context, impact, cypher, detect_changes,
+rename, route_map, etc.).
+
+Exception: zoekt_search and zoekt_symbol are global search tools. For Zoekt,
+omit "repo" to search all indexed repositories; set "repo" only when you
+intentionally want to narrow results to one Zoekt repository.`,
     inputSchema: {
       type: 'object',
       properties: {},
@@ -547,7 +552,7 @@ WHEN TO USE: After changing group.yaml or re-indexing member repos.`,
 
 WHEN TO USE: Finding code by content — literal strings, regex patterns, or language-filtered searches. Faster and more precise than semantic search for exact matches.
 
-**repo is OPTIONAL** — omit it to search ALL indexed repos at once. Only set repo when you want to restrict results to a specific repository.
+GLOBAL BY DEFAULT: omit "repo" to search ALL indexed repos at once. The graph-tool multi-repo rule does not apply here. Only set repo when you want to restrict results to a specific Zoekt repository.
 
 Supports Zoekt query syntax:
   - Literal: \`handleError\`
@@ -569,7 +574,8 @@ Configure endpoints via ZOEKT_ENDPOINTS (comma-separated) or ZOEKT_URL env vars.
         query: { type: 'string', description: 'Search query (Zoekt syntax)' },
         repo: {
           type: 'string',
-          description: 'Restrict search to this Zoekt repo name. Omit to search all indexed repos.',
+          description:
+            'Optional filter. Restrict search to this Zoekt repo name only when intentionally narrowing results; omit to search all indexed repos.',
         },
         regex: { type: 'boolean', description: 'Treat query as regex (prepends r: prefix)' },
         case_sensitive: { type: 'boolean', description: 'Case-sensitive search' },
@@ -588,7 +594,7 @@ Configure endpoints via ZOEKT_ENDPOINTS (comma-separated) or ZOEKT_URL env vars.
 
 WHEN TO USE: Finding where a specific symbol is defined — more precise than full-text search for symbol names.
 
-**repo is OPTIONAL** — omit it to search ALL indexed repos at once. Only set repo when you want to restrict results to a specific repository.`,
+GLOBAL BY DEFAULT: omit "repo" to search ALL indexed repos at once. The graph-tool multi-repo rule does not apply here. Only set repo when you want to restrict results to a specific Zoekt repository.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -600,7 +606,8 @@ WHEN TO USE: Finding where a specific symbol is defined — more precise than fu
         },
         repo: {
           type: 'string',
-          description: 'Restrict search to this Zoekt repo name. Omit to search all indexed repos.',
+          description:
+            'Optional filter. Restrict search to this Zoekt repo name only when intentionally narrowing results; omit to search all indexed repos.',
         },
         max_results: { type: 'number', description: 'Max file matches to return (default 50)' },
       },
