@@ -558,11 +558,11 @@ WHEN TO USE: After changing group.yaml or re-indexing member repos.`,
   },
   {
     name: 'zoekt_search',
-    description: `Full-text and regex search across indexed repositories using Zoekt.
+    description: `[FALLBACK TOOL] Full-text and regex search across indexed repositories using Zoekt.
 
-LOW PRIORITY / FALLBACK: The 'query' tool already integrates Zoekt internally and is the preferred search entry point. Use zoekt_search only as a final fallback when 'query' fails to find specific code, or when you need advanced regex/language filters not available in 'query'.
+NOTE: This is a fallback alternative to the 'query' tool. The 'query' tool already integrates Zoekt internally, supports smart multi-repo discovery, and is the preferred search entry point.
 
-WHEN TO USE: Finding code by content — literal strings, regex patterns, or language-filtered searches. Faster and more precise than semantic search for exact matches. Use it as a precise locator, then inspect matches with code_snippet or understand symbols with context().
+WHEN TO USE: ONLY use 'zoekt_search' when 'query' fails to find specific code, or when you explicitly need advanced regex/language filters not available in 'query'. Best for finding exact literal strings, regex patterns, or language-filtered searches. Use it as a precise locator, then inspect matches with code_snippet or understand symbols with context().
 
 GLOBAL BY DEFAULT: omit "repo" to search ALL indexed repos at once. The graph-tool multi-repo rule does not apply here. Only set repo when you want to restrict results to a specific Zoekt repository.
 
@@ -605,11 +605,11 @@ Configure endpoints via ZOEKT_ENDPOINTS (comma-separated) or ZOEKT_URL env vars.
   },
   {
     name: 'zoekt_symbol',
-    description: `Precise symbol search (functions, classes, methods, interfaces) using Zoekt ctags index.
+    description: `[FALLBACK TOOL] Precise symbol search (functions, classes, methods, interfaces) using Zoekt ctags index.
 
-LOW PRIORITY / FALLBACK: The 'query' tool already integrates Zoekt internally and is the preferred search entry point. Use zoekt_symbol only as a final fallback when 'query' or 'context' fails to find a specific symbol across the entire multi-repo setup.
+NOTE: This is a fallback alternative to the 'query' and 'context' tools. The 'query' tool already integrates Zoekt internally, supports smart multi-repo discovery, and is the preferred search entry point.
 
-WHEN TO USE: Finding where a specific symbol is defined — more precise than full-text search for symbol names.
+WHEN TO USE: ONLY use 'zoekt_symbol' when 'query' or 'context' fails to find a specific symbol across the entire multi-repo setup. Best for finding where a specific symbol is defined when other tools fail.
 
 GLOBAL BY DEFAULT: omit "repo" to search ALL indexed repos at once. The graph-tool multi-repo rule does not apply here. Only set repo when you want to restrict results to a specific Zoekt repository.`,
     inputSchema: {
