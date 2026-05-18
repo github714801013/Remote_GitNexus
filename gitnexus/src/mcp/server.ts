@@ -84,7 +84,7 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
  * Create a configured MCP Server with all handlers registered.
  * Transport-agnostic — caller connects the desired transport.
  */
-export function createMCPServer(backend: LocalBackend): Server {
+export function createMCPServer(backend: LocalBackend, projectWhitelist?: string[]): Server {
   const require = createRequire(import.meta.url);
   const pkgVersion: string = require('../../package.json').version;
   const server = new Server(
@@ -101,11 +101,34 @@ export function createMCPServer(backend: LocalBackend): Server {
     },
   );
 
+  // Normalize whitelist for efficient lookups (case-insensitive)
+  const whitelist = projectWhitelist
+    ?.map((p) => p.trim().toLowerCase())
+    .filter((p) => p.length > 0);
+  const isWhitelisted = (name: string, id?: string, path?: string) => {
+    if (!whitelist || whitelist.length === 0) return true;
+    const n = name.toLowerCase();
+    const i = id?.toLowerCase();
+    const p = path?.toLowerCase();
+    return (
+      whitelist.includes(n) ||
+      (i && whitelist.includes(i)) ||
+      (p && (whitelist.includes(p) || (p.startsWith('/') && whitelist.includes(p.substring(1)))))
+    );
+  };
+
   // Handle list resources request
   server.setRequestHandler(ListResourcesRequestSchema, async () => {
     const resources = getResourceDefinitions();
+    // Filter resources by repo whitelist if present
+    const filtered = resources.filter((r) => {
+      // Resource URIs are gitnexus://repo/{name}/...
+      const match = r.uri.match(/^gitnexus:\/\/repo\/([^/]+)/);
+      if (!match) return true;
+      return isWhitelisted(match[1]);
+    });
     return {
-      resources: resources.map((r) => ({
+      resources: filtered.map((r) => ({
         uri: r.uri,
         name: r.name,
         description: r.description,
@@ -130,6 +153,20 @@ export function createMCPServer(backend: LocalBackend): Server {
   // Handle read resource request
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     const { uri } = request.params;
+
+    // Security: block reading resources for non-whitelisted repos
+    const match = uri.match(/^gitnexus:\/\/repo\/([^/]+)/);
+    if (match && !isWhitelisted(match[1])) {
+      return {
+        contents: [
+          {
+            uri,
+            mimeType: 'text/plain',
+            text: `Error: Access to repository '${match[1]}' is restricted.`,
+          },
+        ],
+      };
+    }
 
     try {
       const content = await readResource(uri, backend);
@@ -168,9 +205,62 @@ export function createMCPServer(backend: LocalBackend): Server {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
+    // Security: block tool calls targeting non-whitelisted repos
+    const targetRepo = (args as any)?.repo;
+    if (typeof targetRepo === 'string' && targetRepo.length > 0 && !targetRepo.startsWith('@')) {
+      if (!isWhitelisted(targetRepo)) {
+        throw new Error(`Access to repository '${targetRepo}' is restricted.`);
+      }
+    }
+
     try {
-      const result = await backend.callTool(name, args);
-      const resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+      // Inject whitelist into tool params if it's a multi-repo search tool
+      const toolParams = whitelist ? { ...args, head: whitelist } : args;
+
+      const result = await backend.callTool(name, toolParams);
+
+      // Recursive filter to remove any mention of non-whitelisted repos in results
+      const filterResult = (val: any): any => {
+        if (!whitelist || whitelist.length === 0) return val;
+        if (Array.isArray(val)) {
+          // Special case: list_repos output is an array of repo objects
+          if (name === 'list_repos') {
+            return val.filter((r) => isWhitelisted(r.name, r.id, r.path)).map(filterResult);
+          }
+          return val.map(filterResult).filter((v) => v !== undefined);
+        }
+        if (val && typeof val === 'object') {
+          // If the object has a 'repo' or 'name' field that looks like a repository, check it
+          // This is a heuristic to prevent leaks in complex objects
+          const rName = val.repo || val.name;
+          const rId = val.id;
+          const rPath = val.path || val.repoPath;
+
+          if (typeof rName === 'string' && rName.length > 0 && !rName.startsWith('@')) {
+            // If it's a repository-defining object and it's not whitelisted, redact or skip
+            if (!isWhitelisted(rName, rId, rPath)) {
+              return undefined;
+            }
+          }
+
+          const newObj: any = {};
+          for (const [key, value] of Object.entries(val)) {
+            const filtered = filterResult(value);
+            if (filtered !== undefined) {
+              newObj[key] = filtered;
+            }
+          }
+          return newObj;
+        }
+        return val;
+      };
+
+      const processedResult = filterResult(result);
+
+      const resultText =
+        typeof processedResult === 'string'
+          ? processedResult
+          : JSON.stringify(processedResult, null, 2);
       const hint = getNextStepHint(name, args as Record<string, any> | undefined);
 
       return {
