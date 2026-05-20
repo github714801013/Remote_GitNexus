@@ -38,14 +38,23 @@ export function mountMCPEndpoints(app: Express, backend: LocalBackend): () => Pr
     const sessionId = transport.sessionId;
     transports.set(sessionId, transport);
 
+    const protocolOnClose = transport.onclose;
+    let closed = false;
     transport.onclose = () => {
+      if (closed) return;
+      closed = true;
       transports.delete(sessionId);
-      void server.close();
+      protocolOnClose?.();
     };
   });
 
   app.post('/api/mcp/messages', async (req: Request, res: Response) => {
-    const sessionId = req.query.sessionId as string;
+    const sessionId = req.query.sessionId;
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      res.status(400).send('Missing sessionId');
+      return;
+    }
+
     const transport = transports.get(sessionId);
 
     if (!transport) {
@@ -57,9 +66,9 @@ export function mountMCPEndpoints(app: Express, backend: LocalBackend): () => Pr
   });
 
   const cleanup = async () => {
-    const closers = [...transports.values()].map((t) => t.close());
+    const activeTransports = [...transports.values()];
     transports.clear();
-    await Promise.allSettled(closers);
+    await Promise.allSettled(activeTransports.map((t) => t.close()));
   };
 
   console.log('Standard MCP SSE endpoints mounted at /sse and /api/mcp/messages');

@@ -26,6 +26,7 @@ import {
   listRegisteredRepos,
   cleanupOldKuzuFiles,
   loadMeta,
+  getGlobalRegistryPath,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
 import { GroupService, type GroupToolPort } from '../../core/group/service.js';
@@ -242,6 +243,7 @@ export class LocalBackend {
   private reinitPromises: Map<string, Promise<void>> = new Map();
   private lastStalenessCheck: Map<string, number> = new Map();
   private listReposCache: ListRepoEntry[] | null = null;
+  private listReposCacheRegistryMtimeMs: number | null = null;
   private groupToolSvc: GroupService | null = null;
   /**
    * One-shot stderr warnings for sibling-clone drift, keyed by
@@ -548,9 +550,20 @@ export class LocalBackend {
    *     that another clone of the same logical repo is registered).
    *   - `remoteUrl`: the canonical origin URL recorded at index time.
    */
+  private async getRegistryMtimeMs(): Promise<number | null> {
+    try {
+      return (await fs.stat(getGlobalRegistryPath())).mtimeMs;
+    } catch {
+      return null;
+    }
+  }
+
   async listRepos(): Promise<ListRepoEntry[]> {
     if (this.listReposCache) {
-      return this.listReposCache;
+      const registryMtimeMs = await this.getRegistryMtimeMs();
+      if (registryMtimeMs === null || registryMtimeMs === this.listReposCacheRegistryMtimeMs) {
+        return this.listReposCache;
+      }
     }
 
     return this.refreshListReposCache();
@@ -613,6 +626,7 @@ export class LocalBackend {
     });
 
     this.listReposCache = repos;
+    this.listReposCacheRegistryMtimeMs = await this.getRegistryMtimeMs();
     return repos;
   }
 

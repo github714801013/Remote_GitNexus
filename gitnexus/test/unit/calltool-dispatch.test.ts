@@ -8,6 +8,7 @@
  * the dispatch and error handling logic in isolation.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import fs from 'fs/promises';
 
 // We need to mock the LadybugDB adapter and repo-manager BEFORE importing LocalBackend.
 // local-backend.ts imports from core/lbug/pool-adapter.js; the mcp/core/lbug-adapter.js
@@ -34,11 +35,23 @@ vi.mock('../../src/mcp/core/lbug-adapter.js', async (importOriginal) => {
   return { ...actual, ...lbugMocks };
 });
 
+vi.mock('fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs/promises')>();
+  return {
+    ...actual,
+    default: {
+      ...actual,
+      stat: vi.fn().mockResolvedValue({ mtimeMs: 1 }),
+    },
+  };
+});
+
 vi.mock('../../src/storage/repo-manager.js', () => ({
   listRegisteredRepos: vi.fn().mockResolvedValue([]),
   cleanupOldKuzuFiles: vi.fn().mockResolvedValue({ found: false, needsReindex: false }),
   loadMeta: vi.fn().mockResolvedValue(null),
   findSiblingClones: vi.fn().mockResolvedValue([]),
+  getGlobalRegistryPath: vi.fn().mockReturnValue('/tmp/.gitnexus/registry.json'),
 }));
 
 // `core/git-staleness` is also imported by `local-backend.ts` (for
@@ -60,7 +73,11 @@ vi.mock('../../src/mcp/core/embedder.js', () => ({
 }));
 
 import { LocalBackend } from '../../src/mcp/local/local-backend.js';
-import { listRegisteredRepos, cleanupOldKuzuFiles } from '../../src/storage/repo-manager.js';
+import {
+  listRegisteredRepos,
+  cleanupOldKuzuFiles,
+  loadMeta,
+} from '../../src/storage/repo-manager.js';
 import {
   initLbug,
   executeQuery,
@@ -159,6 +176,7 @@ describe('LocalBackend.callTool', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    vi.mocked(fs.stat).mockResolvedValue({ mtimeMs: 1 } as any);
     backend = new LocalBackend();
     setupSingleRepo();
     await backend.init();
@@ -684,6 +702,7 @@ describe('LocalBackend.resolveRepo', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    vi.mocked(fs.stat).mockResolvedValue({ mtimeMs: 1 } as any);
     backend = new LocalBackend();
   });
 
@@ -807,6 +826,7 @@ describe('LocalBackend.getContext', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    vi.mocked(fs.stat).mockResolvedValue({ mtimeMs: 1 } as any);
     backend = new LocalBackend();
     setupSingleRepo();
     await backend.init();
@@ -844,6 +864,7 @@ describe('ensureInitialized', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    vi.mocked(fs.stat).mockResolvedValue({ mtimeMs: 1 } as any);
     backend = new LocalBackend();
     setupSingleRepo();
     await backend.init();
@@ -880,6 +901,7 @@ describe('callTool cypher write blocking', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    vi.mocked(fs.stat).mockResolvedValue({ mtimeMs: 1 } as any);
     backend = new LocalBackend();
     setupSingleRepo();
     await backend.init();
@@ -922,6 +944,7 @@ describe('LocalBackend.listRepos', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    vi.mocked(fs.stat).mockResolvedValue({ mtimeMs: 1 } as any);
     backend = new LocalBackend();
   });
 
@@ -955,6 +978,49 @@ describe('LocalBackend.listRepos', () => {
     // listRegisteredRepos called: once in init, once for first listRepos.
     expect(listRegisteredRepos).toHaveBeenCalledTimes(2);
     expect(checkStaleness).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes listRepos cache when registry mtime changes', async () => {
+    setupSingleRepo();
+    await backend.init();
+    const cachedRepos = await backend.callTool('list_repos', {});
+
+    (listRegisteredRepos as any).mockResolvedValue([
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'fresh-project',
+        path: '/tmp/fresh-project',
+      },
+    ]);
+    vi.mocked(fs.stat).mockResolvedValue({ mtimeMs: 2 } as any);
+
+    const refreshedRepos = await backend.callTool('list_repos', {});
+
+    expect(refreshedRepos).not.toEqual(cachedRepos);
+    expect(refreshedRepos).toHaveLength(1);
+    expect(refreshedRepos[0]).toEqual(
+      expect.objectContaining({
+        name: 'fresh-project',
+        path: '/tmp/fresh-project',
+      }),
+    );
+  });
+
+  it('returns cached listRepos results when registry stat fails', async () => {
+    setupSingleRepo();
+    await backend.init();
+    const cachedRepos = await backend.callTool('list_repos', {});
+
+    (listRegisteredRepos as any).mockResolvedValue([
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'fresh-project',
+        path: '/tmp/fresh-project',
+      },
+    ]);
+    vi.mocked(fs.stat).mockRejectedValue(Object.assign(new Error('missing'), { code: 'ENOENT' }));
+
+    expect(await backend.callTool('list_repos', {})).toEqual(cachedRepos);
   });
 
   it('refreshes an existing listRepos cache when backend init runs again', async () => {
@@ -992,6 +1058,7 @@ describe('cypher tool LadybugDB not ready', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    vi.mocked(fs.stat).mockResolvedValue({ mtimeMs: 1 } as any);
     backend = new LocalBackend();
     setupSingleRepo();
     await backend.init();
@@ -1022,6 +1089,7 @@ describe('cypher result formatting', () => {
     // Full reset of all mocks to prevent state leaking from other tests
     vi.resetAllMocks();
     (listRegisteredRepos as any).mockResolvedValue([MOCK_REPO_ENTRY]);
+    (loadMeta as any).mockResolvedValue(null);
     (cleanupOldKuzuFiles as any).mockResolvedValue({ found: false, needsReindex: false });
     (initLbug as any).mockResolvedValue(undefined);
     (isLbugReady as any).mockReturnValue(true);
