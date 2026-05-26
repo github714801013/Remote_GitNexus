@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { JobManager } from '../../src/server/analyze-job.js';
 import {
+  isRepoAlreadyActiveError,
   isRepairableIndexError,
+  shouldScheduleStartupIncrementalAnalyze,
   shouldScheduleStartupEmbeddings,
   shouldTreatAnalyzeWorkerExitAsCrash,
 } from '../../src/server/api.js';
@@ -98,11 +100,28 @@ describe('analyze API logic', () => {
     );
   });
 
+  it('classifies active repository analyze locks as skippable webhook conflicts', () => {
+    expect(
+      isRepoAlreadyActiveError(new Error('Another job is already active for this repository')),
+    ).toBe(true);
+    expect(isRepoAlreadyActiveError(new Error('Worker crashed'))).toBe(false);
+  });
+
   it('schedules startup embeddings only for indexed repos without vectors', () => {
     expect(shouldScheduleStartupEmbeddings({ stats: { nodes: 10, embeddings: 0 } })).toBe(true);
     expect(shouldScheduleStartupEmbeddings({ stats: { nodes: 10 } })).toBe(true);
     expect(shouldScheduleStartupEmbeddings({ stats: { nodes: 10, embeddings: 3 } })).toBe(false);
     expect(shouldScheduleStartupEmbeddings({ stats: { nodes: 0, embeddings: 0 } })).toBe(false);
     expect(shouldScheduleStartupEmbeddings(null)).toBe(false);
+  });
+
+  it('schedules startup incremental analyze only when the index is behind HEAD', () => {
+    expect(shouldScheduleStartupIncrementalAnalyze({ isStale: true, commitsBehind: 2 })).toBe(true);
+    expect(shouldScheduleStartupIncrementalAnalyze({ isStale: true, commitsBehind: 0 })).toBe(
+      false,
+    );
+    expect(shouldScheduleStartupIncrementalAnalyze({ isStale: false, commitsBehind: 0 })).toBe(
+      false,
+    );
   });
 });

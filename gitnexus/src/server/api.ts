@@ -48,6 +48,7 @@ import { ensureCocoaPodsDependencies } from './cocoapods.js';
 import { extractRepoName, getCloneDir, cloneOrPull, cloneOrResetToBranch } from './git-clone.js';
 import { cleanCorruptedLbugAfterCrash } from './crash-lbug-cleanup.js';
 import { WebhookAnalyzeQueue } from './webhook-analyze-queue.js';
+import { checkStaleness, type StalenessInfo } from '../core/git-staleness.js';
 import {
   WebhookWorktreeError,
   assertEnvAllowed,
@@ -69,6 +70,10 @@ const pkg = _require('../../package.json');
 const DEFAULT_WEBHOOK_ANALYZE_CONCURRENCY = 1;
 const MEMORY_PROGRESS_PREFIX = '[memory] ';
 const PROJECT_DISCOVERY_MAX_DEPTH = 4;
+const REPO_ALREADY_ACTIVE_MESSAGE = 'Another job is already active for this repository';
+
+export const isRepoAlreadyActiveError = (err: unknown): boolean =>
+  String(err instanceof Error ? err.message : err).includes(REPO_ALREADY_ACTIVE_MESSAGE);
 
 export const isRepairableIndexError = (err: unknown): boolean => {
   const msg = String(err instanceof Error ? err.message : err).toLowerCase();
@@ -90,6 +95,10 @@ export const shouldScheduleStartupEmbeddings = (
   const embeddings = meta?.stats?.embeddings ?? 0;
   return nodes > 0 && embeddings <= 0;
 };
+
+export const shouldScheduleStartupIncrementalAnalyze = (
+  staleness: Pick<StalenessInfo, 'isStale' | 'commitsBehind'>,
+): boolean => staleness.isStale && staleness.commitsBehind > 0;
 
 const pathExists = async (targetPath: string): Promise<boolean> =>
   fs.access(targetPath).then(
@@ -618,7 +627,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   const acquireRepoLock = (repoPath: string): string | null => {
     if (activeRepoPaths.has(repoPath)) {
-      return `Another job is already active for this repository`;
+      return REPO_ALREADY_ACTIVE_MESSAGE;
     }
     activeRepoPaths.add(repoPath);
     return null;
@@ -802,7 +811,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       run: async () => {
         const lockKey = getStoragePath(repoPath);
         const lockErr = acquireRepoLock(lockKey);
-        if (lockErr) throw new Error(lockErr);
+        if (lockErr) {
+          const err = new Error(lockErr);
+          if (isRepoAlreadyActiveError(err)) {
+            console.info(`[webhook] analyze skipped active repoPath=${resolvedRepoPath}`);
+            return;
+          }
+          throw err;
+        }
         try {
           await beforeAnalyze?.();
           await ensureCocoaPodsDependencies(repoPath);
@@ -909,6 +925,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const lbugPath = path.join(entry.storagePath, 'lbug');
       const meta = await loadMeta(entry.storagePath);
       const needsEmbeddings = shouldScheduleStartupEmbeddings(meta);
+      const staleness = checkStaleness(repoPath, entry.lastCommit);
       try {
         await initPooledLbug(entry.name, lbugPath);
         await closePooledLbug(entry.name);
@@ -934,6 +951,26 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         });
         queued.done.catch((analyzeErr) => {
           console.error(`[webhook] startup index repair failed for ${entry.name}:`, analyzeErr);
+        });
+        continue;
+      }
+
+      if (shouldScheduleStartupIncrementalAnalyze(staleness)) {
+        console.warn(
+          `[webhook] startup index health check detected stale index repo=${entry.name} commitsBehind=${staleness.commitsBehind}; enqueue incremental analyze`,
+        );
+        const queued = enqueueWebhookAnalyze(repoPath, {
+          repoName: entry.name,
+          force: false,
+          embeddings: needsEmbeddings || undefined,
+          registryName: entry.name,
+          registryBranch: entry.branch,
+        });
+        queued.done.catch((analyzeErr) => {
+          console.error(
+            `[webhook] startup stale index refresh failed for ${entry.name}:`,
+            analyzeErr,
+          );
         });
         continue;
       }
@@ -1646,17 +1683,20 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         branch: repo.branch || 'master',
       });
 
-      if (repo.cloneUrl) {
-        console.info(
-          `[webhook] sync repository repository=${repo.fullName} branch=${repo.branch || 'master'} path=${repoPath}`,
-        );
-        await cloneOrResetToBranch(repo.cloneUrl, repoPath, repo.branch || 'master');
-      }
-
-      const queued = enqueueWebhookAnalyze(repoPath, {
-        repoUrl: repo.cloneUrl,
-        repoName: path.basename(repo.fullName),
-      });
+      const queued = enqueueWebhookAnalyze(
+        repoPath,
+        {
+          repoUrl: repo.cloneUrl,
+          repoName: path.basename(repo.fullName),
+        },
+        async () => {
+          if (!repo.cloneUrl) return;
+          console.info(
+            `[webhook] sync repository repository=${repo.fullName} branch=${repo.branch || 'master'} path=${repoPath}`,
+          );
+          await cloneOrResetToBranch(repo.cloneUrl, repoPath, repo.branch || 'master');
+        },
+      );
       queued.done.catch((err) => {
         console.error(`[webhook] gitea analyze failed for ${repo.fullName}:`, err);
       });
