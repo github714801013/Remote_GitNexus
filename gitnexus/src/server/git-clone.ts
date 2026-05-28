@@ -228,13 +228,14 @@ export async function cloneOrResetToBranch(
 
 export function buildWebhookBranchSyncCommands(url: string, branch: string): string[][] {
   assertSafeGitRef(branch, 'branch');
+  const remoteRef = `refs/remotes/origin/${branch}`;
   return [
     ['remote', 'set-url', 'origin', url],
-    ['fetch', 'origin', branch, '--depth', '1'],
-    ['reset', '--hard', 'FETCH_HEAD'],
+    ['fetch', 'origin', `+refs/heads/${branch}:${remoteRef}`, '--depth', '1'],
+    ['reset', '--hard', remoteRef],
     ['clean', '-fd', '-e', '.gitnexus', '-e', '.gitnexus/'],
-    ['checkout', '-B', branch, 'FETCH_HEAD'],
-    ['reset', '--hard', 'FETCH_HEAD'],
+    ['checkout', '-B', branch, remoteRef],
+    ['reset', '--hard', remoteRef],
     ['clean', '-fd', '-e', '.gitnexus', '-e', '.gitnexus/'],
   ];
 }

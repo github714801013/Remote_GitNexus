@@ -254,12 +254,54 @@ const SEARCH_SOURCE_WEIGHTS = {
   vector: 0.8,
   zoekt: 1.2,
 } as const;
+const CROSS_REPO_ZOEKT_DISCOVERY_LIMIT = 200;
+const CROSS_REPO_VECTOR_MATCHES_PER_REPO = 5;
+const CROSS_REPO_VECTOR_DISCOVERY_CONCURRENCY = 4;
+const MATCH_SNIPPET_MAX_CHARS = 240;
+
+type QueryMatchSource = 'zoekt' | 'vector';
+
+interface QueryMatchSummary {
+  repo: string;
+  filePath: string;
+  source: QueryMatchSource;
+  score: number;
+  name?: string;
+  startLine?: number;
+  endLine?: number;
+  snippet?: string;
+}
+
+interface QueryRepoCandidate {
+  repo: RepoHandle;
+  score: number;
+  matches: QueryMatchSummary[];
+}
+
+async function mapWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  const limit = Math.max(1, Math.min(concurrency, items.length));
+  let nextIndex = 0;
+
+  await Promise.all(
+    Array.from({ length: limit }, async () => {
+      while (nextIndex < items.length) {
+        const item = items[nextIndex++];
+        await worker(item);
+      }
+    }),
+  );
+}
 
 export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
   private contextCache: Map<string, CodebaseContext> = new Map();
   private initializedRepos: Set<string> = new Set();
   private reinitPromises: Map<string, Promise<void>> = new Map();
+  private crossRepoOperationTails: Map<string, Promise<void>> = new Map();
   private lastStalenessCheck: Map<string, number> = new Map();
   private listReposCache: ListRepoEntry[] | null = null;
   private listReposCacheRegistryMtimeMs: number | null = null;
@@ -752,6 +794,142 @@ export class LocalBackend {
     return [];
   }
 
+  private compactMatchSnippet(value: unknown): string | undefined {
+    if (typeof value !== 'string') return undefined;
+    const compacted = value.replace(/\s+/g, ' ').trim();
+    if (!compacted) return undefined;
+    return compacted.length > MATCH_SNIPPET_MAX_CHARS
+      ? `${compacted.slice(0, MATCH_SNIPPET_MAX_CHARS)}...`
+      : compacted;
+  }
+
+  private pushQueryCandidateMatch(
+    candidates: Map<string, QueryRepoCandidate>,
+    repo: RepoHandle,
+    match: QueryMatchSummary,
+  ): void {
+    const existing = candidates.get(repo.id);
+    if (existing) {
+      existing.score += match.score;
+      existing.matches.push(match);
+      return;
+    }
+    candidates.set(repo.id, { repo, score: match.score, matches: [match] });
+  }
+
+  private async runCrossRepoOperationForRepo<T>(
+    repoId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.crossRepoOperationTails.get(repoId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.catch(() => {}).then(() => gate);
+    this.crossRepoOperationTails.set(repoId, tail);
+
+    await previous.catch(() => {});
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.crossRepoOperationTails.get(repoId) === tail) {
+        this.crossRepoOperationTails.delete(repoId);
+      }
+    }
+  }
+
+  private async discoverQueryCandidates(
+    query: string,
+    repos: RepoHandle[],
+  ): Promise<QueryRepoCandidate[]> {
+    const candidates = new Map<string, QueryRepoCandidate>();
+    const scopedRepoIds = new Set(repos.map((repo) => repo.id));
+
+    const zoektTask = (async () => {
+      try {
+        const { ZoektClient, loadZoektConfig } = await import('../../core/search/zoekt-client.js');
+        const config = loadZoektConfig();
+        if (!config.enabled) return;
+
+        const result = await new ZoektClient(config).search(query, {
+          maxDocDisplayCount: CROSS_REPO_ZOEKT_DISCOVERY_LIMIT,
+        });
+        result.matches.forEach((match, index) => {
+          const repo = this.resolveRepoFromZoektRepository(match.repository);
+          if (!repo || !scopedRepoIds.has(repo.id)) return;
+          const hitLine = this.getZoektHitLine(match);
+          this.pushQueryCandidateMatch(candidates, repo, {
+            repo: repo.name,
+            filePath: match.fileName,
+            source: 'zoekt',
+            score: SEARCH_SOURCE_WEIGHTS.zoekt / (RRF_K + index + 1),
+            startLine: hitLine ?? undefined,
+            endLine: hitLine ?? undefined,
+            snippet: this.compactMatchSnippet(
+              match.lineMatches?.find((line: any) => !line.isContext)?.line ??
+                match.lineMatches?.[0]?.line,
+            ),
+          });
+        });
+      } catch (e) {
+        console.error(`GitNexus: Zoekt discovery failed: ${e}`);
+      }
+    })();
+
+    const vectorTask = mapWithConcurrency(
+      repos,
+      envPositiveInt(
+        'GITNEXUS_CROSS_REPO_VECTOR_CONCURRENCY',
+        CROSS_REPO_VECTOR_DISCOVERY_CONCURRENCY,
+      ),
+      async (repo) => {
+        try {
+          const matches = await this.runCrossRepoOperationForRepo(repo.id, async () => {
+            await this.ensureInitialized(repo.id);
+            return this.semanticSearch(repo, query, CROSS_REPO_VECTOR_MATCHES_PER_REPO);
+          });
+          matches.forEach((match, index) => {
+            this.pushQueryCandidateMatch(candidates, repo, {
+              repo: repo.name,
+              filePath: match.filePath,
+              source: 'vector',
+              score: SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + index + 1),
+              name: match.name,
+              startLine: match.startLine,
+              endLine: match.endLine,
+            });
+          });
+        } catch (e) {
+          logQueryError(`query:vector-discovery:${repo.name}`, e);
+        }
+      },
+    );
+
+    await Promise.all([zoektTask, vectorTask]);
+
+    return [...candidates.values()]
+      .map((candidate) => ({
+        ...candidate,
+        matches: candidate.matches.sort((a, b) => b.score - a.score).slice(0, 10),
+      }))
+      .sort((a, b) => b.score - a.score);
+  }
+
+  private resolveRepoFromZoektRepository(rawName: string): RepoHandle | null {
+    let handle = this.resolveRepoFromCache(rawName);
+    if (handle) return handle;
+
+    const segments = rawName.split('/');
+    for (let i = 0; i < segments.length; i++) {
+      const suffix = segments.slice(i).join('/');
+      handle = this.resolveRepoFromCache(suffix);
+      if (handle) return handle;
+    }
+    return null;
+  }
+
   private parseHeadScope(head: unknown): { exact: string[]; prefixes: string[] } | null {
     const values =
       typeof head === 'string'
@@ -785,6 +963,32 @@ export class LocalBackend {
     return scope ? repos.filter((repo) => this.matchesHeadScope(repo, scope)) : repos;
   }
 
+  private selectTopMatchesWithRepoCoverage(
+    matches: QueryMatchSummary[],
+    limit: number,
+  ): QueryMatchSummary[] {
+    const sorted = [...matches].sort((a, b) => b.score - a.score);
+    const selected: QueryMatchSummary[] = [];
+    const selectedMatches = new Set<QueryMatchSummary>();
+    const coveredRepos = new Set<string>();
+
+    for (const match of sorted) {
+      if (selected.length >= limit) break;
+      if (coveredRepos.has(match.repo)) continue;
+      selected.push(match);
+      selectedMatches.add(match);
+      coveredRepos.add(match.repo);
+    }
+
+    for (const match of sorted) {
+      if (selected.length >= limit) break;
+      if (selectedMatches.has(match)) continue;
+      selected.push(match);
+    }
+
+    return selected.sort((a, b) => b.score - a.score);
+  }
+
   /**
    * Merge results from multiple single-repo query calls into one unified response.
    */
@@ -798,6 +1002,8 @@ export class LocalBackend {
       processes: [] as any[],
       process_symbols: [] as any[],
       definitions: [] as any[],
+      matches: [] as QueryMatchSummary[],
+      matched_repos: [] as string[],
       timing: { wall: 0 } as Record<string, number>,
       warning: undefined as string | undefined,
       errors: [] as Array<{ repo?: string; error: string }>,
@@ -805,6 +1011,7 @@ export class LocalBackend {
 
     const seenSymbolIds = new Set<string>();
     const seenProcessIds = new Set<string>();
+    const seenMatchKeys = new Set<string>();
 
     for (const res of results) {
       if (res?.error) {
@@ -847,6 +1054,15 @@ export class LocalBackend {
           }
         }
       }
+      if (res.matches) {
+        for (const match of res.matches) {
+          const key = `${match.repo}:${match.filePath}:${match.startLine ?? ''}:${match.endLine ?? ''}:${match.source}`;
+          if (!seenMatchKeys.has(key)) {
+            merged.matches.push(match);
+            seenMatchKeys.add(key);
+          }
+        }
+      }
       if (res.timing) {
         merged.timing.wall = Math.max(merged.timing.wall, res.timing.wall || 0);
         // Accumulate other phases if helpful, but wall is primary
@@ -857,7 +1073,13 @@ export class LocalBackend {
     // Re-sort processes by priority across all repos
     merged.processes.sort((a, b) => b.priority - a.priority).slice(0, 10);
     merged.definitions = merged.definitions.slice(0, 30);
+    merged.matches = this.selectTopMatchesWithRepoCoverage(merged.matches, 50);
+    merged.matched_repos = [...new Set(merged.matches.map((match) => match.repo))];
     if (merged.errors.length === 0) delete (merged as any).errors;
+    if (merged.matches.length === 0) {
+      delete (merged as any).matches;
+      delete (merged as any).matched_repos;
+    }
 
     return merged;
   }
@@ -1098,29 +1320,36 @@ export class LocalBackend {
     }
 
     // Multi-repo query support: if no repo provided and multiple exist,
-    // discover relevant repos via Zoekt and merge results.
+    // discover relevant repos via Zoekt + embedding and merge results.
     if (method === 'query' && !p.repo && this.repos.size > 1) {
       const discoveryQuery =
         typeof p.zoekt === 'string' && p.zoekt.trim().length > 0
           ? p.zoekt
           : (params?.query as string);
-      const discovered = (await this.discoveryReposViaZoekt(discoveryQuery)).filter((repo) =>
-        headScope ? this.matchesHeadScope(repo, headScope) : true,
+      const candidates = await this.discoverQueryCandidates(
+        discoveryQuery,
+        this.getScopedRepos(headScope),
       );
-      if (discovered.length > 0) {
+      if (candidates.length > 0) {
         console.error(
-          `GitNexus: Auto-discovered ${discovered.length} repos for query: ${discovered.map((r) => r.name).join(', ')}`,
+          `GitNexus: Auto-discovered ${candidates.length} repos for query: ${candidates.map((candidate) => candidate.repo.name).join(', ')}`,
         );
         const entries = await Promise.all(
-          discovered.map(async (repo) => {
+          candidates.map(async (candidate) => {
             try {
+              const result = await this.runCrossRepoOperationForRepo(candidate.repo.id, () =>
+                this.query(candidate.repo, params),
+              );
               return {
-                repo,
-                result: await this.query(repo, params),
+                repo: candidate.repo,
+                result: {
+                  ...result,
+                  matches: candidate.matches,
+                },
               };
             } catch (err) {
               return {
-                repo,
+                repo: candidate.repo,
                 result: { error: err instanceof Error ? err.message : String(err) },
               };
             }

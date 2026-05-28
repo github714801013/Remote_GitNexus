@@ -130,14 +130,14 @@ describe('git-clone', () => {
   });
 
   describe('buildWebhookBranchSyncCommands', () => {
-    it('uses fetch/reset commands so divergent local webhook mirrors do not block indexing', () => {
+    it('uses stable remote-tracking refs so divergent local webhook mirrors do not depend on FETCH_HEAD', () => {
       expect(buildWebhookBranchSyncCommands('https://example.com/org/repo.git', 'dev')).toEqual([
         ['remote', 'set-url', 'origin', 'https://example.com/org/repo.git'],
-        ['fetch', 'origin', 'dev', '--depth', '1'],
-        ['reset', '--hard', 'FETCH_HEAD'],
+        ['fetch', 'origin', '+refs/heads/dev:refs/remotes/origin/dev', '--depth', '1'],
+        ['reset', '--hard', 'refs/remotes/origin/dev'],
         ['clean', '-fd', '-e', '.gitnexus', '-e', '.gitnexus/'],
-        ['checkout', '-B', 'dev', 'FETCH_HEAD'],
-        ['reset', '--hard', 'FETCH_HEAD'],
+        ['checkout', '-B', 'dev', 'refs/remotes/origin/dev'],
+        ['reset', '--hard', 'refs/remotes/origin/dev'],
         ['clean', '-fd', '-e', '.gitnexus', '-e', '.gitnexus/'],
       ]);
     });
