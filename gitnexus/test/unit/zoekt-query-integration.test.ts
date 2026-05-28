@@ -105,17 +105,21 @@ describe('LocalBackend.query with Zoekt integration', () => {
     expect(mockSearch).not.toHaveBeenCalled();
   });
 
-  it('如果未提供 repo 且存在多个项目，则尝试通过 Zoekt 自动发现多个项目并合并结果', async () => {
+  it('如果未提供 repo，则并行使用 Zoekt 和 embedding 发现多个项目并合并结果', async () => {
     mockLoadConfig.mockReturnValue({
       enabled: true,
       endpoints: ['http://localhost:6070'],
     });
 
-    // Mock search for discovery: returns two repos
+    // Zoekt discovery only sees repo-1.
     mockSearch.mockResolvedValueOnce({
       matches: [
-        { repository: 'repo-1', fileName: 'src/a.ts', score: 10.0, lineMatches: [] },
-        { repository: 'repo-2', fileName: 'src/b.ts', score: 9.0, lineMatches: [] },
+        {
+          repository: 'repo-1',
+          fileName: 'src/a.ts',
+          score: 10.0,
+          lineMatches: [{ line: 'handleError()', lineNumber: 12 }],
+        },
       ],
       stats: { matchCount: 2, durationMs: 1 },
     });
@@ -129,6 +133,22 @@ describe('LocalBackend.query with Zoekt integration', () => {
     // Add repos to backend
     (backend as any).repos.set('repo-1', { id: 'repo-1', name: 'repo-1', repoPath: '/p1' });
     (backend as any).repos.set('repo-2', { id: 'repo-2', name: 'repo-2', repoPath: '/p2' });
+
+    vi.spyOn(backend as any, 'semanticSearch').mockImplementation(async (repo: any) =>
+      repo.name === 'repo-2'
+        ? [
+            {
+              nodeId: 'Function:src/vector.ts:semanticHit',
+              name: 'semanticHit',
+              type: 'Function',
+              filePath: 'src/vector.ts',
+              startLine: 20,
+              endLine: 30,
+              distance: 0.2,
+            },
+          ]
+        : [],
+    );
 
     // Spy on query to check what it returns for each repo
     const querySpy = vi.spyOn(backend as any, 'query');
@@ -144,8 +164,16 @@ describe('LocalBackend.query with Zoekt integration', () => {
     // Should have called discovery search once
     expect(mockSearch.mock.calls[0][1]).not.toHaveProperty('repoFilter');
 
-    // Should have called query for both repos
+    // Should have called query for both repos even though Zoekt only found repo-1.
     expect(querySpy).toHaveBeenCalledTimes(2);
+    expect(querySpy).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'repo-1' }),
+      expect.any(Object),
+    );
+    expect(querySpy).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'repo-2' }),
+      expect.any(Object),
+    );
 
     // Results should be merged
     expect(result.processes).toHaveLength(2);
@@ -154,6 +182,184 @@ describe('LocalBackend.query with Zoekt integration', () => {
 
     expect(result.process_symbols).toHaveLength(2);
     expect(result.definitions).toHaveLength(2);
+    expect(result.matches).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          repo: 'repo-1',
+          filePath: 'src/a.ts',
+          startLine: 12,
+          source: 'zoekt',
+        }),
+        expect.objectContaining({
+          repo: 'repo-2',
+          filePath: 'src/vector.ts',
+          startLine: 20,
+          endLine: 30,
+          source: 'vector',
+        }),
+      ]),
+    );
+  });
+
+  it('跨仓库 embedding 发现应限制 LadybugDB 初始化并发但不跳过仓库', async () => {
+    const previousConcurrency = process.env.GITNEXUS_CROSS_REPO_VECTOR_CONCURRENCY;
+    process.env.GITNEXUS_CROSS_REPO_VECTOR_CONCURRENCY = '2';
+
+    try {
+      mockLoadConfig.mockReturnValue({
+        enabled: false,
+        endpoints: [],
+      });
+      (backend as any).repos.clear();
+
+      for (let i = 1; i <= 5; i++) {
+        (backend as any).repos.set(`repo-${i}`, {
+          id: `repo-${i}`,
+          name: `repo-${i}`,
+          repoPath: `/p${i}`,
+        });
+      }
+
+      let activeInitializations = 0;
+      let maxActiveInitializations = 0;
+      const initializedRepos: string[] = [];
+      vi.spyOn(backend as any, 'ensureInitialized').mockImplementation(async (repoId: string) => {
+        activeInitializations++;
+        maxActiveInitializations = Math.max(maxActiveInitializations, activeInitializations);
+        initializedRepos.push(repoId);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        activeInitializations--;
+      });
+      vi.spyOn(backend as any, 'semanticSearch').mockImplementation(async (repo: any) => [
+        {
+          name: `hit-${repo.id}`,
+          filePath: `src/${repo.id}.ts`,
+          startLine: 1,
+          endLine: 2,
+        },
+      ]);
+
+      const querySpy = vi.spyOn(backend as any, 'query');
+      querySpy.mockImplementation(async (repo: any) => ({
+        processes: [],
+        process_symbols: [],
+        definitions: [{ name: `Def in ${repo.id}`, filePath: `src/${repo.id}.ts` }],
+        timing: { wall: 10 },
+      }));
+
+      const result = await backend.callTool('query', { query: 'handleError' });
+
+      expect(maxActiveInitializations).toBeLessThanOrEqual(2);
+      expect(initializedRepos).toHaveLength(5);
+      expect(result.matched_repos).toEqual(['repo-1', 'repo-2', 'repo-3', 'repo-4', 'repo-5']);
+      expect(querySpy).toHaveBeenCalledTimes(5);
+    } finally {
+      if (previousConcurrency === undefined) {
+        delete process.env.GITNEXUS_CROSS_REPO_VECTOR_CONCURRENCY;
+      } else {
+        process.env.GITNEXUS_CROSS_REPO_VECTOR_CONCURRENCY = previousConcurrency;
+      }
+    }
+  });
+
+  it('并发跨仓库查询应错开同一项目的 discovery 和 query', async () => {
+    const previousConcurrency = process.env.GITNEXUS_CROSS_REPO_VECTOR_CONCURRENCY;
+    process.env.GITNEXUS_CROSS_REPO_VECTOR_CONCURRENCY = '2';
+
+    try {
+      mockLoadConfig.mockReturnValue({
+        enabled: false,
+        endpoints: [],
+      });
+      (backend as any).repos.clear();
+      (backend as any).repos.set('repo-1', { id: 'repo-1', name: 'repo-1', repoPath: '/p1' });
+      (backend as any).repos.set('repo-2', { id: 'repo-2', name: 'repo-2', repoPath: '/p2' });
+
+      const activeByRepo = new Map<string, number>();
+      let sameRepoOverlap = false;
+      const runTracked = async <T>(repoId: string, work: () => Promise<T>): Promise<T> => {
+        const active = activeByRepo.get(repoId) ?? 0;
+        if (active > 0) sameRepoOverlap = true;
+        activeByRepo.set(repoId, active + 1);
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return await work();
+        } finally {
+          activeByRepo.set(repoId, (activeByRepo.get(repoId) ?? 1) - 1);
+        }
+      };
+
+      vi.spyOn(backend as any, 'ensureInitialized').mockResolvedValue(undefined);
+      vi.spyOn(backend as any, 'semanticSearch').mockImplementation(async (repo: any) =>
+        runTracked(repo.id, async () => [
+          {
+            name: `hit-${repo.id}`,
+            filePath: `src/${repo.id}.ts`,
+            startLine: 1,
+            endLine: 2,
+          },
+        ]),
+      );
+
+      const querySpy = vi.spyOn(backend as any, 'query');
+      querySpy.mockImplementation(async (repo: any) =>
+        runTracked(repo.id, async () => ({
+          processes: [],
+          process_symbols: [],
+          definitions: [{ name: `Def in ${repo.id}`, filePath: `src/${repo.id}.ts` }],
+          timing: { wall: 10 },
+        })),
+      );
+
+      await Promise.all([
+        backend.callTool('query', { query: 'handleError' }),
+        backend.callTool('query', { query: 'handleError' }),
+      ]);
+
+      expect(sameRepoOverlap).toBe(false);
+      expect(querySpy).toHaveBeenCalledTimes(4);
+    } finally {
+      if (previousConcurrency === undefined) {
+        delete process.env.GITNEXUS_CROSS_REPO_VECTOR_CONCURRENCY;
+      } else {
+        process.env.GITNEXUS_CROSS_REPO_VECTOR_CONCURRENCY = previousConcurrency;
+      }
+    }
+  });
+
+  it('跨仓库 matches 截断应保留每个项目的代表命中', async () => {
+    const highScoreMatches = Array.from({ length: 60 }, (_, index) => ({
+      repo: 'repo-a',
+      filePath: `src/a-${index}.ts`,
+      source: 'vector' as const,
+      score: 100 - index,
+      startLine: index + 1,
+      endLine: index + 1,
+    }));
+    const result = (backend as any).mergeQueryResults([
+      { matches: highScoreMatches },
+      {
+        matches: [
+          {
+            repo: 'oa-pc',
+            filePath: 'src/pages/after-service/order/components/spareMachine.vue',
+            source: 'zoekt',
+            score: 1,
+            startLine: 1,
+            endLine: 1,
+          },
+        ],
+      },
+    ]);
+
+    expect(result.matches).toHaveLength(50);
+    expect(result.matched_repos).toContain('oa-pc');
+    expect(result.matches).toContainEqual(
+      expect.objectContaining({
+        repo: 'oa-pc',
+        filePath: 'src/pages/after-service/order/components/spareMachine.vue',
+      }),
+    );
   });
 
   it('如果未提供 repo 且传入 zoekt，则使用 Zoekt 跨仓库发现并合并结果', async () => {
@@ -183,7 +389,7 @@ describe('LocalBackend.query with Zoekt integration', () => {
 
     const result = await backend.callTool('query', { zoekt: '"成为会员"' });
 
-    expect(mockSearch).toHaveBeenCalledWith('"成为会员"', { maxDocDisplayCount: 20 });
+    expect(mockSearch).toHaveBeenCalledWith('"成为会员"', { maxDocDisplayCount: 200 });
     expect(querySpy).toHaveBeenCalledTimes(2);
     expect(result.processes.map((p: any) => p.id)).toEqual(['proc-repo-1', 'proc-repo-2']);
   });
