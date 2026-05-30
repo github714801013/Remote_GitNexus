@@ -26,3 +26,9 @@
 ## Phase 5: Audit & Finish (审计与完结)
 - [x] 本地工程合规审计表输出 (Compliance Audit Report): 本次交付限定为 Neo4j 单库存储、查询分支、embedding 写入、compose 部署和对应测试；部署脚本已跳过 LadybugDB 索引 `meta.json` 备份；废弃 pgvector 文档未纳入暂存。
 - [x] 完结审计拦截 (Final Phase Check): 已执行精确暂存并核对 `git diff --cached --name-only`。
+
+## Patch: Neo4j 跨库查询与 LadybugDB 初始化熔断
+- [x] MCP 描述更新：Neo4j 下优先省略 `repo` 做跨库查询，拿到具体项目后再指定 `repo` 缩小范围；LadybugDB 单文件库不做真正跨库图/向量查询。
+- [x] 查询路径更新：Neo4j repo-less `query` 直接返回跨库 discovery 结果，不再按候选 repo 循环调用单仓库 `query`。
+- [x] 初始化熔断：Neo4j 后端下 `ensureInitialized()` 直接返回，不初始化 LadybugDB 文件库。
+- [x] 验证：`npm test -- test/unit/neo4j-cross-repo-query.test.ts test/unit/tools.test.ts`、`npx tsc --noEmit`、`git diff --check` 通过。

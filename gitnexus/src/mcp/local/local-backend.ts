@@ -266,7 +266,9 @@ interface QueryMatchSummary {
   filePath: string;
   source: QueryMatchSource;
   score: number;
+  id?: string;
   name?: string;
+  type?: string;
   startLine?: number;
   endLine?: number;
   snippet?: string;
@@ -528,6 +530,9 @@ export class LocalBackend {
   // ─── Lazy LadybugDB Init ────────────────────────────────────────────
 
   private async ensureInitialized(repoId: string): Promise<void> {
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) return;
+
     // If a reinit is already in progress for this repo, wait for it
     const pending = this.reinitPromises.get(repoId);
     if (pending) return pending;
@@ -899,7 +904,9 @@ export class LocalBackend {
                 filePath: match.filePath,
                 source: 'vector',
                 score: SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + index + 1),
+                id: match.nodeId,
                 name: match.name,
+                type: match.type,
                 startLine: match.startLine,
                 endLine: match.endLine,
               });
@@ -926,7 +933,9 @@ export class LocalBackend {
                   filePath: match.filePath,
                   source: 'vector',
                   score: SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + index + 1),
+                  id: match.nodeId,
                   name: match.name,
+                  type: match.type,
                   startLine: match.startLine,
                   endLine: match.endLine,
                 });
@@ -1017,6 +1026,41 @@ export class LocalBackend {
     }
 
     return selected.sort((a, b) => b.score - a.score);
+  }
+
+  private queryFromDiscoveredCandidates(candidates: QueryRepoCandidate[]): any {
+    const matches = this.selectTopMatchesWithRepoCoverage(
+      candidates.flatMap((candidate) => candidate.matches),
+      50,
+    );
+    const seenDefinitions = new Set<string>();
+    const definitions = [];
+
+    for (const match of matches) {
+      if (!match.name) continue;
+      const key = `${match.repo}:${match.id ?? ''}:${match.filePath}:${match.name}`;
+      if (seenDefinitions.has(key)) continue;
+      seenDefinitions.add(key);
+      definitions.push({
+        repo: match.repo,
+        id: match.id,
+        name: match.name,
+        type: match.type,
+        filePath: match.filePath,
+        startLine: match.startLine,
+        endLine: match.endLine,
+        score: match.score,
+        source: match.source,
+      });
+    }
+
+    return {
+      processes: [],
+      process_symbols: [],
+      definitions: definitions.slice(0, 30),
+      matches,
+      matched_repos: [...new Set(matches.map((match) => match.repo))],
+    };
   }
 
   /**
@@ -1367,6 +1411,13 @@ export class LocalBackend {
     // Multi-repo query support: if no repo provided and multiple exist,
     // discover relevant repos via Zoekt + embedding and merge results.
     if (method === 'query' && !p.repo && this.repos.size > 1) {
+      const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+      if (!isNeo4jBackendEnabled()) {
+        return {
+          error:
+            'Cross-repository query requires the Neo4j storage backend. Specify repo for single-file LadybugDB indexes.',
+        };
+      }
       const discoveryQuery =
         typeof p.zoekt === 'string' && p.zoekt.trim().length > 0
           ? p.zoekt
@@ -1379,28 +1430,7 @@ export class LocalBackend {
         console.error(
           `GitNexus: Auto-discovered ${candidates.length} repos for query: ${candidates.map((candidate) => candidate.repo.name).join(', ')}`,
         );
-        const entries = await Promise.all(
-          candidates.map(async (candidate) => {
-            try {
-              const result = await this.runCrossRepoOperationForRepo(candidate.repo.id, () =>
-                this.query(candidate.repo, params),
-              );
-              return {
-                repo: candidate.repo,
-                result: {
-                  ...result,
-                  matches: candidate.matches,
-                },
-              };
-            } catch (err) {
-              return {
-                repo: candidate.repo,
-                result: { error: err instanceof Error ? err.message : String(err) },
-              };
-            }
-          }),
-        );
-        return this.mergeCrossRepoResults(method, entries);
+        return this.queryFromDiscoveredCandidates(candidates);
       }
     }
 

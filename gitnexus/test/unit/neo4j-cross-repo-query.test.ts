@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { LocalBackend } from '../../src/mcp/local/local-backend.js';
 import * as zoektClient from '../../src/core/search/zoekt-client.js';
-import { semanticSearchMany } from '../../src/core/neo4j/embedding-adapter.js';
+import { semanticSearch, semanticSearchMany } from '../../src/core/neo4j/embedding-adapter.js';
 import { embedQuery } from '../../src/mcp/core/embedder.js';
 import { executeParameterized, executeQuery, initLbug } from '../../src/core/lbug/pool-adapter.js';
 
@@ -148,5 +148,60 @@ describe('Neo4j cross-repo vector discovery', () => {
 
     expect(initLbug).not.toHaveBeenCalled();
     expect(result).toHaveProperty('definitions');
+  });
+
+  it('does not initialize LadybugDB from the shared initializer in Neo4j backend mode', async () => {
+    const backend = new LocalBackend();
+    const repo = {
+      id: 'repo-a',
+      name: 'Repo A',
+      repoPath: '/repo/a',
+      storagePath: '/repo/a/.gitnexus',
+      lbugPath: '/repo/a/.gitnexus/lbug',
+      indexedAt: '2026-05-30',
+      lastCommit: 'a',
+    };
+    (backend as any).repos.set(repo.id, repo);
+
+    await (backend as any).ensureInitialized(repo.id);
+
+    expect(initLbug).not.toHaveBeenCalled();
+  });
+
+  it('uses Neo4j cross-repo discovery directly for repo-less query calls', async () => {
+    const backend = new LocalBackend();
+    const repos = [
+      {
+        id: 'repo-a',
+        name: 'Repo A',
+        repoPath: '/repo/a',
+        storagePath: '/repo/a/.gitnexus',
+        lbugPath: '/repo/a/.gitnexus/lbug',
+        indexedAt: '2026-05-30',
+        lastCommit: 'a',
+      },
+      {
+        id: 'repo-b',
+        name: 'Repo B',
+        repoPath: '/repo/b',
+        storagePath: '/repo/b/.gitnexus',
+        lbugPath: '/repo/b/.gitnexus/lbug',
+        indexedAt: '2026-05-30',
+        lastCommit: 'b',
+      },
+    ];
+    repos.forEach((repo) => (backend as any).repos.set(repo.id, repo));
+
+    const result = await backend.callTool('query', { query: 'handler', limit: 2 });
+
+    expect(semanticSearchMany).toHaveBeenCalledWith(['Repo A', 'Repo B'], [0.1, 0.2], 10);
+    expect(semanticSearch).not.toHaveBeenCalled();
+    expect(initLbug).not.toHaveBeenCalled();
+    expect(result.matched_repos).toEqual(['Repo A', 'Repo B']);
+    expect(result.matches).toHaveLength(2);
+    expect(result.definitions.map((definition: any) => definition.name)).toEqual([
+      'handlerA',
+      'handlerB',
+    ]);
   });
 });
