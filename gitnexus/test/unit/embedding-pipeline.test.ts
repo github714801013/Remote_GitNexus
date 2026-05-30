@@ -163,6 +163,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       embedText: vi.fn().mockResolvedValue(new Float32Array(384)),
       embeddingToArray: vi.fn().mockImplementation((emb: Float32Array) => Array.from(emb)),
       isEmbedderReady: vi.fn().mockReturnValue(true),
+      getCurrentDevice: vi.fn().mockReturnValue('cpu'),
     }));
 
     // Mock loadVectorExtension (avoids needing the native lbug module)
@@ -294,6 +295,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       embedText: vi.fn().mockResolvedValue(new Float32Array(384)),
       embeddingToArray: vi.fn().mockImplementation((emb: Float32Array) => Array.from(emb)),
       isEmbedderReady: vi.fn().mockReturnValue(true),
+      getCurrentDevice: vi.fn().mockReturnValue('cpu'),
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
       loadVectorExtension: vi.fn().mockResolvedValue(undefined),
@@ -463,6 +465,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       embedText: vi.fn().mockResolvedValue(new Float32Array(384)),
       embeddingToArray: vi.fn().mockImplementation((emb: Float32Array) => Array.from(emb)),
       isEmbedderReady: vi.fn().mockReturnValue(true),
+      getCurrentDevice: vi.fn().mockReturnValue('cpu'),
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
       loadVectorExtension: vi.fn().mockResolvedValue(undefined),
@@ -517,6 +520,7 @@ describe('runEmbeddingPipeline incremental filter', () => {
       embedText: vi.fn().mockResolvedValue(new Float32Array(384)),
       embeddingToArray: vi.fn().mockImplementation((emb: Float32Array) => Array.from(emb)),
       isEmbedderReady: vi.fn().mockReturnValue(true),
+      getCurrentDevice: vi.fn().mockReturnValue('cpu'),
     }));
     vi.doMock('../../src/core/lbug/lbug-adapter.js', () => ({
       loadVectorExtension: vi.fn().mockResolvedValue(undefined),

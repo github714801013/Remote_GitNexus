@@ -44,15 +44,7 @@ ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
     if [ -f /home/ji99/gitnexus/repos.json ]; then cp /home/ji99/gitnexus/repos.json /home/ji99/gitnexus/repos.json.bak; fi
     if [ -f /home/ji99/.gitnexus/registry.json ]; then cp /home/ji99/.gitnexus/registry.json "${REMOTE_PATH}/registry.json.bak"; fi
 
-    echo "备份现有索引 meta.json..."
-    if docker image inspect "${IMAGE_NAME}:latest" >/dev/null 2>&1; then
-        docker run --rm --entrypoint sh \
-            -v /home/ji99/gitnexus:/projects \
-            "${IMAGE_NAME}:latest" \
-            -lc 'find /projects -path "*/.gitnexus/meta.json" -type f -exec cp -p {} {}.bak \;'
-    else
-        echo "WARN: ${IMAGE_NAME}:latest 不存在，跳过 meta.json 容器内备份"
-    fi
+    echo "Neo4j 模式不再备份 LadybugDB 索引 meta.json"
 EOF
 scp "${TAR_FILE}" mcp_proxy_docker/auto_verify.py repos.json mcp_proxy_docker/docker-compose-vllm.yml mcp_proxy_docker/docker-compose.yml "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/"
 

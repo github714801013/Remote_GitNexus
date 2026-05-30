@@ -206,9 +206,23 @@ export async function runFullAnalysis(
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
   const existingMeta = await loadMeta(storagePath);
   const shouldGenerateEmbeddings = shouldGenerateEmbeddingsForAnalysis(existingMeta, options);
+  const projectNameInitial =
+    options.registryName ?? getInferredRepoName(repoPath) ?? path.basename(repoPath);
+  const { isNeo4jBackendEnabled } = await import('./neo4j/config.js');
+  const neo4jBackendEnabled = isNeo4jBackendEnabled();
+  let canReturnAlreadyUpToDate = true;
+  if (neo4jBackendEnabled) {
+    try {
+      const { countRepoGraphNodes } = await import('./neo4j/graph-loader.js');
+      canReturnAlreadyUpToDate = (await countRepoGraphNodes(projectNameInitial)) > 0;
+    } catch {
+      canReturnAlreadyUpToDate = false;
+    }
+  }
 
   // ── Early-return: already up to date ──────────────────────────────
   if (
+    canReturnAlreadyUpToDate &&
     shouldReturnAlreadyUpToDate(existingMeta, currentCommit, {
       ...options,
       embeddings: shouldGenerateEmbeddings,
@@ -249,6 +263,99 @@ export async function runFullAnalysis(
     const scaled = Math.round(p.percent * 0.6);
     progress(p.phase, scaled, p.message.startsWith('[memory] ') ? p.message : phaseLabel);
   });
+
+  if (neo4jBackendEnabled) {
+    progress('lbug', 60, 'Loading into Neo4j...');
+    const { loadGraphToNeo4j } = await import('./neo4j/graph-loader.js');
+    const stats = await loadGraphToNeo4j(projectNameInitial, pipelineResult.graph);
+    let embeddingCount = 0;
+
+    if (shouldGenerateEmbeddings && stats.nodes <= EMBEDDING_NODE_LIMIT) {
+      const { isHttpMode } = await import('./embeddings/http-client.js');
+      const httpMode = isHttpMode();
+      progress(
+        'embeddings',
+        90,
+        httpMode ? 'Connecting to embedding endpoint...' : 'Loading embedding model...',
+      );
+
+      const { runEmbeddingPipeline } = await import('./embeddings/embedding-pipeline.js');
+      const {
+        countEmbeddings,
+        deleteEmbeddingsForNodes,
+        ensureNeo4jEmbeddingIndex,
+        fetchExistingEmbeddingHashes: fetchExistingNeo4jEmbeddingHashes,
+        loadEmbeddableNodes,
+        upsertEmbeddings,
+      } = await import('./neo4j/embedding-adapter.js');
+      const { readServerMapping } = await import('./embeddings/server-mapping.js');
+      const serverName = await readServerMapping(projectNameInitial);
+      const existingEmbeddings = await fetchExistingNeo4jEmbeddingHashes(projectNameInitial);
+
+      await runEmbeddingPipeline(
+        async () => [],
+        async () => {},
+        (p) => {
+          const scaled = 90 + Math.round((p.percent / 100) * 8);
+          const label =
+            p.phase === 'loading-model'
+              ? httpMode
+                ? 'Connecting to embedding endpoint...'
+                : 'Loading embedding model...'
+              : `Embedding ${p.nodesProcessed || 0}/${p.totalNodes || '?'}`;
+          progress('embeddings', scaled, label);
+        },
+        {},
+        undefined,
+        { repoName: projectNameInitial, serverName },
+        existingEmbeddings,
+        {
+          loadNodes: () => loadEmbeddableNodes(projectNameInitial),
+          insertEmbeddings: (updates) => upsertEmbeddings(projectNameInitial, updates),
+          deleteEmbeddingsForNodeIds: (nodeIds) =>
+            deleteEmbeddingsForNodes(projectNameInitial, nodeIds),
+          ensureVectorIndex: ensureNeo4jEmbeddingIndex,
+        },
+      );
+
+      embeddingCount = await countEmbeddings(projectNameInitial);
+    }
+
+    progress('done', 98, 'Saving metadata...');
+    const meta = {
+      repoPath,
+      lastCommit: currentCommit,
+      indexedAt: new Date().toISOString(),
+      branch:
+        options.registryBranch ?? (hasGitDir(repoPath) ? getCurrentBranch(repoPath) : undefined),
+      remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+      stats: {
+        files: pipelineResult.totalFileCount,
+        nodes: stats.nodes,
+        edges: stats.edges,
+        communities: pipelineResult.communityResult?.stats.totalCommunities,
+        processes: pipelineResult.processResult?.stats.totalProcesses,
+        embeddings: embeddingCount,
+      },
+    };
+
+    const projectName = await registerRepo(repoPath, meta, {
+      name: options.registryName,
+      allowDuplicateName: options.allowDuplicateName,
+    });
+    await saveMeta(storagePath, meta);
+    if (hasGitDir(repoPath)) {
+      await addToGitignore(repoPath);
+    }
+
+    progress('done', 100, 'Done');
+    return {
+      repoName: projectName,
+      repoPath,
+      stats: meta.stats,
+      ...(options.returnPipelineResult ? { pipelineResult } : {}),
+    };
+  }
 
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────
   progress('lbug', 60, 'Loading into LadybugDB (Shadow Build)...');
