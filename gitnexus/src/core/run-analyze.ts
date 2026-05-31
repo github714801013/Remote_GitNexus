@@ -24,6 +24,12 @@ import {
   fetchExistingEmbeddingHashes,
 } from './lbug/lbug-adapter.js';
 import {
+  EMBEDDING_STATUS_COMPLETE,
+  EMBEDDING_STATUS_FAILED,
+  EMBEDDING_STATUS_PENDING,
+  EMBEDDING_STATUS_RUNNING,
+  type EmbeddingStatus,
+  type RepoMeta,
   getStoragePaths,
   saveMeta,
   loadMeta,
@@ -120,6 +126,7 @@ export interface AnalyzeResult {
 type ExistingAnalyzeMeta = {
   lastCommit?: string;
   branch?: string;
+  embeddingStatus?: EmbeddingStatus;
   stats?: {
     embeddings?: number;
   };
@@ -139,7 +146,12 @@ export function shouldReturnAlreadyUpToDate(
   if (currentCommit === '') {
     return false;
   }
-  if (options.embeddings && (existingMeta.stats?.embeddings ?? 0) <= 0) {
+  if (
+    options.embeddings &&
+    ((existingMeta.stats?.embeddings ?? 0) <= 0 ||
+      (existingMeta.embeddingStatus !== undefined &&
+        existingMeta.embeddingStatus !== EMBEDDING_STATUS_COMPLETE))
+  ) {
     return false;
   }
   return true;
@@ -149,7 +161,14 @@ export function shouldGenerateEmbeddingsForAnalysis(
   existingMeta: ExistingAnalyzeMeta | null | undefined,
   options: Pick<AnalyzeOptions, 'embeddings'>,
 ): boolean {
-  return options.embeddings ?? (existingMeta?.stats?.embeddings ?? 0) > 0;
+  if (options.embeddings !== undefined) {
+    return options.embeddings;
+  }
+  return (
+    (existingMeta?.stats?.embeddings ?? 0) > 0 ||
+    (existingMeta?.embeddingStatus !== undefined &&
+      existingMeta.embeddingStatus !== EMBEDDING_STATUS_COMPLETE)
+  );
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -272,7 +291,7 @@ export async function runFullAnalysis(
     progress('lbug', 60, 'Loading into Neo4j...');
     const { loadGraphToNeo4j } = await import('./neo4j/graph-loader.js');
     const stats = await loadGraphToNeo4j(projectNameInitial, pipelineResult.graph);
-    const graphMeta = {
+    const graphMeta: RepoMeta = {
       repoPath,
       lastCommit: currentCommit,
       indexedAt: new Date().toISOString(),
@@ -288,6 +307,9 @@ export async function runFullAnalysis(
         embeddings: 0,
       },
     };
+    if (shouldGenerateEmbeddings && stats.nodes <= EMBEDDING_NODE_LIMIT) {
+      graphMeta.embeddingStatus = EMBEDDING_STATUS_PENDING;
+    }
 
     progress('done', 89, 'Saving graph metadata...');
     const projectName = await registerRepo(repoPath, graphMeta, {
@@ -318,36 +340,61 @@ export async function runFullAnalysis(
       const { readServerMapping } = await import('./embeddings/server-mapping.js');
       const serverName = await readServerMapping(projectNameInitial);
       const existingEmbeddings = await fetchExistingNeo4jEmbeddingHashes(projectNameInitial);
+      const runningMeta = {
+        ...graphMeta,
+        indexedAt: new Date().toISOString(),
+        embeddingStatus: EMBEDDING_STATUS_RUNNING,
+      };
+      await registerRepo(repoPath, runningMeta, {
+        name: options.registryName,
+        allowDuplicateName: options.allowDuplicateName,
+      });
+      await saveMeta(storagePath, runningMeta);
 
-      await runEmbeddingPipeline(
-        async () => [],
-        async () => {},
-        (p) => {
-          const scaled = 90 + Math.round((p.percent / 100) * 8);
-          const label =
-            p.phase === 'loading-model'
-              ? httpMode
-                ? 'Connecting to embedding endpoint...'
-                : 'Loading embedding model...'
-              : `Embedding ${p.nodesProcessed || 0}/${p.totalNodes || '?'}`;
-          progress('embeddings', scaled, label);
-        },
-        {},
-        undefined,
-        { repoName: projectNameInitial, serverName },
-        existingEmbeddings,
-        {
-          loadNodes: () => loadEmbeddableNodes(projectNameInitial),
-          insertEmbeddings: (updates) => upsertEmbeddings(projectNameInitial, updates),
-          deleteEmbeddingsForNodeIds: (nodeIds) =>
-            deleteEmbeddingsForNodes(projectNameInitial, nodeIds),
-          ensureVectorIndex: ensureNeo4jEmbeddingIndex,
-        },
-      );
+      try {
+        await runEmbeddingPipeline(
+          async () => [],
+          async () => {},
+          (p) => {
+            const scaled = 90 + Math.round((p.percent / 100) * 8);
+            const label =
+              p.phase === 'loading-model'
+                ? httpMode
+                  ? 'Connecting to embedding endpoint...'
+                  : 'Loading embedding model...'
+                : `Embedding ${p.nodesProcessed || 0}/${p.totalNodes || '?'}`;
+            progress('embeddings', scaled, label);
+          },
+          {},
+          undefined,
+          { repoName: projectNameInitial, serverName },
+          existingEmbeddings,
+          {
+            loadNodes: () => loadEmbeddableNodes(projectNameInitial),
+            insertEmbeddings: (updates) => upsertEmbeddings(projectNameInitial, updates),
+            deleteEmbeddingsForNodeIds: (nodeIds) =>
+              deleteEmbeddingsForNodes(projectNameInitial, nodeIds),
+            ensureVectorIndex: ensureNeo4jEmbeddingIndex,
+          },
+        );
+      } catch (err) {
+        const failedMeta = {
+          ...runningMeta,
+          indexedAt: new Date().toISOString(),
+          embeddingStatus: EMBEDDING_STATUS_FAILED,
+        };
+        await registerRepo(repoPath, failedMeta, {
+          name: options.registryName,
+          allowDuplicateName: options.allowDuplicateName,
+        });
+        await saveMeta(storagePath, failedMeta);
+        throw err;
+      }
 
       finalMeta = {
         ...graphMeta,
         indexedAt: new Date().toISOString(),
+        embeddingStatus: EMBEDDING_STATUS_COMPLETE,
         stats: {
           ...graphMeta.stats,
           embeddings: await countEmbeddings(projectNameInitial),

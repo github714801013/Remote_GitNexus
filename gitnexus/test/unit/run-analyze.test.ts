@@ -41,6 +41,18 @@ describe('run-analyze module', () => {
     ).toBe(true);
   });
 
+  it('does not skip current index when embedding generation was interrupted', async () => {
+    const mod = await import('../../src/core/run-analyze.js');
+
+    expect(
+      mod.shouldReturnAlreadyUpToDate(
+        { lastCommit: 'abc123', embeddingStatus: 'running', stats: { embeddings: 42 } },
+        'abc123',
+        { embeddings: true },
+      ),
+    ).toBe(false);
+  });
+
   it('does not skip current index when registry branch changed', async () => {
     const mod = await import('../../src/core/run-analyze.js');
 
@@ -71,6 +83,17 @@ describe('run-analyze module', () => {
     expect(
       mod.shouldGenerateEmbeddingsForAnalysis(
         { stats: { embeddings: 42 } },
+        { embeddings: undefined },
+      ),
+    ).toBe(true);
+  });
+
+  it('inherits embedding generation when the previous embedding run was incomplete', async () => {
+    const mod = await import('../../src/core/run-analyze.js');
+
+    expect(
+      mod.shouldGenerateEmbeddingsForAnalysis(
+        { embeddingStatus: 'failed', stats: { embeddings: 42 } },
         { embeddings: undefined },
       ),
     ).toBe(true);

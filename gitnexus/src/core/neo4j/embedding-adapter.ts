@@ -4,6 +4,7 @@ import {
   LABEL_METHOD,
   LABELS_WITH_EXPORTED,
   type EmbeddableNode,
+  type ExistingEmbeddingHashes,
 } from '../embeddings/types.js';
 import neo4j from 'neo4j-driver';
 import { withNeo4jSession } from './driver.js';
@@ -43,18 +44,21 @@ const toNumber = (value: any, fallback = 0): number => {
 
 export const fetchExistingEmbeddingHashes = async (
   repoId: string,
-): Promise<Map<string, string>> => {
+): Promise<ExistingEmbeddingHashes> => {
   return await withNeo4jSession(async (session) => {
     return await session.executeRead(async (tx) => {
       const result = await tx.run(
-        `MATCH (e:\`${EMBEDDING_TABLE_NAME}\` {repoId: $repoId}) RETURN e.nodeId AS nodeId, e.contentHash AS contentHash`,
+        `MATCH (e:\`${EMBEDDING_TABLE_NAME}\` {repoId: $repoId}) RETURN e.nodeId AS nodeId, head(collect(e.contentHash)) AS contentHash, count(e) AS chunkCount`,
         { repoId },
       );
-      const hashes = new Map<string, string>();
+      const hashes: ExistingEmbeddingHashes = new Map();
       for (const record of result.records ?? []) {
         const nodeId = String(recordGet(record, 'nodeId') ?? '');
         if (!nodeId) continue;
-        hashes.set(nodeId, String(recordGet(record, 'contentHash') ?? ''));
+        hashes.set(nodeId, {
+          contentHash: String(recordGet(record, 'contentHash') ?? ''),
+          chunkCount: toNumber(recordGet(record, 'chunkCount'), 0),
+        });
       }
       return hashes;
     });

@@ -51,6 +51,17 @@ export const canonicalizePath = (p: string): string => {
   }
 };
 
+export const EMBEDDING_STATUS_PENDING = 'pending' as const;
+export const EMBEDDING_STATUS_RUNNING = 'running' as const;
+export const EMBEDDING_STATUS_COMPLETE = 'complete' as const;
+export const EMBEDDING_STATUS_FAILED = 'failed' as const;
+
+export type EmbeddingStatus =
+  | typeof EMBEDDING_STATUS_PENDING
+  | typeof EMBEDDING_STATUS_RUNNING
+  | typeof EMBEDDING_STATUS_COMPLETE
+  | typeof EMBEDDING_STATUS_FAILED;
+
 export interface RepoMeta {
   repoPath: string;
   lastCommit: string;
@@ -64,6 +75,7 @@ export interface RepoMeta {
    * treated as path-only and sibling-clone detection is skipped.
    */
   remoteUrl?: string;
+  embeddingStatus?: EmbeddingStatus;
   stats?: {
     files?: number;
     nodes?: number;
@@ -94,6 +106,7 @@ export interface RegistryEntry {
   branch?: string;
   /** See {@link RepoMeta.remoteUrl}. Mirrored from meta at register time. */
   remoteUrl?: string;
+  embeddingStatus?: EmbeddingStatus;
   stats?: RepoMeta['stats'];
 }
 
@@ -524,6 +537,7 @@ export const registerRepo = async (
       lastCommit: meta.lastCommit,
       branch: meta.branch,
       remoteUrl: meta.remoteUrl,
+      embeddingStatus: meta.embeddingStatus,
       stats: meta.stats,
     };
 

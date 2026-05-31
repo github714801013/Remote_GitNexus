@@ -28,6 +28,8 @@ import {
   type SemanticSearchResult,
   type ModelProgress,
   type EmbeddingContext,
+  type ExistingEmbeddingHashes,
+  type ExistingEmbeddingInfo,
   DEFAULT_EMBEDDING_CONFIG,
   EMBEDDABLE_LABELS,
   isShortLabel,
@@ -72,6 +74,36 @@ export const contentHashForNode = (
     config,
   );
   return createHash('sha1').update(EMBEDDING_TEXT_VERSION).update('\n').update(text).digest('hex');
+};
+
+const getExistingEmbeddingInfo = (value: string | ExistingEmbeddingInfo): ExistingEmbeddingInfo =>
+  typeof value === 'string' ? { contentHash: value } : value;
+
+const countExpectedChunksForNode = async (
+  node: EmbeddableNode,
+  config: EmbeddingConfig,
+): Promise<number> => {
+  if (isShortLabel(node.label)) {
+    return 1;
+  }
+  const startLine = node.startLine ?? 0;
+  const endLine = node.endLine ?? 0;
+  try {
+    return (
+      await chunkNode(
+        node.label,
+        node.content,
+        node.filePath,
+        startLine,
+        endLine,
+        config.chunkSize,
+        config.overlap,
+      )
+    ).length;
+  } catch {
+    return characterChunk(node.content, startLine, endLine, config.chunkSize, config.overlap)
+      .length;
+  }
 };
 
 /**
@@ -231,8 +263,8 @@ const createVectorIndex = async (
  * @param config - Optional configuration override
  * @param skipNodeIds - Optional set of node IDs that already have embeddings (incremental mode)
  * @param context - Optional repo/server context for metadata enrichment
- * @param existingEmbeddings - Optional map of nodeId → contentHash for incremental mode.
- *        Nodes whose hash matches are skipped; nodes with a changed hash are DELETE'd
+ * @param existingEmbeddings - Optional map of nodeId → contentHash/chunk metadata for incremental mode.
+ *        Nodes whose hash and chunk count match are skipped; changed or incomplete nodes are DELETE'd
  *        and re-embedded; nodes not in the map are embedded fresh.
 
  */
@@ -246,7 +278,7 @@ export const runEmbeddingPipeline = async (
   config: Partial<EmbeddingConfig> = {},
   skipNodeIds?: Set<string>,
   context?: EmbeddingContext,
-  existingEmbeddings?: Map<string, string>,
+  existingEmbeddings?: ExistingEmbeddingHashes,
   storage?: EmbeddingPipelineStorage,
 ): Promise<void> => {
   const finalConfig = { ...DEFAULT_EMBEDDING_CONFIG, ...config };
@@ -300,22 +332,33 @@ export const runEmbeddingPipeline = async (
     if (existingEmbeddings && existingEmbeddings.size > 0) {
       const beforeCount = nodes.length;
       const staleNodeIds: string[] = [];
-      nodes = nodes.filter((n) => {
-        const existingHash = existingEmbeddings.get(n.id);
-        if (existingHash === undefined) {
+      const nodesToEmbed: EmbeddableNode[] = [];
+      for (const n of nodes) {
+        const existing = existingEmbeddings.get(n.id);
+        if (existing === undefined) {
           // New node — needs embedding
-          return true;
+          nodesToEmbed.push(n);
+          continue;
         }
+        const existingInfo = getExistingEmbeddingInfo(existing);
         const currentHash = contentHashForNode(n, finalConfig);
-        if (currentHash !== existingHash) {
-          // Content changed — cache hash for reuse during insert, mark for DELETE + re-embed
+        const expectedChunkCount =
+          existingInfo.chunkCount === undefined
+            ? undefined
+            : await countExpectedChunksForNode(n, finalConfig);
+        if (
+          currentHash !== existingInfo.contentHash ||
+          (expectedChunkCount !== undefined && expectedChunkCount !== existingInfo.chunkCount)
+        ) {
+          // Content changed or a previous run only wrote part of this node.
           computedStaleHashes.set(n.id, currentHash);
           staleNodeIds.push(n.id);
-          return true;
+          nodesToEmbed.push(n);
+          continue;
         }
         // Hash matches — skip (fresh); no need to cache hash for skipped nodes
-        return false;
-      });
+      }
+      nodes = nodesToEmbed;
 
       // DELETE stale embedding rows so they can be re-inserted
       // (Kuzu forbids SET on vector-indexed properties; DELETE-then-INSERT is the sanctioned pattern)

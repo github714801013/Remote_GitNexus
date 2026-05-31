@@ -22,6 +22,8 @@ RUN if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
     apt-get update -y && apt-get install -y --fix-missing \
     curl \
     ca-certificates \
+    cron \
+    tzdata \
     python3 \
     git \
     ruby-full \

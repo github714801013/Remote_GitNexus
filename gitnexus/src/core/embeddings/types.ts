@@ -283,6 +283,13 @@ export interface CachedEmbedding {
   contentHash?: string;
 }
 
+export interface ExistingEmbeddingInfo {
+  contentHash: string;
+  chunkCount?: number;
+}
+
+export type ExistingEmbeddingHashes = Map<string, string | ExistingEmbeddingInfo>;
+
 /**
  * Context info for embedding pipeline (repo/server metadata enrichment)
  */

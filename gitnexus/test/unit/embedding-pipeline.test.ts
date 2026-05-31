@@ -247,6 +247,35 @@ describe('runEmbeddingPipeline incremental filter', () => {
     expect(readyProgress!.percent).toBe(100);
   });
 
+  it('re-embeds unchanged nodes when existing chunk coverage is incomplete', async () => {
+    mockEmbedderSetup();
+
+    const node = makeNode();
+    const hash = contentHashForNode(node, DEFAULT_EMBEDDING_CONFIG);
+    const existingEmbeddings = new Map([[node.id, { contentHash: hash, chunkCount: 0 }]]);
+
+    const executeQuery = mockExecuteQuery([node]);
+    const executeWithReusedStatement = mockExecuteWithReusedStatement();
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    await runEmbeddingPipeline(
+      executeQuery,
+      executeWithReusedStatement,
+      onProgress,
+      {},
+      undefined,
+      undefined,
+      existingEmbeddings,
+    );
+
+    const createCalls = stmtCalls.filter((c) => c.cypher.includes('CREATE'));
+    expect(createCalls.length).toBeGreaterThanOrEqual(1);
+    const deleteCalls = stmtCalls.filter((c) => c.cypher.includes('DELETE'));
+    expect(deleteCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
   it('embeds new nodes not in existingEmbeddings', async () => {
     mockEmbedderSetup();
 

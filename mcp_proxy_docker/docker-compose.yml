@@ -119,6 +119,7 @@ services:
       - zoekt-index:/data/zoekt-index
     environment:
       - NODE_OPTIONS=--max-old-space-size=32768
+      - TZ=Asia/Shanghai
       - GITEA_TOKEN=${GITEA_TOKEN}
       - GITNEXUS_EMBEDDING_URL=http://10.1.14.177:8001/v1
       - GITNEXUS_INDEX_EMBEDDING_URL=http://10.1.14.177:8002/v1

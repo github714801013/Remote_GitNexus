@@ -21,8 +21,8 @@ describe('Neo4j embedding adapter', () => {
   it('fetches existing embedding content hashes by repoId', async () => {
     txRun.mockResolvedValueOnce({
       records: [
-        record({ nodeId: 'Function:a', contentHash: 'hash-a' }),
-        record({ nodeId: 'Function:b', contentHash: null }),
+        record({ nodeId: 'Function:a', contentHash: 'hash-a', chunkCount: 2 }),
+        record({ nodeId: 'Function:b', contentHash: null, chunkCount: 1 }),
       ],
     });
     const { fetchExistingEmbeddingHashes } =
@@ -31,13 +31,13 @@ describe('Neo4j embedding adapter', () => {
     const hashes = await fetchExistingEmbeddingHashes('repo-a');
 
     expect(txRun).toHaveBeenCalledWith(
-      'MATCH (e:`CodeEmbedding` {repoId: $repoId}) RETURN e.nodeId AS nodeId, e.contentHash AS contentHash',
+      'MATCH (e:`CodeEmbedding` {repoId: $repoId}) RETURN e.nodeId AS nodeId, head(collect(e.contentHash)) AS contentHash, count(e) AS chunkCount',
       { repoId: 'repo-a' },
     );
     expect(hashes).toEqual(
       new Map([
-        ['Function:a', 'hash-a'],
-        ['Function:b', ''],
+        ['Function:a', { contentHash: 'hash-a', chunkCount: 2 }],
+        ['Function:b', { contentHash: '', chunkCount: 1 }],
       ]),
     );
   });

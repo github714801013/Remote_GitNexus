@@ -13,6 +13,10 @@ IMAGE_NAME="gitnexus-mcp-proxy"
 TAR_FILE="gitnexus_noble_deploy.tar.gz"
 RAW_TAR_FILE="${TAR_FILE%.gz}"
 BUILDX_BUILDER="gitnexus-deploy-builder"
+if [ -z "${gitnexus_gitea_token:-}" ] && command -v powershell.exe >/dev/null 2>&1; then
+    gitnexus_gitea_token=$(powershell.exe -NoProfile -Command "[Environment]::GetEnvironmentVariable('gitnexus_gitea_token')" | tr -d '\r')
+    export gitnexus_gitea_token
+fi
 : "${gitnexus_gitea_token:?gitnexus_gitea_token environment variable is required}"
 
 # 自动修复 Windows Bash 下的 Docker 路径问题

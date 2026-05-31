@@ -14,6 +14,8 @@ import path from 'path';
 import fs from 'fs/promises';
 import { createRequire } from 'node:module';
 import {
+  EMBEDDING_STATUS_COMPLETE,
+  type EmbeddingStatus,
   loadMeta,
   listRegisteredRepos,
   getStoragePath,
@@ -93,11 +95,16 @@ export const isRepairableIndexError = (err: unknown): boolean => {
 export const repoNameFromPath = (repoPath: string): string => path.basename(repoPath);
 
 export const shouldScheduleStartupEmbeddings = (
-  meta: { stats?: { nodes?: number; embeddings?: number } } | null | undefined,
+  meta:
+    | { embeddingStatus?: EmbeddingStatus; stats?: { nodes?: number; embeddings?: number } }
+    | null
+    | undefined,
 ): boolean => {
   const nodes = meta?.stats?.nodes ?? 0;
   const embeddings = meta?.stats?.embeddings ?? 0;
-  return nodes > 0 && embeddings <= 0;
+  const embeddingIncomplete =
+    meta?.embeddingStatus !== undefined && meta.embeddingStatus !== EMBEDDING_STATUS_COMPLETE;
+  return nodes > 0 && (embeddings <= 0 || embeddingIncomplete);
 };
 
 export const shouldScheduleStartupIncrementalAnalyze = (
@@ -925,142 +932,172 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     }
   };
 
-  const scheduleStartupIndexHealthCheck = async (): Promise<void> => {
+  let indexHealthCheckRunning = false;
+  const runIndexHealthCheck = async (source = 'startup'): Promise<{ skipped: boolean }> => {
+    if (indexHealthCheckRunning) {
+      console.warn(`[webhook] ${source} index health check skipped: already running`);
+      return { skipped: true };
+    }
+    indexHealthCheckRunning = true;
     const projectsRoot = getProjectsRoot();
-    const reposFile = path.join(projectsRoot, 'repos.json');
-    const webhookBranchByPath = new Map<string, string>();
     try {
-      const raw = await fs.readFile(reposFile, 'utf-8');
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        for (const entry of parsed) {
-          if (!entry || typeof entry.full_name !== 'string') continue;
-          const branch = typeof entry.branch === 'string' ? entry.branch : 'master';
-          const repoPath = getGiteaWebhookRepoPath(projectsRoot, entry.full_name);
-          webhookBranchByPath.set(path.resolve(repoPath), branch);
+      const reposFile = path.join(projectsRoot, 'repos.json');
+      const webhookBranchByPath = new Map<string, string>();
+      try {
+        const raw = await fs.readFile(reposFile, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          for (const entry of parsed) {
+            if (!entry || typeof entry.full_name !== 'string') continue;
+            const branch = typeof entry.branch === 'string' ? entry.branch : 'master';
+            const repoPath = getGiteaWebhookRepoPath(projectsRoot, entry.full_name);
+            webhookBranchByPath.set(path.resolve(repoPath), branch);
+          }
         }
+      } catch {
+        // repos.json is optional; plain project discovery still works without it.
       }
-    } catch {
-      // repos.json is optional; plain project discovery still works without it.
-    }
-    const registeredBeforeSync = await listRegisteredRepos().catch((err) => {
-      console.warn('[webhook] startup registry sync skipped:', err);
-      return [];
-    });
-    const registeredPaths = new Set(registeredBeforeSync.map((entry) => path.resolve(entry.path)));
-    const projectRepoPaths = await discoverProjectRepoPaths(projectsRoot);
-
-    for (const repoPath of projectRepoPaths) {
-      const resolvedRepoPath = path.resolve(repoPath);
-      if (registeredPaths.has(resolvedRepoPath)) continue;
-      const repoName = repoNameFromPath(resolvedRepoPath);
-      const meta = await loadMeta(getStoragePath(resolvedRepoPath));
-      if (meta) {
-        await registerRepo(resolvedRepoPath, meta, { name: repoName });
-        registeredPaths.add(resolvedRepoPath);
-        console.info(`[webhook] registered discovered project repo for MCP repo=${repoName}`);
-        continue;
-      }
-
-      console.warn(
-        `[webhook] discovered project repo missing MCP index repo=${repoName}; enqueue analyze`,
-      );
-      const queued = enqueueWebhookAnalyze(resolvedRepoPath, { repoName });
-      queued.done.catch((analyzeErr) => {
-        console.error(
-          `[webhook] discovered project repo analyze failed for ${repoName}:`,
-          analyzeErr,
-        );
+      const registeredBeforeSync = await listRegisteredRepos().catch((err) => {
+        console.warn(`[webhook] ${source} registry sync skipped:`, err);
+        return [];
       });
-    }
+      const registeredPaths = new Set(
+        registeredBeforeSync.map((entry) => path.resolve(entry.path)),
+      );
+      const projectRepoPaths = await discoverProjectRepoPaths(projectsRoot);
 
-    await backend.refreshListReposCache().catch((err) => {
-      console.warn('[webhook] refresh repo cache after project discovery failed:', err);
-    });
+      for (const repoPath of projectRepoPaths) {
+        const resolvedRepoPath = path.resolve(repoPath);
+        if (registeredPaths.has(resolvedRepoPath)) continue;
+        const repoName = repoNameFromPath(resolvedRepoPath);
+        const meta = await loadMeta(getStoragePath(resolvedRepoPath));
+        if (meta) {
+          await registerRepo(resolvedRepoPath, meta, { name: repoName });
+          registeredPaths.add(resolvedRepoPath);
+          console.info(`[webhook] registered discovered project repo for MCP repo=${repoName}`);
+          continue;
+        }
 
-    const entries = await listRegisteredRepos().catch((err) => {
-      console.warn('[webhook] startup index health check skipped:', err);
-      return [];
-    });
+        console.warn(
+          `[webhook] discovered project repo missing MCP index repo=${repoName}; enqueue analyze`,
+        );
+        const queued = enqueueWebhookAnalyze(resolvedRepoPath, { repoName });
+        queued.done.catch((analyzeErr) => {
+          console.error(
+            `[webhook] discovered project repo analyze failed for ${repoName}:`,
+            analyzeErr,
+          );
+        });
+      }
 
-    for (const entry of entries) {
-      const repoPath = entry.path;
-      const registryBranch = webhookBranchByPath.get(path.resolve(repoPath)) ?? entry.branch;
-      const meta = await loadMeta(entry.storagePath);
-      const needsEmbeddings = shouldScheduleStartupEmbeddings(meta);
-      const staleness = checkStaleness(repoPath, entry.lastCommit);
+      await backend.refreshListReposCache().catch((err) => {
+        console.warn('[webhook] refresh repo cache after project discovery failed:', err);
+      });
 
-      if (shouldRunStartupLbugHealthCheck()) {
-        const lbugPath = path.join(entry.storagePath, 'lbug');
-        try {
-          await initPooledLbug(entry.name, lbugPath);
-          await closePooledLbug(entry.name);
-        } catch (err) {
-          await closePooledLbug(entry.name).catch(() => {});
-          if (!isRepairableIndexError(err)) {
+      const entries = await listRegisteredRepos().catch((err) => {
+        console.warn(`[webhook] ${source} index health check skipped:`, err);
+        return [];
+      });
+
+      for (const entry of entries) {
+        const repoPath = entry.path;
+        const registryBranch = webhookBranchByPath.get(path.resolve(repoPath)) ?? entry.branch;
+        const meta = await loadMeta(entry.storagePath);
+        const needsEmbeddings = shouldScheduleStartupEmbeddings(meta);
+        const staleness = checkStaleness(repoPath, entry.lastCommit);
+
+        if (shouldRunStartupLbugHealthCheck()) {
+          const lbugPath = path.join(entry.storagePath, 'lbug');
+          try {
+            await initPooledLbug(entry.name, lbugPath);
+            await closePooledLbug(entry.name);
+          } catch (err) {
+            await closePooledLbug(entry.name).catch(() => {});
+            if (!isRepairableIndexError(err)) {
+              console.warn(
+                `[webhook] ${source} index health check skipped repo=${entry.name}: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+              continue;
+            }
+
             console.warn(
-              `[webhook] startup index health check skipped repo=${entry.name}: ${
-                err instanceof Error ? err.message : String(err)
-              }`,
+              `[webhook] ${source} index health check detected damaged index repo=${entry.name}; enqueue analyze`,
             );
+            const queued = enqueueWebhookAnalyze(repoPath, {
+              repoName: entry.name,
+              embeddings: needsEmbeddings || undefined,
+              registryName: entry.name,
+              registryBranch,
+            });
+            queued.done.catch((analyzeErr) => {
+              console.error(
+                `[webhook] ${source} index repair failed for ${entry.name}:`,
+                analyzeErr,
+              );
+            });
             continue;
           }
+        }
 
+        if (shouldScheduleStartupIncrementalAnalyze(staleness)) {
           console.warn(
-            `[webhook] startup index health check detected damaged index repo=${entry.name}; enqueue analyze`,
+            `[webhook] ${source} index health check detected stale index repo=${entry.name} commitsBehind=${staleness.commitsBehind}; enqueue incremental analyze`,
           );
           const queued = enqueueWebhookAnalyze(repoPath, {
             repoName: entry.name,
+            force: false,
             embeddings: needsEmbeddings || undefined,
             registryName: entry.name,
             registryBranch,
           });
           queued.done.catch((analyzeErr) => {
-            console.error(`[webhook] startup index repair failed for ${entry.name}:`, analyzeErr);
+            console.error(
+              `[webhook] ${source} stale index refresh failed for ${entry.name}:`,
+              analyzeErr,
+            );
           });
           continue;
         }
-      }
 
-      if (shouldScheduleStartupIncrementalAnalyze(staleness)) {
-        console.warn(
-          `[webhook] startup index health check detected stale index repo=${entry.name} commitsBehind=${staleness.commitsBehind}; enqueue incremental analyze`,
-        );
-        const queued = enqueueWebhookAnalyze(repoPath, {
-          repoName: entry.name,
-          force: false,
-          embeddings: needsEmbeddings || undefined,
-          registryName: entry.name,
-          registryBranch,
-        });
-        queued.done.catch((analyzeErr) => {
-          console.error(
-            `[webhook] startup stale index refresh failed for ${entry.name}:`,
-            analyzeErr,
+        if (needsEmbeddings) {
+          console.warn(
+            `[webhook] ${source} embedding health check detected missing vectors repo=${entry.name}; enqueue analyze with embeddings`,
           );
-        });
-        continue;
+          const queued = enqueueWebhookAnalyze(repoPath, {
+            repoName: entry.name,
+            embeddings: true,
+            registryName: entry.name,
+            registryBranch,
+          });
+          queued.done.catch((analyzeErr) => {
+            console.error(
+              `[webhook] ${source} embedding repair failed for ${entry.name}:`,
+              analyzeErr,
+            );
+          });
+        }
       }
-
-      if (needsEmbeddings) {
-        console.warn(
-          `[webhook] startup embedding health check detected missing vectors repo=${entry.name}; enqueue analyze with embeddings`,
-        );
-        const queued = enqueueWebhookAnalyze(repoPath, {
-          repoName: entry.name,
-          embeddings: true,
-          registryName: entry.name,
-          registryBranch,
-        });
-        queued.done.catch((analyzeErr) => {
-          console.error(`[webhook] startup embedding repair failed for ${entry.name}:`, analyzeErr);
-        });
-      }
+      return { skipped: false };
+    } finally {
+      indexHealthCheckRunning = false;
     }
   };
 
   void scheduleStartupWebhookRepos();
-  void scheduleStartupIndexHealthCheck();
+  void runIndexHealthCheck('startup').catch((err) => {
+    console.error('[webhook] startup index health check failed:', err);
+  });
+
+  app.post('/api/index-health-check', async (_req, res) => {
+    try {
+      const result = await runIndexHealthCheck('scheduled');
+      res.status(result.skipped ? 202 : 200).json({ ok: true, ...result });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Index health check failed' });
+    }
+  });
 
   /**
    * Maximum time the hold-queue will wait for an active analysis job to complete.

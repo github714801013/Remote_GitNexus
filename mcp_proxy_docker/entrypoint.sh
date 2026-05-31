@@ -17,6 +17,20 @@ export GITNEXUS_EMBEDDING_BATCH_SIZE="${GITNEXUS_EMBEDDING_BATCH_SIZE:-1}"
 # 持久化 registry 到挂载卷，避免容器重启后丢失索引注册信息
 export GITNEXUS_HOME="${GITNEXUS_HOME:-/root/.gitnexus}"
 mkdir -p "$GITNEXUS_HOME"
+export TZ="${TZ:-Asia/Shanghai}"
+if [ -f "/usr/share/zoneinfo/$TZ" ]; then
+  ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime
+  echo "$TZ" >/etc/timezone
+fi
+
+# Daily index health check. The endpoint only enqueues stale/missing-vector repos.
+cat >/etc/cron.d/gitnexus-index-health-check <<'EOF'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 22 * * * root curl -fsS -X POST http://127.0.0.1:1347/api/index-health-check >> /proc/1/fd/1 2>> /proc/1/fd/2
+EOF
+chmod 0644 /etc/cron.d/gitnexus-index-health-check
+cron
 
 # Ensure CUDA and cuDNN libraries are found.
 # NOTE: /usr/local/cuda-12/compat is intentionally excluded — it contains
@@ -43,13 +57,14 @@ echo "Starting GitNexus Web UI on port 1350 (via proxy)..."
 node /app/mcp_proxy/proxy.js &
 proxy_pid=$!
 
-trap 'kill -TERM "$serve_pid" "$proxy_pid" 2>/dev/null || true; wait 2>/dev/null || true' TERM INT
+trap 'service cron stop >/dev/null 2>&1 || true; kill -TERM "$serve_pid" "$proxy_pid" 2>/dev/null || true; wait 2>/dev/null || true' TERM INT
 
 set +e
 wait -n "$serve_pid" "$proxy_pid"
 exit_code=$?
 set -e
 echo "A GitNexus service exited with code ${exit_code}; stopping remaining services."
+service cron stop >/dev/null 2>&1 || true
 kill -TERM "$serve_pid" "$proxy_pid" 2>/dev/null || true
 wait 2>/dev/null || true
 exit "$exit_code"

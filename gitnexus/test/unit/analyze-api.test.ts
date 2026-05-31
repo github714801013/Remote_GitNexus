@@ -113,6 +113,24 @@ describe('analyze API logic', () => {
     expect(shouldScheduleStartupEmbeddings({ stats: { nodes: 10, embeddings: 0 } })).toBe(true);
     expect(shouldScheduleStartupEmbeddings({ stats: { nodes: 10 } })).toBe(true);
     expect(shouldScheduleStartupEmbeddings({ stats: { nodes: 10, embeddings: 3 } })).toBe(false);
+    expect(
+      shouldScheduleStartupEmbeddings({
+        embeddingStatus: 'running',
+        stats: { nodes: 10, embeddings: 3 },
+      }),
+    ).toBe(true);
+    expect(
+      shouldScheduleStartupEmbeddings({
+        embeddingStatus: 'failed',
+        stats: { nodes: 10, embeddings: 3 },
+      }),
+    ).toBe(true);
+    expect(
+      shouldScheduleStartupEmbeddings({
+        embeddingStatus: 'complete',
+        stats: { nodes: 10, embeddings: 3 },
+      }),
+    ).toBe(false);
     expect(shouldScheduleStartupEmbeddings({ stats: { nodes: 0, embeddings: 0 } })).toBe(false);
     expect(shouldScheduleStartupEmbeddings(null)).toBe(false);
   });

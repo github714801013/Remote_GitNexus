@@ -28,9 +28,6 @@ export function mountMCPEndpoints(app: Express, backend: LocalBackend): () => Pr
     const projects = parseCsvHeader(req.headers['projects']);
     const envs = parseCsvHeader(req.headers['env']);
     const scope = projects || envs ? { projects, envs } : undefined;
-    if (projects) {
-      console.log(`[MCP] New session with project whitelist: ${projects.join(', ')}`);
-    }
     if (envs) {
       console.log(`[MCP] New session with env scope: ${envs.join(', ')}`);
     }
