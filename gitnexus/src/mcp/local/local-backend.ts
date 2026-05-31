@@ -266,7 +266,9 @@ interface QueryMatchSummary {
   filePath: string;
   source: QueryMatchSource;
   score: number;
+  id?: string;
   name?: string;
+  type?: string;
   startLine?: number;
   endLine?: number;
   snippet?: string;
@@ -528,6 +530,9 @@ export class LocalBackend {
   // ─── Lazy LadybugDB Init ────────────────────────────────────────────
 
   private async ensureInitialized(repoId: string): Promise<void> {
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) return;
+
     // If a reinit is already in progress for this repo, wait for it
     const pending = this.reinitPromises.get(repoId);
     if (pending) return pending;
@@ -878,34 +883,68 @@ export class LocalBackend {
       }
     })();
 
-    const vectorTask = mapWithConcurrency(
-      repos,
-      envPositiveInt(
-        'GITNEXUS_CROSS_REPO_VECTOR_CONCURRENCY',
-        CROSS_REPO_VECTOR_DISCOVERY_CONCURRENCY,
-      ),
-      async (repo) => {
-        try {
-          const matches = await this.runCrossRepoOperationForRepo(repo.id, async () => {
-            await this.ensureInitialized(repo.id);
-            return this.semanticSearch(repo, query, CROSS_REPO_VECTOR_MATCHES_PER_REPO);
-          });
-          matches.forEach((match, index) => {
-            this.pushQueryCandidateMatch(candidates, repo, {
-              repo: repo.name,
-              filePath: match.filePath,
-              source: 'vector',
-              score: SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + index + 1),
-              name: match.name,
-              startLine: match.startLine,
-              endLine: match.endLine,
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const vectorTask = isNeo4jBackendEnabled()
+      ? (async () => {
+          try {
+            const repoById = new Map(repos.map((repo) => [repo.name, repo]));
+            const { embedQuery } = await import('../core/embedder.js');
+            const queryVec = await embedQuery(query);
+            const { semanticSearchMany } = await import('../../core/neo4j/embedding-adapter.js');
+            const matches = await semanticSearchMany(
+              repos.map((repo) => repo.name),
+              queryVec,
+              CROSS_REPO_VECTOR_MATCHES_PER_REPO * repos.length,
+            );
+            matches.forEach((match, index) => {
+              const repo = repoById.get(match.repoId ?? '');
+              if (!repo) return;
+              this.pushQueryCandidateMatch(candidates, repo, {
+                repo: repo.name,
+                filePath: match.filePath,
+                source: 'vector',
+                score: SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + index + 1),
+                id: match.nodeId,
+                name: match.name,
+                type: match.type,
+                startLine: match.startLine,
+                endLine: match.endLine,
+              });
             });
-          });
-        } catch (e) {
-          logQueryError(`query:vector-discovery:${repo.name}`, e);
-        }
-      },
-    );
+          } catch (e) {
+            logQueryError('query:vector-discovery:neo4j', e);
+          }
+        })()
+      : mapWithConcurrency(
+          repos,
+          envPositiveInt(
+            'GITNEXUS_CROSS_REPO_VECTOR_CONCURRENCY',
+            CROSS_REPO_VECTOR_DISCOVERY_CONCURRENCY,
+          ),
+          async (repo) => {
+            try {
+              const matches = await this.runCrossRepoOperationForRepo(repo.id, async () => {
+                await this.ensureInitialized(repo.id);
+                return this.semanticSearch(repo, query, CROSS_REPO_VECTOR_MATCHES_PER_REPO);
+              });
+              matches.forEach((match, index) => {
+                this.pushQueryCandidateMatch(candidates, repo, {
+                  repo: repo.name,
+                  filePath: match.filePath,
+                  source: 'vector',
+                  score: SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + index + 1),
+                  id: match.nodeId,
+                  name: match.name,
+                  type: match.type,
+                  startLine: match.startLine,
+                  endLine: match.endLine,
+                });
+              });
+            } catch (e) {
+              logQueryError(`query:vector-discovery:${repo.name}`, e);
+            }
+          },
+        );
 
     await Promise.all([zoektTask, vectorTask]);
 
@@ -987,6 +1026,41 @@ export class LocalBackend {
     }
 
     return selected.sort((a, b) => b.score - a.score);
+  }
+
+  private queryFromDiscoveredCandidates(candidates: QueryRepoCandidate[]): any {
+    const matches = this.selectTopMatchesWithRepoCoverage(
+      candidates.flatMap((candidate) => candidate.matches),
+      50,
+    );
+    const seenDefinitions = new Set<string>();
+    const definitions = [];
+
+    for (const match of matches) {
+      if (!match.name) continue;
+      const key = `${match.repo}:${match.id ?? ''}:${match.filePath}:${match.name}`;
+      if (seenDefinitions.has(key)) continue;
+      seenDefinitions.add(key);
+      definitions.push({
+        repo: match.repo,
+        id: match.id,
+        name: match.name,
+        type: match.type,
+        filePath: match.filePath,
+        startLine: match.startLine,
+        endLine: match.endLine,
+        score: match.score,
+        source: match.source,
+      });
+    }
+
+    return {
+      processes: [],
+      process_symbols: [],
+      definitions: definitions.slice(0, 30),
+      matches,
+      matched_repos: [...new Set(matches.map((match) => match.repo))],
+    };
   }
 
   /**
@@ -1260,17 +1334,32 @@ export class LocalBackend {
     });
 
     try {
-      const rows = await executeParameterized(
-        repo.id,
-        `
+      const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+      const rows = isNeo4jBackendEnabled()
+        ? await (async () => {
+            const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+            return await executeReadCypher(
+              `
+        MATCH (n {repoId: $repoId})
+        WHERE labels(n)[0] IN ['Function', 'Method', 'Class', 'Interface', 'Constructor', 'Route', 'Tool']
+          AND (${clauses.join(' OR ')})
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+        ORDER BY (n.endLine - n.startLine) ASC
+      `,
+              { repoId: repo.name, ...queryParams },
+            );
+          })()
+        : await executeParameterized(
+            repo.id,
+            `
         MATCH (n)
         WHERE labels(n)[0] IN ['Function', 'Method', 'Class', 'Interface', 'Constructor', 'Route', 'Tool']
           AND (${clauses.join(' OR ')})
         RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
         ORDER BY (n.endLine - n.startLine) ASC
       `,
-        queryParams,
-      );
+            queryParams,
+          );
 
       for (const hit of hits) {
         const row = rows
@@ -1322,6 +1411,13 @@ export class LocalBackend {
     // Multi-repo query support: if no repo provided and multiple exist,
     // discover relevant repos via Zoekt + embedding and merge results.
     if (method === 'query' && !p.repo && this.repos.size > 1) {
+      const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+      if (!isNeo4jBackendEnabled()) {
+        return {
+          error:
+            'Cross-repository query requires the Neo4j storage backend. Specify repo for single-file LadybugDB indexes.',
+        };
+      }
       const discoveryQuery =
         typeof p.zoekt === 'string' && p.zoekt.trim().length > 0
           ? p.zoekt
@@ -1334,28 +1430,7 @@ export class LocalBackend {
         console.error(
           `GitNexus: Auto-discovered ${candidates.length} repos for query: ${candidates.map((candidate) => candidate.repo.name).join(', ')}`,
         );
-        const entries = await Promise.all(
-          candidates.map(async (candidate) => {
-            try {
-              const result = await this.runCrossRepoOperationForRepo(candidate.repo.id, () =>
-                this.query(candidate.repo, params),
-              );
-              return {
-                repo: candidate.repo,
-                result: {
-                  ...result,
-                  matches: candidate.matches,
-                },
-              };
-            } catch (err) {
-              return {
-                repo: candidate.repo,
-                result: { error: err instanceof Error ? err.message : String(err) },
-              };
-            }
-          }),
-        );
-        return this.mergeCrossRepoResults(method, entries);
+        return this.queryFromDiscoveredCandidates(candidates);
       }
     }
 
@@ -1555,7 +1630,11 @@ export class LocalBackend {
       return { error: 'query or zoekt parameter is required and cannot be empty.' };
     }
 
-    await this.ensureInitialized(repo.id);
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const useNeo4jBackend = isNeo4jBackendEnabled();
+    if (!useNeo4jBackend) {
+      await this.ensureInitialized(repo.id);
+    }
 
     const processLimit = params.limit || 5;
     const maxSymbolsPerProcess = params.max_symbols || 10;
@@ -1685,14 +1764,25 @@ export class LocalBackend {
       // Find processes this symbol participates in
       let processRows: any[] = [];
       try {
-        processRows = await executeParameterized(
-          repo.id,
-          `
+        if (useNeo4jBackend) {
+          const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+          processRows = await executeReadCypher(
+            `
+          MATCH (n {repoId: $repoId, id: $nodeId})-[r:STEP_IN_PROCESS]->(p:Process {repoId: $repoId})
+          RETURN p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
+        `,
+            { repoId: repo.name, nodeId: sym.nodeId },
+          );
+        } else {
+          processRows = await executeParameterized(
+            repo.id,
+            `
           MATCH (n {id: $nodeId})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
           RETURN p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
         `,
-          { nodeId: sym.nodeId },
-        );
+            { nodeId: sym.nodeId },
+          );
+        }
       } catch (e) {
         logQueryError('query:process-lookup', e);
       }
@@ -1701,15 +1791,27 @@ export class LocalBackend {
       let cohesion = 0;
       let module: string | undefined;
       try {
-        const cohesionRows = await executeParameterized(
-          repo.id,
-          `
+        const cohesionRows = useNeo4jBackend
+          ? await (async () => {
+              const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+              return await executeReadCypher(
+                `
+          MATCH (n {repoId: $repoId, id: $nodeId})-[:MEMBER_OF]->(c:Community {repoId: $repoId})
+          RETURN c.cohesion AS cohesion, c.heuristicLabel AS module
+          LIMIT 1
+        `,
+                { repoId: repo.name, nodeId: sym.nodeId },
+              );
+            })()
+          : await executeParameterized(
+              repo.id,
+              `
           MATCH (n {id: $nodeId})-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
           RETURN c.cohesion AS cohesion, c.heuristicLabel AS module
           LIMIT 1
         `,
-          { nodeId: sym.nodeId },
-        );
+              { nodeId: sym.nodeId },
+            );
         if (cohesionRows.length > 0) {
           cohesion = (cohesionRows[0].cohesion ?? cohesionRows[0][0]) || 0;
           module = cohesionRows[0].module ?? cohesionRows[0][1];
@@ -1722,14 +1824,25 @@ export class LocalBackend {
       let content: string | undefined;
       if (includeContent) {
         try {
-          const contentRows = await executeParameterized(
-            repo.id,
-            `
+          const contentRows = useNeo4jBackend
+            ? await (async () => {
+                const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+                return await executeReadCypher(
+                  `
+            MATCH (n {repoId: $repoId, id: $nodeId})
+            RETURN n.content AS content
+          `,
+                  { repoId: repo.name, nodeId: sym.nodeId },
+                );
+              })()
+            : await executeParameterized(
+                repo.id,
+                `
             MATCH (n {id: $nodeId})
             RETURN n.content AS content
           `,
-            { nodeId: sym.nodeId },
-          );
+                { nodeId: sym.nodeId },
+              );
           if (contentRows.length > 0) {
             content = contentRows[0].content ?? contentRows[0][0];
           }
@@ -1857,6 +1970,11 @@ export class LocalBackend {
     query: string,
     limit: number,
   ): Promise<{ results: any[]; ftsUsed: boolean }> {
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      return { results: [], ftsUsed: true };
+    }
+
     const { searchFTSFromLbug } = await import('../../core/search/bm25-index.js');
     let bm25Results;
     try {
@@ -1938,6 +2056,15 @@ export class LocalBackend {
    */
   private async semanticSearch(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
     try {
+      const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+      if (isNeo4jBackendEnabled()) {
+        const { embedQuery } = await import('../core/embedder.js');
+        const queryVec = await embedQuery(query);
+        const { semanticSearch: neo4jSemanticSearch } =
+          await import('../../core/neo4j/embedding-adapter.js');
+        return await neo4jSemanticSearch(repo.name, queryVec, limit);
+      }
+
       // Check if embedding table exists before loading the model (avoids heavy model init when embeddings are off)
       const tableCheck = await executeQuery(
         repo.id,
@@ -2017,6 +2144,16 @@ export class LocalBackend {
   }
 
   private async cypher(repo: RepoHandle, params: { query: string }): Promise<any> {
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      try {
+        const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+        return await executeReadCypher(params.query);
+      } catch (err: any) {
+        return { error: err.message || 'Query failed' };
+      }
+    }
+
     await this.ensureInitialized(repo.id);
 
     if (!isLbugReady(repo.id)) {
@@ -2490,13 +2627,60 @@ export class LocalBackend {
       include_content?: boolean;
     },
   ): Promise<any> {
-    await this.ensureInitialized(repo.id);
-
     const { name, uid, file_path, kind, include_content } = params;
 
     if (!name && !uid) {
       return { error: 'Either "name" or "uid" parameter is required.' };
     }
+
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      const { findSymbolContext } = await import('../../core/neo4j/read-adapter.js');
+      const rows = await findSymbolContext(repo.name, uid || name || '', 10);
+      if (rows.length === 0) {
+        return { error: `Symbol '${name || uid}' not found` };
+      }
+
+      const row = rows[0];
+      const categorizeNeo4jRefs = (refs: any[] | undefined, direction: 'incoming' | 'outgoing') => {
+        const cats: Record<string, any[]> = {};
+        for (const ref of refs ?? []) {
+          const relType = String(ref.type || '').toLowerCase();
+          if (!relType) continue;
+          const entry =
+            direction === 'incoming'
+              ? {
+                  uid: ref.source,
+                  name: ref.sourceName,
+                }
+              : {
+                  uid: ref.target,
+                  name: ref.targetName,
+                };
+          if (!cats[relType]) cats[relType] = [];
+          cats[relType].push(entry);
+        }
+        return cats;
+      };
+
+      return {
+        status: 'found',
+        symbol: {
+          uid: row.id,
+          name: row.name,
+          kind: row.type,
+          filePath: row.filePath,
+          startLine: row.startLine,
+          endLine: row.endLine,
+          ...(include_content && row.content ? { content: row.content } : {}),
+        },
+        incoming: categorizeNeo4jRefs(row.incoming, 'incoming'),
+        outgoing: categorizeNeo4jRefs(row.outgoing, 'outgoing'),
+        processes: [],
+      };
+    }
+
+    await this.ensureInitialized(repo.id);
 
     const outcome = await this.resolveSymbolCandidates(
       repo,
@@ -3268,6 +3452,51 @@ export class LocalBackend {
       minConfidence?: number;
     },
   ): Promise<any> {
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      const { target, direction } = params;
+      const maxDepth = params.maxDepth || 3;
+      const { findImpact } = await import('../../core/neo4j/read-adapter.js');
+      const rows = await findImpact(repo.name, params.target_uid || target, direction, maxDepth);
+      const byDepth: Record<string, any[]> = {};
+
+      for (const row of rows) {
+        const depth = String(row.depth ?? 1);
+        if (!byDepth[depth]) byDepth[depth] = [];
+        byDepth[depth].push({
+          uid: row.id,
+          name: row.name,
+          kind: row.type,
+          filePath: row.filePath,
+        });
+      }
+
+      let risk = 'LOW';
+      const directCount = byDepth['1']?.length ?? 0;
+      if (directCount >= 30 || rows.length >= 200) {
+        risk = 'CRITICAL';
+      } else if (directCount >= 15 || rows.length >= 100) {
+        risk = 'HIGH';
+      } else if (directCount >= 5 || rows.length >= 30) {
+        risk = 'MEDIUM';
+      }
+
+      return {
+        target: { name: target },
+        direction,
+        impactedCount: rows.length,
+        risk,
+        summary: {
+          direct: directCount,
+          processes_affected: 0,
+          modules_affected: 0,
+        },
+        affected_processes: [],
+        affected_modules: [],
+        byDepth,
+      };
+    }
+
     await this.ensureInitialized(repo.id);
 
     const { target, direction } = params;

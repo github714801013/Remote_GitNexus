@@ -79,11 +79,27 @@ export const contentHashForNode = (
  */
 export type EmbeddingProgressCallback = (progress: EmbeddingProgress) => void;
 
+export interface EmbeddingPipelineStorage {
+  loadNodes?: () => Promise<EmbeddableNode[]>;
+  insertEmbeddings?: (
+    updates: Array<{
+      nodeId: string;
+      chunkIndex: number;
+      startLine: number;
+      endLine: number;
+      embedding: number[];
+      contentHash?: string;
+    }>,
+  ) => Promise<void>;
+  deleteEmbeddingsForNodeIds?: (nodeIds: string[]) => Promise<void>;
+  ensureVectorIndex?: () => Promise<void>;
+}
+
 /**
  * Query all embeddable nodes from LadybugDB
  * Uses table-specific queries for different label types
  */
-const queryEmbeddableNodes = async (
+export const queryEmbeddableNodes = async (
   executeQuery: (cypher: string) => Promise<any[]>,
 ): Promise<EmbeddableNode[]> => {
   const allNodes: EmbeddableNode[] = [];
@@ -231,6 +247,7 @@ export const runEmbeddingPipeline = async (
   skipNodeIds?: Set<string>,
   context?: EmbeddingContext,
   existingEmbeddings?: Map<string, string>,
+  storage?: EmbeddingPipelineStorage,
 ): Promise<void> => {
   const finalConfig = { ...DEFAULT_EMBEDDING_CONFIG, ...config };
 
@@ -264,7 +281,9 @@ export const runEmbeddingPipeline = async (
     }
 
     // Phase 2: Query embeddable nodes
-    let nodes = await queryEmbeddableNodes(executeQuery);
+    let nodes = storage?.loadNodes
+      ? await storage.loadNodes()
+      : await queryEmbeddableNodes(executeQuery);
 
     // Apply context metadata
     if (context?.repoName) {
@@ -305,10 +324,14 @@ export const runEmbeddingPipeline = async (
           console.log(`🔄 Deleting ${staleNodeIds.length} stale embedding rows for re-embed`);
         }
         try {
-          await executeWithReusedStatement(
-            `MATCH (e:${EMBEDDING_TABLE_NAME} {nodeId: $nodeId}) DELETE e`,
-            staleNodeIds.map((nodeId) => ({ nodeId })),
-          );
+          if (storage?.deleteEmbeddingsForNodeIds) {
+            await storage.deleteEmbeddingsForNodeIds(staleNodeIds);
+          } else {
+            await executeWithReusedStatement(
+              `MATCH (e:${EMBEDDING_TABLE_NAME} {nodeId: $nodeId}) DELETE e`,
+              staleNodeIds.map((nodeId) => ({ nodeId })),
+            );
+          }
         } catch (err) {
           // "does not exist" = rows already gone — safe to proceed.
           // All other errors risk vector-index corruption (Kuzu requires DELETE-before-INSERT
@@ -339,7 +362,11 @@ export const runEmbeddingPipeline = async (
       // Ensure the vector index exists even when no new nodes need embedding.
       // A prior crash or first-time incremental run may have left CodeEmbedding
       // rows without ever reaching index creation.
-      await createVectorIndex(executeQuery);
+      if (storage?.ensureVectorIndex) {
+        await storage.ensureVectorIndex();
+      } else {
+        await createVectorIndex(executeQuery);
+      }
 
       onProgress({
         phase: 'ready',
@@ -450,7 +477,9 @@ export const runEmbeddingPipeline = async (
       // Increased default GPU sub-batch size to 32 for better performance on remote GPU.
       const EMBED_SUB_BATCH = process.env.GITNEXUS_EMBEDDING_BATCH_SIZE
         ? parseInt(process.env.GITNEXUS_EMBEDDING_BATCH_SIZE, 10)
-        : getCurrentDevice() === 'cuda' || getCurrentDevice() === 'dml' ? 32 : 8;
+        : getCurrentDevice() === 'cuda' || getCurrentDevice() === 'dml'
+          ? 32
+          : 8;
       for (let si = 0; si < allTexts.length; si += EMBED_SUB_BATCH) {
         const subTexts = allTexts.slice(si, si + EMBED_SUB_BATCH);
         const subUpdates = allUpdates.slice(si, si + EMBED_SUB_BATCH);
@@ -471,7 +500,11 @@ export const runEmbeddingPipeline = async (
           embedding: embeddingToArray(embeddings[i]),
         }));
 
-        await batchInsertEmbeddings(executeWithReusedStatement, dbUpdates);
+        if (storage?.insertEmbeddings) {
+          await storage.insertEmbeddings(dbUpdates);
+        } else {
+          await batchInsertEmbeddings(executeWithReusedStatement, dbUpdates);
+        }
       }
 
       processedNodes += batch.length;
@@ -500,7 +533,11 @@ export const runEmbeddingPipeline = async (
       console.log('📇 Creating vector index...');
     }
 
-    await createVectorIndex(executeQuery);
+    if (storage?.ensureVectorIndex) {
+      await storage.ensureVectorIndex();
+    } else {
+      await createVectorIndex(executeQuery);
+    }
 
     onProgress({
       phase: 'ready',

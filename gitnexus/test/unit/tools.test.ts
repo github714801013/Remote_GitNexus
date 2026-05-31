@@ -103,15 +103,17 @@ describe('GITNEXUS_TOOLS', () => {
     expect(names).not.toContain('zoekt_symbol');
   });
 
-  it('documents query as the unified Zoekt entry point', () => {
+  it('documents Neo4j-first cross-repo query guidance', () => {
     const listReposTool = GITNEXUS_TOOLS.find((t) => t.name === 'list_repos')!;
     const queryTool = GITNEXUS_TOOLS.find((t) => t.name === 'query')!;
-    expect(listReposTool.description).toContain('Use query for Zoekt-backed search');
+    expect(listReposTool.description).toContain('call query without "repo"');
+    expect(listReposTool.description).toContain('Single-file LadybugDB indexes are repo-scoped');
     expect(queryTool.description).toContain('SMART DISCOVERY');
-    expect(queryTool.description).toContain('When omitting "repo", pass "zoekt"');
+    expect(queryTool.description).toContain('omit "repo" by default for the first query');
+    expect(queryTool.description).toContain('Single-file LadybugDB indexes are repo-scoped');
     expect(queryTool.inputSchema.properties.zoekt.description).toContain('Raw Zoekt query string');
     expect(queryTool.inputSchema.properties.repo.description).toContain(
-      'If omitted in multi-repo setups, provide "zoekt"',
+      'In Neo4j mode, omit for the first search',
     );
   });
 

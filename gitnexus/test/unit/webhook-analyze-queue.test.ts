@@ -75,4 +75,99 @@ describe('WebhookAnalyzeQueue', () => {
     await duplicateTwo.done;
     expect(started).toEqual(['first', 'duplicate-two']);
   });
+
+  it('prioritizes the latest duplicate repo request before unrelated queued repos', async () => {
+    const queue = new WebhookAnalyzeQueue();
+    const first = deferred<void>();
+    const started: string[] = [];
+
+    const firstResult = queue.enqueue({
+      key: 'repo-a',
+      run: async () => {
+        started.push('first');
+        await first.promise;
+      },
+    });
+    const otherResult = queue.enqueue({
+      key: 'repo-b',
+      run: async () => {
+        started.push('other');
+      },
+    });
+    const duplicateResult = queue.enqueue({
+      key: 'repo-a',
+      run: async () => {
+        started.push('duplicate');
+      },
+    });
+
+    expect(otherResult.status).toBe('accepted');
+    expect(duplicateResult.status).toBe('deferred');
+    await Promise.resolve();
+    expect(started).toEqual(['first']);
+
+    first.resolve();
+    await firstResult.done;
+    await duplicateResult.done;
+    await otherResult.done;
+    expect(started).toEqual(['first', 'duplicate', 'other']);
+  });
+
+  it('starts another repo after the active task releases its structure slot', async () => {
+    const queue = new WebhookAnalyzeQueue();
+    const embedding = deferred<void>();
+    const started: string[] = [];
+
+    const firstResult = queue.enqueue({
+      key: 'repo-a',
+      run: async (releaseStructureSlot) => {
+        started.push('repo-a');
+        releaseStructureSlot();
+        await embedding.promise;
+      },
+    });
+    const secondResult = queue.enqueue({
+      key: 'repo-b',
+      run: async () => {
+        started.push('repo-b');
+      },
+    });
+
+    await Promise.resolve();
+    expect(started).toEqual(['repo-a', 'repo-b']);
+
+    await secondResult.done;
+    embedding.resolve();
+    await firstResult.done;
+  });
+
+  it('keeps duplicate repo requests deferred after the structure slot is released', async () => {
+    const queue = new WebhookAnalyzeQueue();
+    const embedding = deferred<void>();
+    const started: string[] = [];
+
+    const firstResult = queue.enqueue({
+      key: 'repo-a',
+      run: async (releaseStructureSlot) => {
+        started.push('first');
+        releaseStructureSlot();
+        await embedding.promise;
+      },
+    });
+    const duplicateResult = queue.enqueue({
+      key: 'repo-a',
+      run: async () => {
+        started.push('duplicate');
+      },
+    });
+
+    expect(duplicateResult.status).toBe('deferred');
+    await Promise.resolve();
+    expect(started).toEqual(['first']);
+
+    embedding.resolve();
+    await firstResult.done;
+    await duplicateResult.done;
+    expect(started).toEqual(['first', 'duplicate']);
+  });
 });

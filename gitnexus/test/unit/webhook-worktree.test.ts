@@ -8,6 +8,7 @@ import {
   assertEnvAllowed,
   assertSafeGitRef,
   assertSafeSegment,
+  buildGiteaWebhookAnalyzeOptions,
   buildRegistryName,
   copyBootstrapIndex,
   getGiteaWebhookRepoPath,
@@ -67,6 +68,17 @@ describe('webhook worktree helpers', () => {
       path.join('/projects', 'oa-java', 'oa-order'),
     );
     expect(() => getGiteaWebhookRepoPath('/projects', '../oa-order')).toThrow(WebhookWorktreeError);
+  });
+
+  it('builds analyze registration options from the legacy Gitea branch', () => {
+    expect(buildGiteaWebhookAnalyzeOptions('group-logistics/oa-stock', 'release_9ji')).toEqual({
+      repoName: 'oa-stock',
+      registryName: 'oa-stock',
+      registryBranch: 'release_9ji',
+    });
+    expect(() => buildGiteaWebhookAnalyzeOptions('group-logistics/oa-stock', '../dev')).toThrow(
+      WebhookWorktreeError,
+    );
   });
 
   it('upserts legacy webhook repo config without dropping existing entries', async () => {

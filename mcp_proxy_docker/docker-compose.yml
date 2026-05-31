@@ -78,6 +78,32 @@ services:
       - zoekt-indexserver
     restart: always
 
+  # ─── Neo4j 单库图及向量索引存储 ──────────────────────────────────────────────
+  neo4j:
+    image: neo4j:2026.04.0
+    container_name: gitnexus-neo4j
+    ports:
+      - '7474:7474'
+      - '7687:7687'
+    environment:
+      - NEO4J_AUTH=${GITNEXUS_NEO4J_USER:-neo4j}/${GITNEXUS_NEO4J_PASSWORD:-gitnexus}
+      - NEO4J_server_memory_heap_initial__size=${GITNEXUS_NEO4J_HEAP_INITIAL:-2G}
+      - NEO4J_server_memory_heap_max__size=${GITNEXUS_NEO4J_HEAP_MAX:-8G}
+      - NEO4J_server_memory_pagecache_size=${GITNEXUS_NEO4J_PAGECACHE:-4G}
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'cypher-shell -u ${GITNEXUS_NEO4J_USER:-neo4j} -p ${GITNEXUS_NEO4J_PASSWORD:-gitnexus} "RETURN 1"',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
   # ─── GitNexus MCP 代理 ────────────────────────────────────────────────────────
   gitnexus-mcp-proxy:
     image: gitnexus-mcp-proxy:latest
@@ -110,13 +136,25 @@ services:
       - GITNEXUS_PIPELINE_MEMORY_LOG=1
       - ZOEKT_ENDPOINTS=http://zoekt-webserver:6070
       - ZOEKT_TRIGGER_DIR=/data/zoekt-index/triggers
+      - GITNEXUS_STORAGE_BACKEND=neo4j
+      - GITNEXUS_NEO4J_URI=bolt://neo4j:7687
+      - GITNEXUS_NEO4J_USER=${GITNEXUS_NEO4J_USER:-neo4j}
+      - GITNEXUS_NEO4J_PASSWORD=${GITNEXUS_NEO4J_PASSWORD:-gitnexus}
+      - GITNEXUS_NEO4J_DATABASE=${GITNEXUS_NEO4J_DATABASE:-neo4j}
     depends_on:
-      - zoekt-webserver
+      zoekt-webserver:
+        condition: service_started
+      neo4j:
+        condition: service_healthy
     stop_grace_period: 5m
     restart: always
 
 volumes:
   zoekt-index:
+    driver: local
+  neo4j-data:
+    driver: local
+  neo4j-logs:
     driver: local
 
 networks:

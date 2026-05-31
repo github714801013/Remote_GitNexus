@@ -2,9 +2,10 @@
  * MCP Tool Definitions
  *
  * Defines the tools that GitNexus exposes to external AI agents.
- * Search/read-only tools can omit `repo` in multi-repo setups; the backend
- * searches visible repositories and returns merged results. Repo-specific or
- * write-like tools still require `repo` when multiple repositories are indexed.
+ * With the Neo4j storage backend, query can omit `repo` to search across
+ * visible repositories first. Single-file LadybugDB indexes are repo-scoped.
+ * Repo-specific or write-like tools still require `repo` when multiple
+ * repositories are indexed.
  */
 
 export interface ToolDefinition {
@@ -39,11 +40,12 @@ Returns each repo's name, path, branch, indexed date, last commit, and stats.
 WHEN TO USE: First step when multiple repos are indexed, or to discover available repos.
 AFTER THIS: READ gitnexus://repo/{name}/context for the repo you want to work with.
 
-When multiple repos are indexed, search/read-only tools such as query, cypher,
-context, route_map, shape_check, tool_map, and api_impact may omit "repo"; the
-service searches visible repositories and returns merged results. Repo-specific
-or write-like tools such as impact, detect_changes, rename, and code_snippet
-should specify "repo".`,
+When the storage backend is Neo4j, start broad: call query without "repo" to
+search across visible repositories. Specify "repo" only after the cross-repo
+result identifies a concrete project or when narrowing follow-up context/impact
+work. Single-file LadybugDB indexes are repo-scoped and require "repo" for
+project-specific searches. Repo-specific or write-like tools such as impact,
+detect_changes, rename, and code_snippet should specify "repo".`,
     inputSchema: {
       type: 'object',
       properties: {},
@@ -69,7 +71,7 @@ Hybrid ranking: BM25 keyword + Semantic vector + Zoekt exact/regex search, merge
 
 GROUP MODE: set "repo" to "@<groupName>" to search all member repos in that group (merged via RRF), or "@<groupName>/<groupRepoPath>" to run against a single member (same path keys as in group.yaml). If you use "@<groupName>" only, the member repo defaults to the lexicographically first key in group.yaml "repos". Prefer resources for contracts/status (see migration from legacy group_* tools).
 
-SMART DISCOVERY: In multi-repo setups, you can omit "repo". GitNexus first tries Zoekt-backed repository discovery when a query/zoekt string is available; if discovery finds no repositories, the service falls back to searching visible repositories and returns merged results.
+SMART DISCOVERY: With the Neo4j storage backend, omit "repo" by default for the first query. GitNexus searches visible repositories in one cross-repo discovery pass and returns repo-labeled matches. Specify "repo" only after the cross-repo result identifies a concrete project or you need to narrow a follow-up lookup. Single-file LadybugDB indexes are repo-scoped and do not provide true cross-repository graph/vector query.
 
 SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). When "repo" starts with "@", only processes whose symbols fall under that prefix are included. For a normal indexed repo name (no leading @), this field is currently ignored by the server.`,
     inputSchema: {
@@ -116,7 +118,7 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
         repo: {
           type: 'string',
           description:
-            'Indexed repository name or path, or group mode "@<groupName>" / "@<groupName>/<memberPath>" (member path keys from group.yaml). Omit to search visible repositories and merge results in multi-repo setups.',
+            'Indexed repository name or path, or group mode "@<groupName>" / "@<groupName>/<memberPath>" (member path keys from group.yaml). In Neo4j mode, omit for the first search so GitNexus can query across visible repositories; set it only to narrow follow-up work to a concrete repo. LadybugDB mode is repo-scoped and requires a repo in multi-repo setups.',
         },
         service: {
           type: 'string',

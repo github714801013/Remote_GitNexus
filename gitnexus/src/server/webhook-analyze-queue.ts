@@ -1,8 +1,9 @@
 export type WebhookAnalyzeStatus = 'accepted' | 'deferred';
+export type ReleaseWebhookAnalyzeSlot = () => void;
 
 export interface WebhookAnalyzeTask {
   key: string;
-  run: () => Promise<void>;
+  run: (releaseStructureSlot: ReleaseWebhookAnalyzeSlot) => Promise<void>;
 }
 
 export interface WebhookAnalyzeQueueResult {
@@ -60,19 +61,31 @@ export class WebhookAnalyzeQueue {
     const key = pending.task.key;
     this.running += 1;
     this.activeKeys.add(key);
+    let structureSlotReleased = false;
+    const releaseStructureSlot = () => {
+      if (structureSlotReleased) return;
+      structureSlotReleased = true;
+      this.running -= 1;
+      this.drain();
+    };
+    const markStructureSlotReleased = () => {
+      if (structureSlotReleased) return;
+      structureSlotReleased = true;
+      this.running -= 1;
+    };
     try {
-      await pending.task.run();
+      await pending.task.run(releaseStructureSlot);
       pending.resolve();
     } catch (err) {
       pending.reject(err);
     } finally {
       this.activeKeys.delete(key);
-      this.running -= 1;
+      markStructureSlotReleased();
 
       const nextForKey = this.pendingByKey.get(key);
       if (nextForKey) {
         this.pendingByKey.delete(key);
-        this.queue.push(nextForKey);
+        this.queue.unshift(nextForKey);
       }
       this.drain();
     }

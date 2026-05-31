@@ -5,6 +5,7 @@ import {
   isRepairableIndexError,
   shouldScheduleStartupIncrementalAnalyze,
   shouldScheduleStartupEmbeddings,
+  shouldRunStartupLbugHealthCheck,
   shouldTreatAnalyzeWorkerExitAsCrash,
 } from '../../src/server/api.js';
 
@@ -17,6 +18,7 @@ describe('analyze API logic', () => {
 
   afterEach(() => {
     manager.dispose();
+    delete process.env.GITNEXUS_STORAGE_BACKEND;
   });
 
   it('creates a job and returns 202 shape', () => {
@@ -123,5 +125,13 @@ describe('analyze API logic', () => {
     expect(shouldScheduleStartupIncrementalAnalyze({ isStale: false, commitsBehind: 0 })).toBe(
       false,
     );
+  });
+
+  it('skips startup lbug health checks when Neo4j is the storage backend', () => {
+    expect(shouldRunStartupLbugHealthCheck()).toBe(true);
+
+    process.env.GITNEXUS_STORAGE_BACKEND = 'neo4j';
+
+    expect(shouldRunStartupLbugHealthCheck()).toBe(false);
   });
 });

@@ -11,6 +11,8 @@ REMOTE_PATH="/home/ji99/Project/mcp_gitnexus_server"
 REGISTRY_URL="harbor.saas.ch999.cn:1088/common"
 IMAGE_NAME="gitnexus-mcp-proxy"
 TAR_FILE="gitnexus_noble_deploy.tar.gz"
+RAW_TAR_FILE="${TAR_FILE%.gz}"
+BUILDX_BUILDER="gitnexus-deploy-builder"
 : "${gitnexus_gitea_token:?gitnexus_gitea_token environment variable is required}"
 
 # 自动修复 Windows Bash 下的 Docker 路径问题
@@ -25,15 +27,23 @@ version=$(git rev-parse --short HEAD 2>/dev/null || echo "latest")
 full_image_tag="${REGISTRY_URL}/${IMAGE_NAME}:${version}"
 
 export DOCKER_BUILDKIT=1
-MSYS_NO_PATHCONV=1 docker build -t "${full_image_tag}" -f mcp_proxy_docker/Dockerfile --build-arg VITE_BACKEND_URL=/ .
-
-# 同时也打一个 latest 标签
-docker tag "${full_image_tag}" "${IMAGE_NAME}:latest"
+rm -f "${RAW_TAR_FILE}" "${TAR_FILE}"
+if ! docker buildx inspect "${BUILDX_BUILDER}" >/dev/null 2>&1; then
+    docker buildx create --name "${BUILDX_BUILDER}" --driver docker-container --use
+fi
+docker buildx inspect "${BUILDX_BUILDER}" --bootstrap >/dev/null
+MSYS_NO_PATHCONV=1 docker buildx build \
+    --builder "${BUILDX_BUILDER}" \
+    -t "${full_image_tag}" \
+    -t "${IMAGE_NAME}:latest" \
+    -f mcp_proxy_docker/Dockerfile \
+    --build-arg VITE_BACKEND_URL=/ \
+    --output "type=docker,dest=${RAW_TAR_FILE}" \
+    .
 
 echo ""
-echo "=== 步骤 2: 导出并压缩镜像 (流式操作，避免临时大文件) ==="
-# 使用管道直接压缩，减少磁盘占用和 IO 锁风险
-docker save "${IMAGE_NAME}:latest" | gzip > "${TAR_FILE}"
+echo "=== 步骤 2: 压缩镜像归档 ==="
+gzip -f "${RAW_TAR_FILE}"
 
 echo ""
 echo "=== 步骤 3: 传输镜像和配置到远端 ==="
@@ -44,15 +54,7 @@ ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
     if [ -f /home/ji99/gitnexus/repos.json ]; then cp /home/ji99/gitnexus/repos.json /home/ji99/gitnexus/repos.json.bak; fi
     if [ -f /home/ji99/.gitnexus/registry.json ]; then cp /home/ji99/.gitnexus/registry.json "${REMOTE_PATH}/registry.json.bak"; fi
 
-    echo "备份现有索引 meta.json..."
-    if docker image inspect "${IMAGE_NAME}:latest" >/dev/null 2>&1; then
-        docker run --rm --entrypoint sh \
-            -v /home/ji99/gitnexus:/projects \
-            "${IMAGE_NAME}:latest" \
-            -lc 'find /projects -path "*/.gitnexus/meta.json" -type f -exec cp -p {} {}.bak \;'
-    else
-        echo "WARN: ${IMAGE_NAME}:latest 不存在，跳过 meta.json 容器内备份"
-    fi
+    echo "Neo4j 模式不再备份 LadybugDB 索引 meta.json"
 EOF
 scp "${TAR_FILE}" mcp_proxy_docker/auto_verify.py repos.json mcp_proxy_docker/docker-compose-vllm.yml mcp_proxy_docker/docker-compose.yml "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/"
 

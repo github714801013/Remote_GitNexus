@@ -41,6 +41,30 @@ describe('run-analyze module', () => {
     ).toBe(true);
   });
 
+  it('does not skip current index when registry branch changed', async () => {
+    const mod = await import('../../src/core/run-analyze.js');
+
+    expect(
+      mod.shouldReturnAlreadyUpToDate(
+        { lastCommit: 'abc123', branch: 'dev', stats: { embeddings: 42 } },
+        'abc123',
+        { embeddings: true, registryBranch: 'release_9ji' },
+      ),
+    ).toBe(false);
+  });
+
+  it('skips current index when registry branch still matches', async () => {
+    const mod = await import('../../src/core/run-analyze.js');
+
+    expect(
+      mod.shouldReturnAlreadyUpToDate(
+        { lastCommit: 'abc123', branch: 'release_9ji', stats: { embeddings: 42 } },
+        'abc123',
+        { embeddings: true, registryBranch: 'release_9ji' },
+      ),
+    ).toBe(true);
+  });
+
   it('inherits embedding generation when the existing index has embeddings', async () => {
     const mod = await import('../../src/core/run-analyze.js');
 

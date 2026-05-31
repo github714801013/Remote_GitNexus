@@ -18,8 +18,10 @@ import {
   listRegisteredRepos,
   getStoragePath,
   registerRepo,
+  saveMeta,
   unregisterRepo,
 } from '../storage/repo-manager.js';
+import { getCurrentBranch, getCurrentCommit, getRemoteUrl, hasGitDir } from '../storage/git.js';
 import {
   executeQuery,
   executePrepared,
@@ -49,10 +51,12 @@ import { extractRepoName, getCloneDir, cloneOrPull, cloneOrResetToBranch } from 
 import { cleanCorruptedLbugAfterCrash } from './crash-lbug-cleanup.js';
 import { WebhookAnalyzeQueue } from './webhook-analyze-queue.js';
 import { checkStaleness, type StalenessInfo } from '../core/git-staleness.js';
+import { isNeo4jBackendEnabled } from '../core/neo4j/config.js';
 import {
   WebhookWorktreeError,
   assertEnvAllowed,
   assertSafeSegment,
+  buildGiteaWebhookAnalyzeOptions,
   buildRegistryName,
   copyBootstrapIndex,
   ensureLocalWorktree,
@@ -99,6 +103,8 @@ export const shouldScheduleStartupEmbeddings = (
 export const shouldScheduleStartupIncrementalAnalyze = (
   staleness: Pick<StalenessInfo, 'isStale' | 'commitsBehind'>,
 ): boolean => staleness.isStale && staleness.commitsBehind > 0;
+
+export const shouldRunStartupLbugHealthCheck = (): boolean => !isNeo4jBackendEnabled();
 
 const pathExists = async (targetPath: string): Promise<boolean> =>
   fs.access(targetPath).then(
@@ -637,6 +643,30 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     activeRepoPaths.delete(repoPath);
   };
 
+  const persistAnalyzeMetadata = async (
+    repoPath: string,
+    options: any,
+    stats: Record<string, unknown> | undefined,
+  ): Promise<void> => {
+    const meta = {
+      repoPath,
+      lastCommit: hasGitDir(repoPath) ? getCurrentCommit(repoPath) : '',
+      indexedAt: new Date().toISOString(),
+      branch:
+        options.registryBranch ?? (hasGitDir(repoPath) ? getCurrentBranch(repoPath) : undefined),
+      remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+      stats: stats ?? {},
+    };
+    await saveMeta(getStoragePath(repoPath), meta);
+    await registerRepo(repoPath, meta, {
+      name: options.registryName,
+      allowDuplicateName: options.allowDuplicateName,
+    });
+    console.info(
+      `[analyze-worker] persisted metadata repoPath=${repoPath} branch=${meta.branch ?? ''} commit=${meta.lastCommit} registryName=${options.registryName ?? ''}`,
+    );
+  };
+
   const createAnalyzeWorker = (
     job: ReturnType<JobManager['createJob']>,
     targetPath: string,
@@ -681,8 +711,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       } else if (msg.type === 'complete') {
         workerReportedTerminal = true;
         releaseRepoLock(analyzeLockKey);
-        backend
-          .refreshListReposCache()
+        persistAnalyzeMetadata(targetPath, options, msg.result?.stats)
+          .then(() => backend.refreshListReposCache())
           .then(() => {
             jobManager.updateJob(job.id, { status: 'complete', repoName: msg.result.repoName });
           })
@@ -808,7 +838,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     console.info(`[webhook] enqueue analyze repoPath=${resolvedRepoPath}`);
     const queued = webhookAnalyzeQueue.enqueue({
       key: resolvedRepoPath,
-      run: async () => {
+      run: async (releaseStructureSlot) => {
         const lockKey = getStoragePath(repoPath);
         const lockErr = acquireRepoLock(lockKey);
         if (lockErr) {
@@ -819,17 +849,30 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           }
           throw err;
         }
+        let releaseProgressListener: (() => void) | undefined;
         try {
           await beforeAnalyze?.();
           await ensureCocoaPodsDependencies(repoPath);
           job = startAnalyzeForPath(repoPath, params, true);
+          releaseProgressListener = jobManager.onProgress(job.id, (progress) => {
+            if (progress.phase === 'embeddings' && progress.percent >= 90) {
+              console.info(
+                `[webhook] analyze structure slot released jobId=${job?.id} repoPath=${resolvedRepoPath}`,
+              );
+              releaseStructureSlot();
+              releaseProgressListener?.();
+              releaseProgressListener = undefined;
+            }
+          });
           console.info(`[webhook] analyze started jobId=${job.id} repoPath=${resolvedRepoPath}`);
           await waitForAnalyzeJob(job.id);
           console.info(`[webhook] analyze completed jobId=${job.id} repoPath=${resolvedRepoPath}`);
         } catch (err: any) {
-          releaseRepoLock(lockKey);
           console.error(`[webhook] analyze failed repoPath=${resolvedRepoPath}:`, err);
           throw err;
+        } finally {
+          releaseProgressListener?.();
+          releaseRepoLock(lockKey);
         }
       },
     });
@@ -868,10 +911,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const repoPath = getGiteaWebhookRepoPath(projectsRoot, entry.full_name);
       const cloneUrl = typeof entry.clone_url === 'string' ? entry.clone_url : undefined;
       const branch = typeof entry.branch === 'string' ? entry.branch : 'master';
-      const repoName = path.basename(entry.full_name);
-      const queued = enqueueWebhookAnalyze(repoPath, { repoUrl: cloneUrl, repoName }, async () => {
-        if (cloneUrl) await cloneOrResetToBranch(cloneUrl, repoPath, branch);
-      });
+      const analyzeOptions = buildGiteaWebhookAnalyzeOptions(entry.full_name, branch);
+      const queued = enqueueWebhookAnalyze(
+        repoPath,
+        { repoUrl: cloneUrl, ...analyzeOptions },
+        async () => {
+          if (cloneUrl) await cloneOrResetToBranch(cloneUrl, repoPath, branch);
+        },
+      );
       queued.done.catch((err) => {
         console.error(`Startup webhook indexing failed for ${entry.full_name}:`, err);
       });
@@ -880,6 +927,22 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   const scheduleStartupIndexHealthCheck = async (): Promise<void> => {
     const projectsRoot = getProjectsRoot();
+    const reposFile = path.join(projectsRoot, 'repos.json');
+    const webhookBranchByPath = new Map<string, string>();
+    try {
+      const raw = await fs.readFile(reposFile, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        for (const entry of parsed) {
+          if (!entry || typeof entry.full_name !== 'string') continue;
+          const branch = typeof entry.branch === 'string' ? entry.branch : 'master';
+          const repoPath = getGiteaWebhookRepoPath(projectsRoot, entry.full_name);
+          webhookBranchByPath.set(path.resolve(repoPath), branch);
+        }
+      }
+    } catch {
+      // repos.json is optional; plain project discovery still works without it.
+    }
     const registeredBeforeSync = await listRegisteredRepos().catch((err) => {
       console.warn('[webhook] startup registry sync skipped:', err);
       return [];
@@ -922,37 +985,41 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
     for (const entry of entries) {
       const repoPath = entry.path;
-      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const registryBranch = webhookBranchByPath.get(path.resolve(repoPath)) ?? entry.branch;
       const meta = await loadMeta(entry.storagePath);
       const needsEmbeddings = shouldScheduleStartupEmbeddings(meta);
       const staleness = checkStaleness(repoPath, entry.lastCommit);
-      try {
-        await initPooledLbug(entry.name, lbugPath);
-        await closePooledLbug(entry.name);
-      } catch (err) {
-        await closePooledLbug(entry.name).catch(() => {});
-        if (!isRepairableIndexError(err)) {
+
+      if (shouldRunStartupLbugHealthCheck()) {
+        const lbugPath = path.join(entry.storagePath, 'lbug');
+        try {
+          await initPooledLbug(entry.name, lbugPath);
+          await closePooledLbug(entry.name);
+        } catch (err) {
+          await closePooledLbug(entry.name).catch(() => {});
+          if (!isRepairableIndexError(err)) {
+            console.warn(
+              `[webhook] startup index health check skipped repo=${entry.name}: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+            continue;
+          }
+
           console.warn(
-            `[webhook] startup index health check skipped repo=${entry.name}: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
+            `[webhook] startup index health check detected damaged index repo=${entry.name}; enqueue analyze`,
           );
+          const queued = enqueueWebhookAnalyze(repoPath, {
+            repoName: entry.name,
+            embeddings: needsEmbeddings || undefined,
+            registryName: entry.name,
+            registryBranch,
+          });
+          queued.done.catch((analyzeErr) => {
+            console.error(`[webhook] startup index repair failed for ${entry.name}:`, analyzeErr);
+          });
           continue;
         }
-
-        console.warn(
-          `[webhook] startup index health check detected damaged index repo=${entry.name}; enqueue analyze`,
-        );
-        const queued = enqueueWebhookAnalyze(repoPath, {
-          repoName: entry.name,
-          embeddings: needsEmbeddings || undefined,
-          registryName: entry.name,
-          registryBranch: entry.branch,
-        });
-        queued.done.catch((analyzeErr) => {
-          console.error(`[webhook] startup index repair failed for ${entry.name}:`, analyzeErr);
-        });
-        continue;
       }
 
       if (shouldScheduleStartupIncrementalAnalyze(staleness)) {
@@ -964,7 +1031,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           force: false,
           embeddings: needsEmbeddings || undefined,
           registryName: entry.name,
-          registryBranch: entry.branch,
+          registryBranch,
         });
         queued.done.catch((analyzeErr) => {
           console.error(
@@ -983,7 +1050,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           repoName: entry.name,
           embeddings: true,
           registryName: entry.name,
-          registryBranch: entry.branch,
+          registryBranch,
         });
         queued.done.catch((analyzeErr) => {
           console.error(`[webhook] startup embedding repair failed for ${entry.name}:`, analyzeErr);
@@ -1676,25 +1743,27 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const projectsRoot = getProjectsRoot();
       const repoPath = getGiteaWebhookRepoPath(projectsRoot, repo.fullName);
       const reposFile = path.join(projectsRoot, 'repos.json');
+      const branch = repo.branch || 'master';
+      const analyzeOptions = buildGiteaWebhookAnalyzeOptions(repo.fullName, branch);
 
       await upsertWebhookRepoConfig(reposFile, {
         full_name: repo.fullName,
         clone_url: repo.cloneUrl,
-        branch: repo.branch || 'master',
+        branch,
       });
 
       const queued = enqueueWebhookAnalyze(
         repoPath,
         {
           repoUrl: repo.cloneUrl,
-          repoName: path.basename(repo.fullName),
+          ...analyzeOptions,
         },
         async () => {
           if (!repo.cloneUrl) return;
           console.info(
-            `[webhook] sync repository repository=${repo.fullName} branch=${repo.branch || 'master'} path=${repoPath}`,
+            `[webhook] sync repository repository=${repo.fullName} branch=${branch} path=${repoPath}`,
           );
-          await cloneOrResetToBranch(repo.cloneUrl, repoPath, repo.branch || 'master');
+          await cloneOrResetToBranch(repo.cloneUrl, repoPath, branch);
         },
       );
       queued.done.catch((err) => {

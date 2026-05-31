@@ -125,6 +125,31 @@ export interface WebhookRepoConfigEntry {
   branch?: string;
 }
 
+export interface WebhookAnalyzeRegistrationOptions {
+  repoName: string;
+  registryName: string;
+  registryBranch: string;
+}
+
+export const buildGiteaWebhookAnalyzeOptions = (
+  fullName: string,
+  branch: string,
+): WebhookAnalyzeRegistrationOptions => {
+  const segments = fullName.split('/');
+  if (segments.length === 0 || segments.some((segment) => segment.length === 0)) {
+    throw new WebhookWorktreeError('Invalid repository full_name');
+  }
+  for (const segment of segments) assertSafeSegment(segment, 'repository full_name');
+  assertSafeGitRef(branch, 'branch');
+
+  const repoName = segments[segments.length - 1];
+  return {
+    repoName,
+    registryName: repoName,
+    registryBranch: branch,
+  };
+};
+
 export const upsertWebhookRepoConfig = async (
   reposFile: string,
   entry: WebhookRepoConfigEntry,
