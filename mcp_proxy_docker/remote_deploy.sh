@@ -60,7 +60,7 @@ ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
 
     echo "Neo4j 模式不再备份 LadybugDB 索引 meta.json"
 EOF
-scp "${TAR_FILE}" mcp_proxy_docker/auto_verify.py repos.json mcp_proxy_docker/docker-compose-vllm.yml mcp_proxy_docker/docker-compose.yml "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/"
+scp "${TAR_FILE}" mcp_proxy_docker/auto_verify.py repos.json mcp_proxy_docker/docker-compose.yml "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/"
 
 echo ""
 echo "=== 步骤 4: 远程部署与启动 ==="
@@ -74,16 +74,13 @@ ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
     echo "清理传输文件..."
     rm "${TAR_FILE}"
 
-    echo "启动辅助引擎 (vLLM)..."
-    docker compose -f docker-compose-vllm.yml up -d
-
     echo "停止并清理旧的独立容器 (如有)..."
     docker stop -t 30 "${IMAGE_NAME}" 2>/dev/null || true
     docker rm "${IMAGE_NAME}" 2>/dev/null || true
 
     echo "启动 GitNexus + Zoekt (docker compose)..."
     GITEA_TOKEN="${gitnexus_gitea_token}" \
-    GITNEXUS_EMBEDDING_BATCH_SIZE="${GITNEXUS_EMBEDDING_BATCH_SIZE:-1}" \
+    GITNEXUS_EMBEDDING_BATCH_SIZE="${GITNEXUS_EMBEDDING_BATCH_SIZE:-32}" \
     docker compose -f docker-compose.yml up -d
 
     echo "--- 执行自动验证 ---"

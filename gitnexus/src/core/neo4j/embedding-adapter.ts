@@ -42,6 +42,8 @@ const toNumber = (value: any, fallback = 0): number => {
   return Number.isFinite(n) ? n : fallback;
 };
 
+const EMBEDDABLE_LABEL_EXPRESSION = EMBEDDABLE_LABELS.map((label) => `\`${label}\``).join('|');
+
 export const fetchExistingEmbeddingHashes = async (
   repoId: string,
 ): Promise<ExistingEmbeddingHashes> => {
@@ -144,7 +146,7 @@ export const upsertEmbeddings = async (
   await withNeo4jSession(async (session) => {
     await session.executeWrite(async (tx) => {
       await tx.run(
-        `UNWIND $embeddings AS row MERGE (e:\`${EMBEDDING_TABLE_NAME}\` {repoId: $repoId, id: row.id}) SET e += row.props WITH e, row MATCH (n {repoId: $repoId, id: row.nodeId}) MERGE (e)-[:EMBEDS]->(n)`,
+        `UNWIND $embeddings AS row MERGE (e:\`${EMBEDDING_TABLE_NAME}\` {repoId: $repoId, id: row.id}) SET e += row.props WITH e, row MATCH (n:${EMBEDDABLE_LABEL_EXPRESSION} {repoId: $repoId, id: row.nodeId}) MERGE (e)-[:EMBEDS]->(n)`,
         {
           repoId,
           embeddings: updates.map((update) => {

@@ -75,6 +75,7 @@ describe('HTTP embedding backend', () => {
       process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
       process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
       process.env.GITNEXUS_EMBEDDING_API_KEY = 'test-key';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '384';
 
       const mockEmbedding = Array.from({ length: 384 }, (_, i) => i * 0.001);
       vi.stubGlobal(
@@ -92,6 +93,7 @@ describe('HTTP embedding backend', () => {
       const body = JSON.parse((fetch as any).mock.calls[0][1].body);
       expect(body.model).toBe('test-model');
       expect(body.input).toEqual(['test text']);
+      expect(body.dimensions).toBe(384);
       expect(result).toBeInstanceOf(Float32Array);
       expect(result.length).toBe(384);
     });

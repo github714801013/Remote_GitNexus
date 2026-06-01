@@ -352,30 +352,33 @@ export async function runFullAnalysis(
       await saveMeta(storagePath, runningMeta);
 
       try {
-        await runEmbeddingPipeline(
-          async () => [],
-          async () => {},
-          (p) => {
-            const scaled = 90 + Math.round((p.percent / 100) * 8);
-            const label =
-              p.phase === 'loading-model'
-                ? httpMode
-                  ? 'Connecting to embedding endpoint...'
-                  : 'Loading embedding model...'
-                : `Embedding ${p.nodesProcessed || 0}/${p.totalNodes || '?'}`;
-            progress('embeddings', scaled, label);
-          },
-          {},
-          undefined,
-          { repoName: projectNameInitial, serverName },
-          existingEmbeddings,
-          {
-            loadNodes: () => loadEmbeddableNodes(projectNameInitial),
-            insertEmbeddings: (updates) => upsertEmbeddings(projectNameInitial, updates),
-            deleteEmbeddingsForNodeIds: (nodeIds) =>
-              deleteEmbeddingsForNodes(projectNameInitial, nodeIds),
-            ensureVectorIndex: ensureNeo4jEmbeddingIndex,
-          },
+        const { withEmbeddingBaseUrl } = await import('./embeddings/http-client.js');
+        await withEmbeddingBaseUrl(process.env.GITNEXUS_INDEX_EMBEDDING_URL, async () =>
+          runEmbeddingPipeline(
+            async () => [],
+            async () => {},
+            (p) => {
+              const scaled = 90 + Math.round((p.percent / 100) * 8);
+              const label =
+                p.phase === 'loading-model'
+                  ? httpMode
+                    ? 'Connecting to embedding endpoint...'
+                    : 'Loading embedding model...'
+                  : `Embedding ${p.nodesProcessed || 0}/${p.totalNodes || '?'}`;
+              progress('embeddings', scaled, label);
+            },
+            {},
+            undefined,
+            { repoName: projectNameInitial, serverName },
+            existingEmbeddings,
+            {
+              loadNodes: () => loadEmbeddableNodes(projectNameInitial),
+              insertEmbeddings: (updates) => upsertEmbeddings(projectNameInitial, updates),
+              deleteEmbeddingsForNodeIds: (nodeIds) =>
+                deleteEmbeddingsForNodes(projectNameInitial, nodeIds),
+              ensureVectorIndex: ensureNeo4jEmbeddingIndex,
+            },
+          ),
         );
       } catch (err) {
         const failedMeta = {

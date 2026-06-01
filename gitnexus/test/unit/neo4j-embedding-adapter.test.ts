@@ -57,7 +57,9 @@ describe('Neo4j embedding adapter', () => {
     ]);
 
     expect(txRun).toHaveBeenCalledWith(
-      'UNWIND $embeddings AS row MERGE (e:`CodeEmbedding` {repoId: $repoId, id: row.id}) SET e += row.props WITH e, row MATCH (n {repoId: $repoId, id: row.nodeId}) MERGE (e)-[:EMBEDS]->(n)',
+      expect.stringContaining(
+        'MATCH (n:`Function`|`Method`|`Constructor`|`Class`|`Interface`|`Struct`|`Enum`|`Trait`|`Impl`|`Macro`|`Namespace`|`TypeAlias`|`Typedef`|`Const`|`Property`|`Record`|`Union`|`Static`|`Variable` {repoId: $repoId, id: row.nodeId})',
+      ),
       {
         repoId: 'repo-a',
         embeddings: [

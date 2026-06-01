@@ -5,6 +5,7 @@ import {
   isRepairableIndexError,
   shouldScheduleStartupIncrementalAnalyze,
   shouldScheduleStartupEmbeddings,
+  shouldScheduleStartupWebhookRepos,
   shouldRunStartupLbugHealthCheck,
   shouldTreatAnalyzeWorkerExitAsCrash,
 } from '../../src/server/api.js';
@@ -19,6 +20,7 @@ describe('analyze API logic', () => {
   afterEach(() => {
     manager.dispose();
     delete process.env.GITNEXUS_STORAGE_BACKEND;
+    delete process.env.GITNEXUS_STARTUP_WEBHOOK_REPOS_ENABLED;
   });
 
   it('creates a job and returns 202 shape', () => {
@@ -113,6 +115,8 @@ describe('analyze API logic', () => {
     expect(shouldScheduleStartupEmbeddings({ stats: { nodes: 10, embeddings: 0 } })).toBe(true);
     expect(shouldScheduleStartupEmbeddings({ stats: { nodes: 10 } })).toBe(true);
     expect(shouldScheduleStartupEmbeddings({ stats: { nodes: 10, embeddings: 3 } })).toBe(false);
+    expect(shouldScheduleStartupEmbeddings({ stats: { nodes: 10, embeddings: 3 } }, 0)).toBe(true);
+    expect(shouldScheduleStartupEmbeddings({ stats: { nodes: 10, embeddings: 0 } }, 3)).toBe(false);
     expect(
       shouldScheduleStartupEmbeddings({
         embeddingStatus: 'running',
@@ -151,5 +155,13 @@ describe('analyze API logic', () => {
     process.env.GITNEXUS_STORAGE_BACKEND = 'neo4j';
 
     expect(shouldRunStartupLbugHealthCheck()).toBe(false);
+  });
+
+  it('does not enqueue all webhook repos on startup unless explicitly enabled', () => {
+    expect(shouldScheduleStartupWebhookRepos()).toBe(false);
+
+    process.env.GITNEXUS_STARTUP_WEBHOOK_REPOS_ENABLED = 'true';
+
+    expect(shouldScheduleStartupWebhookRepos()).toBe(true);
   });
 });

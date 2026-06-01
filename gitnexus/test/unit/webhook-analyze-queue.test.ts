@@ -1,5 +1,8 @@
-import { describe, expect, it } from 'vitest';
-import { WebhookAnalyzeQueue } from '../../src/server/webhook-analyze-queue.js';
+import { describe, expect, it, vi } from 'vitest';
+import {
+  WebhookAnalyzeQueue,
+  WebhookStartStaggerGate,
+} from '../../src/server/webhook-analyze-queue.js';
 
 const deferred = <T>() => {
   let resolve!: (value: T) => void;
@@ -169,5 +172,94 @@ describe('WebhookAnalyzeQueue', () => {
     await firstResult.done;
     await duplicateResult.done;
     expect(started).toEqual(['first', 'duplicate']);
+  });
+
+  it('staggers each queued project start when concurrency allows parallel jobs', async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const queue = new WebhookAnalyzeQueue(2, {
+      startStaggerMs: 300_000,
+      now: () => now,
+    });
+    const first = deferred<void>();
+    const started: string[] = [];
+
+    try {
+      const firstResult = queue.enqueue({
+        key: 'repo-a',
+        run: async () => {
+          started.push('repo-a');
+          await first.promise;
+        },
+      });
+      const secondResult = queue.enqueue({
+        key: 'repo-b',
+        run: async () => {
+          started.push('repo-b');
+        },
+      });
+
+      await Promise.resolve();
+      expect(firstResult.status).toBe('accepted');
+      expect(secondResult.status).toBe('accepted');
+      expect(started).toEqual(['repo-a']);
+
+      now += 299_999;
+      await vi.advanceTimersByTimeAsync(299_999);
+      expect(started).toEqual(['repo-a']);
+
+      now += 1;
+      await vi.advanceTimersByTimeAsync(1);
+      expect(started).toEqual(['repo-a', 'repo-b']);
+
+      await secondResult.done;
+      first.resolve();
+      await firstResult.done;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shares start staggering across structure and embedding queues', async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const startGate = new WebhookStartStaggerGate(300_000, () => now);
+    const structureQueue = new WebhookAnalyzeQueue(2, { startGate });
+    const embeddingQueue = new WebhookAnalyzeQueue(2, { startGate });
+    const structure = deferred<void>();
+    const started: string[] = [];
+
+    try {
+      const structureResult = structureQueue.enqueue({
+        key: 'structure-repo',
+        run: async () => {
+          started.push('structure-repo');
+          await structure.promise;
+        },
+      });
+      const embeddingResult = embeddingQueue.enqueue({
+        key: 'embedding-repo',
+        run: async () => {
+          started.push('embedding-repo');
+        },
+      });
+
+      await Promise.resolve();
+      expect(started).toEqual(['structure-repo']);
+
+      now += 299_999;
+      await vi.advanceTimersByTimeAsync(299_999);
+      expect(started).toEqual(['structure-repo']);
+
+      now += 1;
+      await vi.advanceTimersByTimeAsync(1);
+      expect(started).toEqual(['structure-repo', 'embedding-repo']);
+
+      await embeddingResult.done;
+      structure.resolve();
+      await structureResult.done;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

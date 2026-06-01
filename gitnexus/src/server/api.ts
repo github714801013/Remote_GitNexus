@@ -15,6 +15,8 @@ import fs from 'fs/promises';
 import { createRequire } from 'node:module';
 import {
   EMBEDDING_STATUS_COMPLETE,
+  EMBEDDING_STATUS_FAILED,
+  EMBEDDING_STATUS_RUNNING,
   type EmbeddingStatus,
   loadMeta,
   listRegisteredRepos,
@@ -37,7 +39,12 @@ import {
   initLbug as initPooledLbug,
   isWriteQuery,
 } from '../core/lbug/pool-adapter.js';
-import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
+import {
+  EMBEDDING_TABLE_NAME,
+  NODE_TABLES,
+  type GraphNode,
+  type GraphRelationship,
+} from 'gitnexus-shared';
 import { searchFTSFromLbug } from '../core/search/bm25-index.js';
 import { hybridSearch } from '../core/search/hybrid-search.js';
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
@@ -51,7 +58,8 @@ import { buildAnalyzeWorkerExecArgv } from './analyze-worker-options.js';
 import { ensureCocoaPodsDependencies } from './cocoapods.js';
 import { extractRepoName, getCloneDir, cloneOrPull, cloneOrResetToBranch } from './git-clone.js';
 import { cleanCorruptedLbugAfterCrash } from './crash-lbug-cleanup.js';
-import { WebhookAnalyzeQueue } from './webhook-analyze-queue.js';
+import { WebhookAnalyzeQueue, WebhookStartStaggerGate } from './webhook-analyze-queue.js';
+import { ResourceAwareConcurrencyController } from './resource-aware-concurrency.js';
 import { checkStaleness, type StalenessInfo } from '../core/git-staleness.js';
 import { isNeo4jBackendEnabled } from '../core/neo4j/config.js';
 import {
@@ -78,6 +86,11 @@ const MEMORY_PROGRESS_PREFIX = '[memory] ';
 const PROJECT_DISCOVERY_MAX_DEPTH = 4;
 const REPO_ALREADY_ACTIVE_MESSAGE = 'Another job is already active for this repository';
 
+const envFlagEnabled = (value: string | undefined, defaultValue: boolean): boolean => {
+  if (value === undefined) return defaultValue;
+  return !['0', 'false', 'no', 'off'].includes(value.trim().toLowerCase());
+};
+
 export const isRepoAlreadyActiveError = (err: unknown): boolean =>
   String(err instanceof Error ? err.message : err).includes(REPO_ALREADY_ACTIVE_MESSAGE);
 
@@ -99,9 +112,10 @@ export const shouldScheduleStartupEmbeddings = (
     | { embeddingStatus?: EmbeddingStatus; stats?: { nodes?: number; embeddings?: number } }
     | null
     | undefined,
+  actualEmbeddings?: number,
 ): boolean => {
   const nodes = meta?.stats?.nodes ?? 0;
-  const embeddings = meta?.stats?.embeddings ?? 0;
+  const embeddings = actualEmbeddings ?? meta?.stats?.embeddings ?? 0;
   const embeddingIncomplete =
     meta?.embeddingStatus !== undefined && meta.embeddingStatus !== EMBEDDING_STATUS_COMPLETE;
   return nodes > 0 && (embeddings <= 0 || embeddingIncomplete);
@@ -270,6 +284,9 @@ export const getWebhookAnalyzeConcurrency = (): number => {
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_WEBHOOK_ANALYZE_CONCURRENCY;
 };
+
+export const shouldScheduleStartupWebhookRepos = (): boolean =>
+  envFlagEnabled(process.env.GITNEXUS_STARTUP_WEBHOOK_REPOS_ENABLED, false);
 
 type GraphStreamRecord =
   | { type: 'node'; data: GraphNode }
@@ -632,7 +649,19 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   await backend.init();
   const cleanupMcp = mountMCPEndpoints(app, backend);
   const jobManager = new JobManager();
-  const webhookAnalyzeQueue = new WebhookAnalyzeQueue(getWebhookAnalyzeConcurrency());
+  const embedJobManager = new JobManager();
+  const resourceConcurrency = new ResourceAwareConcurrencyController();
+  const webhookParallelStartGate = new WebhookStartStaggerGate(() =>
+    resourceConcurrency.getParallelEntryStaggerMs(),
+  );
+  const webhookAnalyzeQueue = new WebhookAnalyzeQueue(
+    () => resourceConcurrency.getConcurrency('structure'),
+    { startGate: webhookParallelStartGate },
+  );
+  const webhookEmbeddingRepairQueue = new WebhookAnalyzeQueue(
+    () => resourceConcurrency.getConcurrency('embedding'),
+    { startGate: webhookParallelStartGate },
+  );
 
   // Shared repo lock — prevents concurrent analyze + embed on the same repo path,
   // which would corrupt LadybugDB (analyze calls closeLbug + initLbug while embed has queries in flight).
@@ -895,6 +924,178 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     };
   };
 
+  type EmbeddingRepairEntry = Awaited<ReturnType<typeof listRegisteredRepos>>[number];
+
+  const startEmbeddingRepairForEntry = (
+    entry: EmbeddingRepairEntry,
+    options: { source: string; registryBranch?: string },
+  ) => {
+    let job: ReturnType<JobManager['createJob']> | undefined;
+    const resolvedRepoPath = path.resolve(entry.path);
+    const queued = webhookEmbeddingRepairQueue.enqueue({
+      key: path.resolve(entry.storagePath),
+      run: async () => {
+        const repoLockPath = entry.storagePath;
+        const lockErr = acquireRepoLock(repoLockPath);
+        if (lockErr) {
+          if (isRepoAlreadyActiveError(new Error(lockErr))) {
+            console.info(
+              `[webhook] ${options.source} embedding repair skipped active repo=${entry.name} path=${entry.path}`,
+            );
+            return;
+          }
+          throw new Error(lockErr);
+        }
+
+        job = embedJobManager.createJob({ repoPath: entry.path });
+        embedJobManager.updateJob(job.id, {
+          repoName: entry.name,
+          status: 'analyzing' as any,
+          progress: {
+            phase: 'embeddings',
+            percent: 0,
+            message: 'Starting embedding repair...',
+          },
+        });
+
+        const updateEmbeddingMeta = async (
+          embeddingStatus: EmbeddingStatus,
+          embeddings?: number,
+        ): Promise<void> => {
+          const latestMeta = await loadMeta(entry.storagePath);
+          const stats = {
+            ...(entry.stats ?? {}),
+            ...(latestMeta?.stats ?? {}),
+            ...(embeddings === undefined ? {} : { embeddings }),
+          };
+          const meta = {
+            repoPath: entry.path,
+            lastCommit: latestMeta?.lastCommit ?? entry.lastCommit,
+            indexedAt: new Date().toISOString(),
+            branch: options.registryBranch ?? latestMeta?.branch ?? entry.branch,
+            remoteUrl: latestMeta?.remoteUrl ?? entry.remoteUrl,
+            embeddingStatus,
+            stats,
+          };
+          await saveMeta(entry.storagePath, meta);
+          await registerRepo(entry.path, meta, {
+            name: entry.name,
+            allowDuplicateName: true,
+          });
+        };
+
+        const progress = (p: any) => {
+          embedJobManager.updateJob(job.id, {
+            progress: {
+              phase: p.phase === 'ready' ? 'complete' : p.phase === 'error' ? 'failed' : p.phase,
+              percent: p.percent,
+              message:
+                p.phase === 'loading-model'
+                  ? 'Loading embedding model...'
+                  : p.phase === 'embedding'
+                    ? `Embedding nodes (${p.percent}%)...`
+                    : p.phase === 'indexing'
+                      ? 'Creating vector index...'
+                      : p.phase === 'ready'
+                        ? 'Embeddings complete'
+                        : `${p.phase} (${p.percent}%)`,
+            },
+          });
+        };
+
+        try {
+          console.info(
+            `[webhook] ${options.source} embedding repair started repo=${entry.name} path=${entry.path}`,
+          );
+          await updateEmbeddingMeta(EMBEDDING_STATUS_RUNNING);
+
+          let embeddingCount = 0;
+          if (isNeo4jBackendEnabled()) {
+            const { runEmbeddingPipeline } =
+              await import('../core/embeddings/embedding-pipeline.js');
+            const { withEmbeddingBaseUrl } = await import('../core/embeddings/http-client.js');
+            const {
+              countEmbeddings,
+              deleteEmbeddingsForNodes,
+              ensureNeo4jEmbeddingIndex,
+              fetchExistingEmbeddingHashes,
+              loadEmbeddableNodes,
+              upsertEmbeddings,
+            } = await import('../core/neo4j/embedding-adapter.js');
+            const { readServerMapping } = await import('../core/embeddings/server-mapping.js');
+            const serverName = await readServerMapping(entry.name);
+            const existingEmbeddings = await fetchExistingEmbeddingHashes(entry.name);
+            await withEmbeddingBaseUrl(process.env.GITNEXUS_INDEX_EMBEDDING_URL, async () =>
+              runEmbeddingPipeline(
+                async () => [],
+                async () => {},
+                progress,
+                {},
+                undefined,
+                { repoName: entry.name, serverName },
+                existingEmbeddings,
+                {
+                  loadNodes: () => loadEmbeddableNodes(entry.name),
+                  insertEmbeddings: (updates) => upsertEmbeddings(entry.name, updates),
+                  deleteEmbeddingsForNodeIds: (nodeIds) =>
+                    deleteEmbeddingsForNodes(entry.name, nodeIds),
+                  ensureVectorIndex: ensureNeo4jEmbeddingIndex,
+                },
+              ),
+            );
+            embeddingCount = await countEmbeddings(entry.name);
+          } else {
+            const lbugPath = path.join(entry.storagePath, 'lbug');
+            await withLbugDb(lbugPath, async () => {
+              const { runEmbeddingPipeline } =
+                await import('../core/embeddings/embedding-pipeline.js');
+              const { fetchExistingEmbeddingHashes } = await import('../core/lbug/lbug-adapter.js');
+              const existingEmbeddings = await fetchExistingEmbeddingHashes(executeQuery);
+              await runEmbeddingPipeline(
+                executeQuery,
+                executeWithReusedStatement,
+                progress,
+                {},
+                undefined,
+                { repoName: entry.name },
+                existingEmbeddings,
+              );
+              const rows = await executeQuery(
+                `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS embeddings`,
+              );
+              embeddingCount = Number(rows?.[0]?.embeddings ?? rows?.[0]?.[0] ?? 0);
+            });
+          }
+
+          await updateEmbeddingMeta(EMBEDDING_STATUS_COMPLETE, embeddingCount);
+          await backend.refreshListReposCache();
+          embedJobManager.updateJob(job.id, { status: 'complete', repoName: entry.name });
+          console.info(
+            `[webhook] ${options.source} embedding repair completed repo=${entry.name} embeddings=${embeddingCount}`,
+          );
+        } catch (err) {
+          await updateEmbeddingMeta(EMBEDDING_STATUS_FAILED).catch(() => {});
+          embedJobManager.updateJob(job.id, {
+            status: 'failed',
+            error: err instanceof Error ? err.message : String(err),
+          });
+          throw err;
+        } finally {
+          releaseRepoLock(repoLockPath);
+        }
+      },
+    });
+
+    console.info(`[webhook] embedding repair ${queued.status} repoPath=${resolvedRepoPath}`);
+    return {
+      status: queued.status,
+      get job() {
+        return job;
+      },
+      done: queued.done,
+    };
+  };
+
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', projectsRoot: getProjectsRoot() });
   });
@@ -1000,12 +1201,27 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         console.warn(`[webhook] ${source} index health check skipped:`, err);
         return [];
       });
+      const countNeo4jEmbeddings = isNeo4jBackendEnabled()
+        ? (await import('../core/neo4j/embedding-adapter.js')).countEmbeddings
+        : undefined;
 
       for (const entry of entries) {
         const repoPath = entry.path;
         const registryBranch = webhookBranchByPath.get(path.resolve(repoPath)) ?? entry.branch;
         const meta = await loadMeta(entry.storagePath);
-        const needsEmbeddings = shouldScheduleStartupEmbeddings(meta);
+        let actualEmbeddings: number | undefined;
+        if (countNeo4jEmbeddings && (meta?.stats?.nodes ?? 0) > 0) {
+          try {
+            actualEmbeddings = await countNeo4jEmbeddings(entry.name);
+          } catch (err) {
+            console.warn(
+              `[webhook] ${source} embedding health check skipped actual count repo=${entry.name}: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          }
+        }
+        const needsEmbeddings = shouldScheduleStartupEmbeddings(meta, actualEmbeddings);
         const staleness = checkStaleness(repoPath, entry.lastCommit);
 
         if (shouldRunStartupLbugHealthCheck()) {
@@ -1067,15 +1283,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         if (needsEmbeddings) {
           console.warn(
-            `[webhook] ${source} embedding health check detected missing vectors repo=${entry.name}; enqueue analyze with embeddings`,
+            `[webhook] ${source} embedding health check detected missing vectors repo=${entry.name}; enqueue embedding repair only`,
           );
-          const queued = enqueueWebhookAnalyze(repoPath, {
-            repoName: entry.name,
-            embeddings: true,
-            registryName: entry.name,
-            registryBranch,
-            allowDuplicateName: true,
-          });
+          const queued = startEmbeddingRepairForEntry(entry, { source, registryBranch });
           queued.done.catch((analyzeErr) => {
             console.error(
               `[webhook] ${source} embedding repair failed for ${entry.name}:`,
@@ -1090,7 +1300,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     }
   };
 
-  void scheduleStartupWebhookRepos();
+  if (shouldScheduleStartupWebhookRepos()) {
+    void scheduleStartupWebhookRepos();
+  }
   void runIndexHealthCheck('startup').catch((err) => {
     console.error('[webhook] startup index health check failed:', err);
   });
@@ -2233,8 +2445,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   });
 
   // ── Embedding endpoints ────────────────────────────────────────────
-
-  const embedJobManager = new JobManager();
 
   // POST /v1/embeddings — OpenAI-compatible embedding endpoint
   // Allows analyze subprocesses to use this serve process as the sole GPU holder.
