@@ -213,7 +213,7 @@ export const semanticSearchMany = async (
 CALL db.index.vector.queryNodes('code_embedding_idx', $fetchLimit, $queryVector)
 YIELD node, score
 WHERE node.repoId IN $repoIds AND score >= $minScore
-MATCH (symbol {repoId: node.repoId, id: node.nodeId})
+MATCH (node)-[:EMBEDS]->(symbol)
 RETURN node.repoId AS repoId,
        node.nodeId AS nodeId,
        symbol.name AS name,

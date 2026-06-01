@@ -108,6 +108,62 @@ describe('Neo4j cross-repo vector discovery', () => {
     expect(candidates.map((candidate: any) => candidate.repo.name)).toEqual(['Repo A', 'Repo B']);
   });
 
+  it('uses semantic text instead of raw Zoekt syntax for vector discovery', async () => {
+    const backend = new LocalBackend();
+    const repos = [
+      {
+        id: 'repo-a',
+        name: 'Repo A',
+        repoPath: '/repo/a',
+        storagePath: '/repo/a/.gitnexus',
+        lbugPath: '/repo/a/.gitnexus/lbug',
+        indexedAt: '2026-05-30',
+        lastCommit: 'a',
+      },
+    ];
+
+    await (backend as any).discoverQueryCandidates(
+      {
+        keywordQuery: '"没有找到年包信息" OR "当前年包次数已用完" OR ("年包" "次数" "已用完")',
+        semanticQuery: '没有找到年包信息 当前年包次数已用完 年包 次数 已用完',
+      },
+      repos,
+    );
+
+    expect(embedQuery).toHaveBeenCalledWith('没有找到年包信息 当前年包次数已用完 年包 次数 已用完');
+    expect(semanticSearchMany).toHaveBeenCalledWith(['Repo A'], [0.1, 0.2], 5);
+  });
+
+  it('keeps raw Zoekt syntax out of vector search for repo-less query calls', async () => {
+    const backend = new LocalBackend();
+    const repo = {
+      id: 'repo-a',
+      name: 'Repo A',
+      repoPath: '/repo/a',
+      storagePath: '/repo/a/.gitnexus',
+      lbugPath: '/repo/a/.gitnexus/lbug',
+      indexedAt: '2026-05-30',
+      lastCommit: 'a',
+    };
+    (backend as any).repos.set(repo.id, repo);
+    (backend as any).repos.set('repo-b', {
+      id: 'repo-b',
+      name: 'Repo B',
+      repoPath: '/repo/b',
+      storagePath: '/repo/b/.gitnexus',
+      lbugPath: '/repo/b/.gitnexus/lbug',
+      indexedAt: '2026-05-30',
+      lastCommit: 'b',
+    });
+
+    await backend.callTool('query', {
+      query: '年包次数已用完',
+      zoekt: '"没有找到年包信息" OR "当前年包次数已用完" OR ("年包" "次数" "已用完")',
+    });
+
+    expect(embedQuery).toHaveBeenCalledWith('年包次数已用完');
+  });
+
   it('does not use LadybugDB BM25 in Neo4j backend mode', async () => {
     const backend = new LocalBackend();
 

@@ -114,6 +114,8 @@ describe('Neo4j embedding adapter', () => {
         minScore: 0.1,
       },
     );
+    expect(txRun.mock.calls[0][0]).toContain('MATCH (node)-[:EMBEDS]->(symbol)');
+    expect(txRun.mock.calls[0][0]).not.toContain('MATCH (symbol {repoId: node.repoId');
     expect(results).toEqual([
       {
         repoId: 'repo-a',

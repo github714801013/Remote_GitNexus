@@ -280,6 +280,11 @@ interface QueryRepoCandidate {
   matches: QueryMatchSummary[];
 }
 
+interface QuerySearchTexts {
+  keywordQuery: string;
+  semanticQuery: string;
+}
+
 async function mapWithConcurrency<T>(
   items: T[],
   concurrency: number,
@@ -846,9 +851,11 @@ export class LocalBackend {
   }
 
   private async discoverQueryCandidates(
-    query: string,
+    query: string | QuerySearchTexts,
     repos: RepoHandle[],
   ): Promise<QueryRepoCandidate[]> {
+    const searchTexts =
+      typeof query === 'string' ? { keywordQuery: query, semanticQuery: query } : query;
     const candidates = new Map<string, QueryRepoCandidate>();
     const scopedRepoIds = new Set(repos.map((repo) => repo.id));
 
@@ -858,7 +865,7 @@ export class LocalBackend {
         const config = loadZoektConfig();
         if (!config.enabled) return;
 
-        const result = await new ZoektClient(config).search(query, {
+        const result = await new ZoektClient(config).search(searchTexts.keywordQuery, {
           maxDocDisplayCount: CROSS_REPO_ZOEKT_DISCOVERY_LIMIT,
         });
         result.matches.forEach((match, index) => {
@@ -889,7 +896,7 @@ export class LocalBackend {
           try {
             const repoById = new Map(repos.map((repo) => [repo.name, repo]));
             const { embedQuery } = await import('../core/embedder.js');
-            const queryVec = await embedQuery(query);
+            const queryVec = await embedQuery(searchTexts.semanticQuery);
             const { semanticSearchMany } = await import('../../core/neo4j/embedding-adapter.js');
             const matches = await semanticSearchMany(
               repos.map((repo) => repo.name),
@@ -925,7 +932,11 @@ export class LocalBackend {
             try {
               const matches = await this.runCrossRepoOperationForRepo(repo.id, async () => {
                 await this.ensureInitialized(repo.id);
-                return this.semanticSearch(repo, query, CROSS_REPO_VECTOR_MATCHES_PER_REPO);
+                return this.semanticSearch(
+                  repo,
+                  searchTexts.semanticQuery,
+                  CROSS_REPO_VECTOR_MATCHES_PER_REPO,
+                );
               });
               matches.forEach((match, index) => {
                 this.pushQueryCandidateMatch(candidates, repo, {
@@ -954,6 +965,37 @@ export class LocalBackend {
         matches: candidate.matches.sort((a, b) => b.score - a.score).slice(0, 10),
       }))
       .sort((a, b) => b.score - a.score);
+  }
+
+  private toSemanticQueryFromZoekt(query: string): string {
+    return query
+      .replace(/"([^"]+)"/g, ' $1 ')
+      .replace(/\b(?:AND|OR|NOT)\b/g, ' ')
+      .replace(/[()]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private buildQuerySearchTexts(params: {
+    query?: string;
+    zoekt?: string;
+    task_context?: string;
+    goal?: string;
+  }): QuerySearchTexts {
+    const keywordQuery = (params.zoekt?.trim() || params.query?.trim() || '').trim();
+    const semanticParts = [params.query, params.goal, params.task_context]
+      .map((part) => part?.trim())
+      .filter((part): part is string => Boolean(part));
+
+    const semanticQuery =
+      semanticParts.length > 0
+        ? semanticParts.join('\n')
+        : this.toSemanticQueryFromZoekt(params.zoekt?.trim() || keywordQuery);
+
+    return {
+      keywordQuery,
+      semanticQuery: semanticQuery || keywordQuery,
+    };
   }
 
   private resolveRepoFromZoektRepository(rawName: string): RepoHandle | null {
@@ -1418,10 +1460,12 @@ export class LocalBackend {
             'Cross-repository query requires the Neo4j storage backend. Specify repo for single-file LadybugDB indexes.',
         };
       }
-      const discoveryQuery =
-        typeof p.zoekt === 'string' && p.zoekt.trim().length > 0
-          ? p.zoekt
-          : (params?.query as string);
+      const discoveryQuery = this.buildQuerySearchTexts({
+        query: typeof p.query === 'string' ? p.query : undefined,
+        zoekt: typeof p.zoekt === 'string' ? p.zoekt : undefined,
+        task_context: typeof p.task_context === 'string' ? p.task_context : undefined,
+        goal: typeof p.goal === 'string' ? p.goal : undefined,
+      });
       const candidates = await this.discoverQueryCandidates(
         discoveryQuery,
         this.getScopedRepos(headScope),
@@ -1639,7 +1683,8 @@ export class LocalBackend {
     const processLimit = params.limit || 5;
     const maxSymbolsPerProcess = params.max_symbols || 10;
     const includeContent = params.include_content ?? false;
-    const searchQuery = (params.zoekt || params.query).trim();
+    const searchTexts = this.buildQuerySearchTexts(params);
+    const searchQuery = searchTexts.keywordQuery;
 
     // Per-phase timing instrumentation (#553). Records wall time for each
     // observable sub-step of the search pipeline so production latency can
@@ -1659,7 +1704,7 @@ export class LocalBackend {
 
     const [bm25SearchResult, semanticResults, zoektResult] = await Promise.all([
       timer.time('bm25', this.bm25Search(repo, searchQuery, searchLimit)),
-      timer.time('vector', this.semanticSearch(repo, searchQuery, searchLimit)),
+      timer.time('vector', this.semanticSearch(repo, searchTexts.semanticQuery, searchLimit)),
       zoektCfg.enabled
         ? timer.time(
             'zoekt',

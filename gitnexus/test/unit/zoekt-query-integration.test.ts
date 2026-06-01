@@ -94,6 +94,44 @@ describe('LocalBackend.query with Zoekt integration', () => {
     );
   });
 
+  it('单仓库混合查询中 Zoekt DSL 只用于关键词检索，向量使用自然语言查询', async () => {
+    mockLoadConfig.mockReturnValue({
+      enabled: true,
+      endpoints: ['http://localhost:6070'],
+    });
+    mockSearch.mockResolvedValue({
+      matches: [],
+      stats: { matchCount: 0, durationMs: 1 },
+    });
+
+    const semanticSpy = vi.spyOn(backend as any, 'semanticSearch');
+    const bm25Spy = vi.spyOn(backend as any, 'bm25Search');
+
+    await backend.callTool('query', {
+      repo: 'test-repo',
+      query: '年包次数已用完',
+      zoekt: '"没有找到年包信息" OR "当前年包次数已用完" OR ("年包" "次数" "已用完")',
+    });
+
+    expect(bm25Spy).toHaveBeenCalledWith(
+      expect.anything(),
+      '"没有找到年包信息" OR "当前年包次数已用完" OR ("年包" "次数" "已用完")',
+      expect.any(Number),
+    );
+    expect(mockSearch).toHaveBeenCalledWith(
+      '"没有找到年包信息" OR "当前年包次数已用完" OR ("年包" "次数" "已用完")',
+      {
+        repoFilter: 'test-repo',
+        maxDocDisplayCount: 50,
+      },
+    );
+    expect(semanticSpy).toHaveBeenCalledWith(
+      expect.anything(),
+      '年包次数已用完',
+      expect.any(Number),
+    );
+  });
+
   it('如果禁用则不调用 Zoekt search', async () => {
     mockLoadConfig.mockReturnValue({
       enabled: false,
