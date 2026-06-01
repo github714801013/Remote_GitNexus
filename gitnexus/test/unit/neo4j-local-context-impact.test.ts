@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { LocalBackend } from '../../src/mcp/local/local-backend.js';
-import { findImpact, findSymbolContext } from '../../src/core/neo4j/read-adapter.js';
-import { initLbug } from '../../src/core/lbug/pool-adapter.js';
+import {
+  executeReadCypher,
+  findImpact,
+  findSymbolContext,
+} from '../../src/core/neo4j/read-adapter.js';
+import { executeParameterized, initLbug } from '../../src/core/lbug/pool-adapter.js';
 
 vi.mock('../../src/core/lbug/pool-adapter.js', () => ({
   initLbug: vi.fn(),
@@ -17,6 +21,7 @@ vi.mock('../../src/core/neo4j/config.js', () => ({
 }));
 
 vi.mock('../../src/core/neo4j/read-adapter.js', () => ({
+  executeReadCypher: vi.fn(async () => []),
   findSymbolContext: vi.fn(async () => [
     {
       id: 'Function:handler',
@@ -98,6 +103,150 @@ describe('LocalBackend context and impact with Neo4j backend', () => {
             filePath: 'src/caller.ts',
           },
         ],
+      },
+    });
+  });
+
+  it('loads API route map from Neo4j without initializing LadybugDB', async () => {
+    vi.mocked(executeReadCypher)
+      .mockResolvedValueOnce([
+        {
+          routeId: 'Route:/api/users',
+          routeName: '/api/users',
+          handlerFile: 'src/api/users.ts',
+          responseKeys: ['data'],
+          errorKeys: ['error'],
+          middleware: ['withAuth'],
+          consumerName: 'useUsers',
+          consumerFile: 'src/hooks/use-users.ts',
+          fetchReason: 'fetch-url-match|keys:data|fetches:1',
+        },
+      ])
+      .mockResolvedValueOnce([{ sourceId: 'Route:/api/users', name: 'UserListFlow' }]);
+
+    const backend = new LocalBackend();
+
+    const result = await (backend as any).routeMap(repo, { route: '/api/users' });
+
+    expect(initLbug).not.toHaveBeenCalled();
+    expect(executeParameterized).not.toHaveBeenCalled();
+    expect(executeReadCypher).toHaveBeenCalledTimes(2);
+    expect(executeReadCypher).toHaveBeenNthCalledWith(
+      1,
+      expect.stringContaining('MATCH (n:Route {repoId: $repoId})'),
+      { repoId: 'Repo A', route: '/api/users' },
+    );
+    expect(executeReadCypher).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining('MATCH (source {repoId: $repoId})-[r:ENTRY_POINT_OF]->'),
+      { repoId: 'Repo A', nodeIds: ['Route:/api/users'] },
+    );
+    expect(result).toMatchObject({
+      total: 1,
+      routes: [
+        {
+          route: '/api/users',
+          handler: 'src/api/users.ts',
+          middleware: ['withAuth'],
+          flows: ['UserListFlow'],
+          consumers: [
+            {
+              name: 'useUsers',
+              filePath: 'src/hooks/use-users.ts',
+              accessedKeys: ['data'],
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it('loads API shape check from Neo4j without initializing LadybugDB', async () => {
+    vi.mocked(executeReadCypher).mockResolvedValueOnce([
+      {
+        routeId: 'Route:/api/users',
+        routeName: '/api/users',
+        handlerFile: 'src/api/users.ts',
+        responseKeys: ['data'],
+        errorKeys: ['error'],
+        middleware: [],
+        consumerName: 'useUsers',
+        consumerFile: 'src/hooks/use-users.ts',
+        fetchReason: 'fetch-url-match|keys:data,missing|fetches:1',
+      },
+    ]);
+
+    const backend = new LocalBackend();
+
+    const result = await (backend as any).shapeCheck(repo, { route: '/api/users' });
+
+    expect(initLbug).not.toHaveBeenCalled();
+    expect(executeParameterized).not.toHaveBeenCalled();
+    expect(executeReadCypher).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      total: 1,
+      mismatches: 1,
+      routes: [
+        {
+          route: '/api/users',
+          status: 'MISMATCH',
+          consumers: [
+            {
+              name: 'useUsers',
+              filePath: 'src/hooks/use-users.ts',
+              accessedKeys: ['data', 'missing'],
+              mismatched: ['missing'],
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it('loads API impact from Neo4j without initializing LadybugDB', async () => {
+    vi.mocked(executeReadCypher)
+      .mockResolvedValueOnce([
+        {
+          routeId: 'Route:/api/users',
+          routeName: '/api/users',
+          handlerFile: 'src/api/users.ts',
+          responseKeys: ['data'],
+          errorKeys: ['error'],
+          middleware: ['withAuth'],
+          consumerName: 'useUsers',
+          consumerFile: 'src/hooks/use-users.ts',
+          fetchReason: 'fetch-url-match|keys:data|fetches:1',
+        },
+      ])
+      .mockResolvedValueOnce([{ sourceId: 'Route:/api/users', name: 'UserListFlow' }]);
+
+    const backend = new LocalBackend();
+
+    const result = await (backend as any).apiImpact(repo, { route: '/api/users' });
+
+    expect(initLbug).not.toHaveBeenCalled();
+    expect(executeParameterized).not.toHaveBeenCalled();
+    expect(executeReadCypher).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      route: '/api/users',
+      handler: 'src/api/users.ts',
+      responseShape: {
+        success: ['data'],
+        error: ['error'],
+      },
+      middleware: ['withAuth'],
+      consumers: [
+        {
+          name: 'useUsers',
+          file: 'src/hooks/use-users.ts',
+          accesses: ['data'],
+        },
+      ],
+      executionFlows: ['UserListFlow'],
+      impactSummary: {
+        directConsumers: 1,
+        affectedFlows: 1,
+        riskLevel: 'LOW',
       },
     });
   });

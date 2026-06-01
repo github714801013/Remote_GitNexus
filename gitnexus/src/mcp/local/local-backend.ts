@@ -4262,6 +4262,7 @@ export class LocalBackend {
    */
   private async fetchRoutesWithConsumers(
     repoId: string,
+    neo4jRepoId: string,
     routeFilter: string,
     params: Record<string, string>,
   ): Promise<
@@ -4280,9 +4281,26 @@ export class LocalBackend {
       }>;
     }>
   > {
-    const rows = await executeParameterized(
-      repoId,
-      `
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const rows = isNeo4jBackendEnabled()
+      ? await (async () => {
+          const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+          return await executeReadCypher(
+            `
+      MATCH (n:Route {repoId: $repoId})
+      WHERE n.id STARTS WITH 'Route:' ${routeFilter}
+      OPTIONAL MATCH (consumer {repoId: $repoId})-[r:FETCHES]->(n)
+      RETURN n.id AS routeId, n.name AS routeName, n.filePath AS handlerFile,
+             n.responseKeys AS responseKeys, n.errorKeys AS errorKeys, n.middleware AS middleware,
+             consumer.name AS consumerName, consumer.filePath AS consumerFile,
+             r.reason AS fetchReason
+    `,
+            { repoId: neo4jRepoId, ...params },
+          );
+        })()
+      : await executeParameterized(
+          repoId,
+          `
       MATCH (n:Route)
       WHERE n.id STARTS WITH 'Route:' ${routeFilter}
       OPTIONAL MATCH (consumer)-[r:CodeRelation]->(n)
@@ -4292,8 +4310,8 @@ export class LocalBackend {
              consumer.name AS consumerName, consumer.filePath AS consumerFile,
              r.reason AS fetchReason
     `,
-      params,
-    );
+          params,
+        );
 
     // Strip wrapping quotes from DB array elements — CSV COPY stores ['key'] which
     // LadybugDB may return as "'key'" rather than "key"
@@ -4371,22 +4389,35 @@ export class LocalBackend {
    */
   private async fetchLinkedFlowsBatch(
     repoId: string,
+    neo4jRepoId: string,
     nodeIds: string[],
   ): Promise<Map<string, string[]>> {
     const result = new Map<string, string[]>();
     if (nodeIds.length === 0) return result;
     try {
-      // Use list_contains to filter at DB level instead of fetching all and filtering in memory
-      const rows = await executeParameterized(
-        repoId,
-        `
+      const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+      const rows = isNeo4jBackendEnabled()
+        ? await (async () => {
+            const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+            return await executeReadCypher(
+              `
+        MATCH (source {repoId: $repoId})-[r:ENTRY_POINT_OF]->(proc:Process {repoId: $repoId})
+        WHERE source.id IN $nodeIds
+        RETURN source.id AS sourceId, proc.label AS name
+      `,
+              { repoId: neo4jRepoId, nodeIds },
+            );
+          })()
+        : await executeParameterized(
+            repoId,
+            `
         MATCH (source)-[r:CodeRelation]->(proc:Process)
         WHERE r.type = 'ENTRY_POINT_OF'
           AND list_contains($nodeIds, source.id)
         RETURN source.id AS sourceId, proc.label AS name
       `,
-        { nodeIds },
-      );
+            { nodeIds },
+          );
       for (const row of rows) {
         const sourceId = row.sourceId ?? row[0];
         const name = row.name ?? row[1];
@@ -4409,7 +4440,12 @@ export class LocalBackend {
 
     const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
     const queryParams = params.route ? { route: params.route } : {};
-    const routes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
+    const routes = await this.fetchRoutesWithConsumers(
+      repo.id,
+      repo.name,
+      routeFilter,
+      queryParams,
+    );
 
     if (routes.length === 0) {
       return {
@@ -4423,6 +4459,7 @@ export class LocalBackend {
 
     const flowMap = await this.fetchLinkedFlowsBatch(
       repo.id,
+      repo.name,
       routes.map((r) => r.id),
     );
 
@@ -4443,7 +4480,12 @@ export class LocalBackend {
 
     const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
     const queryParams = params.route ? { route: params.route } : {};
-    const allRoutes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
+    const allRoutes = await this.fetchRoutesWithConsumers(
+      repo.id,
+      repo.name,
+      routeFilter,
+      queryParams,
+    );
 
     const results = allRoutes
       .filter(
@@ -4545,7 +4587,7 @@ export class LocalBackend {
     }
 
     const toolIds = rows.map((r: any) => r.id ?? r[0]);
-    const flowMap = await this.fetchLinkedFlowsBatch(repo.id, toolIds);
+    const flowMap = await this.fetchLinkedFlowsBatch(repo.id, repo.name, toolIds);
 
     return {
       tools: rows.map((r: any) => {
@@ -4583,7 +4625,12 @@ export class LocalBackend {
       queryParams.file = params.file;
     }
 
-    const routes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
+    const routes = await this.fetchRoutesWithConsumers(
+      repo.id,
+      repo.name,
+      routeFilter,
+      queryParams,
+    );
 
     if (routes.length === 0) {
       const target = params.route || params.file;
@@ -4592,6 +4639,7 @@ export class LocalBackend {
 
     const flowMap = await this.fetchLinkedFlowsBatch(
       repo.id,
+      repo.name,
       routes.map((r) => r.id),
     );
 
