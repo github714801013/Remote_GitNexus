@@ -111,7 +111,9 @@ describe('GITNEXUS_TOOLS', () => {
     expect(queryTool.description).toContain('SMART DISCOVERY');
     expect(queryTool.description).toContain('omit "repo" by default for the first query');
     expect(queryTool.description).toContain('Single-file LadybugDB indexes are repo-scoped');
-    expect(queryTool.inputSchema.properties.zoekt.description).toContain('Raw Zoekt query string');
+    expect(queryTool.description).toContain('QUERY LANGUAGE SPLIT');
+    expect(queryTool.description).toContain('uses "query" for semantic vector discovery');
+    expect(queryTool.inputSchema.properties.zoekt.description).toContain('raw Zoekt DSL only');
     expect(queryTool.inputSchema.properties.repo.description).toContain(
       'In Neo4j mode, omit for the first search',
     );
@@ -134,7 +136,11 @@ describe('GITNEXUS_TOOLS', () => {
   it('documents precise Zoekt filters on the unified query tool', () => {
     const tool = GITNEXUS_TOOLS.find((t) => t.name === 'query')!;
 
-    expect(tool.inputSchema.properties.zoekt.description).toContain('Raw Zoekt query string');
+    expect(tool.inputSchema.properties.query.description).toContain('Plain natural-language');
+    expect(tool.inputSchema.properties.query.description).toContain('Do NOT include Zoekt DSL');
+    expect(tool.inputSchema.properties.query.description).toContain('Strongly recommended');
+    expect(tool.inputSchema.properties.zoekt.description).toContain('raw Zoekt DSL only');
+    expect(tool.inputSchema.properties.zoekt.description).toContain('Pair complex Zoekt DSL');
   });
 
   it('group tools without backend repo param omit repo property', () => {

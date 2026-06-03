@@ -67,3 +67,13 @@
 - [x] 实现：worker 完成后由父进程兜底写入 meta/registry，确保 HTTP/MCP 清单使用当前工作树分支和 commit。
 - [x] 验证：`npm test -- test/unit/webhook-worktree.test.ts test/unit/analyze-api.test.ts test/unit/run-analyze.test.ts test/unit/webhook-analyze-queue.test.ts`、`npx tsc --noEmit`、`git diff --check` 通过。
 - [x] 部署验证：使用 `mcp_proxy_docker/remote_deploy.sh` 重新部署后触发 oa-stock webhook；meta、registry、HTTP `/api/repos`、MCP `list_repos` 均显示 `oa-stock` 分支为 `release_9ji`。
+
+## Patch: query 工具区分语义查询与 Zoekt DSL
+- [x] 技能与规范：已读取 `dev-spec-gen/SKILL.md`、`references/general-specs.md`、`references/superpowers-integration-specs.md`；当前环境无独立 `superpowers:*` 技能入口，使用本地 TODO 与显式计划兜底。
+- [x] 技术栈识别：`gitnexus/package.json`、`gitnexus/tsconfig.json`、`gitnexus/test/unit/tools.test.ts` 证明本次范围为 TypeScript/Node/Vitest。
+- [x] 影响分析：GitNexus MCP 未登记 `GitNexus` 仓库，无法运行图影响分析；已用本地 `rg` 定位 `query` 工具 schema 与 `buildQuerySearchTexts` 分流逻辑。
+- [x] Bug Reproduction：现场 timing 显示 Zoekt DSL 查询 `("小件" "退款") OR ...` 进入 `query`，vector 仍需处理复杂 DSL，`symbol_lookup` 也被放大。
+- [x] 实现：优化 MCP `query` 工具描述，明确 `query` 提供自然语言语义搜索文本，`zoekt` 提供精确代码搜索 DSL；同时传两个字段时分别服务 vector/BM25 与 Zoekt。
+- [x] 部署：使用 Git Bash 执行 `mcp_proxy_docker/remote_deploy.sh` 完成部署；为避免历史归档进入 Docker build context，已补充 `.dockerignore` 排除 `*.tar`、`*.tar.gz`、`*.tgz`、`*.zip`。
+- [x] 线上回归：远端 `/health` 正常，容器启动时间已更新；容器产物包含 `raw Zoekt DSL only` 描述；MCP 查询同时传 `query` 与 `zoekt` 返回多仓库结果，Zoekt 日志只使用 `zoekt` 字段 DSL。
+- [x] 验证：`npm test -- test/unit/tools.test.ts test/unit/neo4j-cross-repo-query.test.ts` 通过 31 tests；`npx tsc --noEmit` 通过；目标文件 `git diff --check` 通过。

@@ -69,6 +69,11 @@ Returns results grouped by process (execution flow):
 
 Hybrid ranking: BM25 keyword + Semantic vector + Zoekt exact/regex search, merged and ranked by Reciprocal Rank Fusion (RRF).
 
+QUERY LANGUAGE SPLIT: Prefer providing two search languages for mixed searches:
+- "query": plain natural language for BM25/vector discovery. Do not put Zoekt operators, quote-heavy DSL, OR/AND groups, or parentheses here.
+- "zoekt": precise Zoekt DSL for exact phrases, symbols, regex, boolean groups, and Chinese phrase matching.
+When both are provided, GitNexus uses "query" for semantic vector discovery and "zoekt" for exact code search, then merges the results.
+
 GROUP MODE: set "repo" to "@<groupName>" to search all member repos in that group (merged via RRF), or "@<groupName>/<groupRepoPath>" to run against a single member (same path keys as in group.yaml). If you use "@<groupName>" only, the member repo defaults to the lexicographically first key in group.yaml "repos". Prefer resources for contracts/status (see migration from legacy group_* tools).
 
 SMART DISCOVERY: With the Neo4j storage backend, omit "repo" by default for the first query. GitNexus searches visible repositories in one cross-repo discovery pass and returns repo-labeled matches. Specify "repo" only after the cross-repo result identifies a concrete project or you need to narrow a follow-up lookup. Single-file LadybugDB indexes are repo-scoped and do not provide true cross-repository graph/vector query.
@@ -80,12 +85,12 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
         query: {
           type: 'string',
           description:
-            'Natural language or simple keyword query. Use this for general concepts or English terms.',
+            'Plain natural-language semantic query for BM25/vector discovery. Write what you want to understand, e.g. "退款权限相关逻辑和岗位码校验". Do NOT include Zoekt DSL operators such as quoted phrase groups, OR/AND/NOT, regex, or parentheses; put those in "zoekt" instead. Strongly recommended whenever "zoekt" is provided.',
         },
         zoekt: {
           type: 'string',
           description:
-            'Advanced: Raw Zoekt query string. MANDATORY for Chinese phrases or complex logic. RULES: 1. Wrap Chinese phrases in double quotes (e.g., "成为会员"). 2. Spaces mean AND (both terms must exist in the file). 3. Use uppercase OR for alternatives. 4. Use parentheses for grouping. If provided, this overrides the default keyword search step.',
+            'Advanced exact-code search language: raw Zoekt DSL only. Use for exact phrases, symbol names, regex, boolean groups, and Chinese phrase matching. RULES: 1. Wrap exact Chinese phrases in double quotes (e.g., "成为会员"). 2. Spaces mean AND. 3. Use uppercase OR/AND/NOT for boolean logic. 4. Use parentheses for grouping. Pair complex Zoekt DSL with a separate plain "query" so vector search receives semantic text instead of DSL.',
         },
         task_context: {
           type: 'string',

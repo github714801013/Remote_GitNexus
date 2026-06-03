@@ -19,6 +19,10 @@ coverage
 .env.*.local
 
 **/*.tsbuildinfo
+*.tar
+*.tar.gz
+*.tgz
+*.zip
 
 .gitnexus
 gitnexus-web/playwright-report
