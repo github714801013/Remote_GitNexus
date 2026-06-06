@@ -1382,7 +1382,7 @@ export class LocalBackend {
             const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
             return await executeReadCypher(
               `
-        MATCH (n {repoId: $repoId})
+        MATCH (n:CodeNode {repoId: $repoId})
         WHERE labels(n)[0] IN ['Function', 'Method', 'Class', 'Interface', 'Constructor', 'Route', 'Tool']
           AND (${clauses.join(' OR ')})
         RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
@@ -1794,6 +1794,61 @@ export class LocalBackend {
     >();
     const definitions: any[] = []; // standalone symbols not in any process
 
+    const neo4jProcessRowsByNode = new Map<string, any[]>();
+    const neo4jCohesionByNode = new Map<string, { cohesion: number; module?: string }>();
+    if (useNeo4jBackend) {
+      const nodeIds = [
+        ...new Set(
+          merged
+            .map(([, item]) => item.data?.nodeId)
+            .filter((nodeId): nodeId is string => typeof nodeId === 'string' && nodeId.length > 0),
+        ),
+      ];
+      if (nodeIds.length > 0) {
+        const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+        try {
+          const processRows = await executeReadCypher(
+            `
+          UNWIND $nodeIds AS nodeId
+          MATCH (n:CodeNode {repoId: $repoId, id: nodeId})-[r:STEP_IN_PROCESS]->(p:Process {repoId: $repoId})
+          RETURN nodeId, p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
+        `,
+            { repoId: repo.name, nodeIds },
+          );
+          for (const row of processRows) {
+            const nodeId = row.nodeId ?? row[0];
+            if (!nodeId) continue;
+            const rows = neo4jProcessRowsByNode.get(nodeId) ?? [];
+            rows.push(row);
+            neo4jProcessRowsByNode.set(nodeId, rows);
+          }
+        } catch (e) {
+          logQueryError('query:process-lookup', e);
+        }
+
+        try {
+          const cohesionRows = await executeReadCypher(
+            `
+          UNWIND $nodeIds AS nodeId
+          MATCH (n:CodeNode {repoId: $repoId, id: nodeId})-[:MEMBER_OF]->(c:Community {repoId: $repoId})
+          RETURN nodeId, c.cohesion AS cohesion, c.heuristicLabel AS module
+        `,
+            { repoId: repo.name, nodeIds },
+          );
+          for (const row of cohesionRows) {
+            const nodeId = row.nodeId ?? row[0];
+            if (!nodeId || neo4jCohesionByNode.has(nodeId)) continue;
+            neo4jCohesionByNode.set(nodeId, {
+              cohesion: (row.cohesion ?? row[1]) || 0,
+              module: row.module ?? row[2],
+            });
+          }
+        } catch (e) {
+          logQueryError('query:cluster-info', e);
+        }
+      }
+    }
+
     for (const [_, item] of merged) {
       const sym = item.data;
       if (!sym.nodeId) {
@@ -1810,14 +1865,7 @@ export class LocalBackend {
       let processRows: any[] = [];
       try {
         if (useNeo4jBackend) {
-          const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
-          processRows = await executeReadCypher(
-            `
-          MATCH (n {repoId: $repoId, id: $nodeId})-[r:STEP_IN_PROCESS]->(p:Process {repoId: $repoId})
-          RETURN p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
-        `,
-            { repoId: repo.name, nodeId: sym.nodeId },
-          );
+          processRows = neo4jProcessRowsByNode.get(sym.nodeId) ?? [];
         } else {
           processRows = await executeParameterized(
             repo.id,
@@ -1836,30 +1884,26 @@ export class LocalBackend {
       let cohesion = 0;
       let module: string | undefined;
       try {
-        const cohesionRows = useNeo4jBackend
-          ? await (async () => {
-              const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
-              return await executeReadCypher(
-                `
-          MATCH (n {repoId: $repoId, id: $nodeId})-[:MEMBER_OF]->(c:Community {repoId: $repoId})
-          RETURN c.cohesion AS cohesion, c.heuristicLabel AS module
-          LIMIT 1
-        `,
-                { repoId: repo.name, nodeId: sym.nodeId },
-              );
-            })()
-          : await executeParameterized(
-              repo.id,
-              `
+        if (useNeo4jBackend) {
+          const row = neo4jCohesionByNode.get(sym.nodeId);
+          if (row) {
+            cohesion = row.cohesion;
+            module = row.module;
+          }
+        } else {
+          const cohesionRows = await executeParameterized(
+            repo.id,
+            `
           MATCH (n {id: $nodeId})-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
           RETURN c.cohesion AS cohesion, c.heuristicLabel AS module
           LIMIT 1
         `,
-              { nodeId: sym.nodeId },
-            );
-        if (cohesionRows.length > 0) {
-          cohesion = (cohesionRows[0].cohesion ?? cohesionRows[0][0]) || 0;
-          module = cohesionRows[0].module ?? cohesionRows[0][1];
+            { nodeId: sym.nodeId },
+          );
+          if (cohesionRows.length > 0) {
+            cohesion = (cohesionRows[0].cohesion ?? cohesionRows[0][0]) || 0;
+            module = cohesionRows[0].module ?? cohesionRows[0][1];
+          }
         }
       } catch (e) {
         logQueryError('query:cluster-info', e);
@@ -1874,7 +1918,7 @@ export class LocalBackend {
                 const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
                 return await executeReadCypher(
                   `
-            MATCH (n {repoId: $repoId, id: $nodeId})
+            MATCH (n:CodeNode {repoId: $repoId, id: $nodeId})
             RETURN n.content AS content
           `,
                   { repoId: repo.name, nodeId: sym.nodeId },

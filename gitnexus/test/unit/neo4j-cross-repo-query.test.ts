@@ -4,6 +4,7 @@ import * as zoektClient from '../../src/core/search/zoekt-client.js';
 import { semanticSearch, semanticSearchMany } from '../../src/core/neo4j/embedding-adapter.js';
 import { embedQuery } from '../../src/mcp/core/embedder.js';
 import { executeParameterized, executeQuery, initLbug } from '../../src/core/lbug/pool-adapter.js';
+import { executeReadCypher } from '../../src/core/neo4j/read-adapter.js';
 
 vi.mock('../../src/core/lbug/pool-adapter.js', () => ({
   initLbug: vi.fn(),
@@ -222,6 +223,84 @@ describe('Neo4j cross-repo vector discovery', () => {
     await (backend as any).ensureInitialized(repo.id);
 
     expect(initLbug).not.toHaveBeenCalled();
+  });
+
+  it('批量回填 Neo4j query 命中符号的流程和社区信息', async () => {
+    const backend = new LocalBackend();
+    vi.spyOn(backend as any, 'semanticSearch').mockResolvedValueOnce([
+      {
+        repoId: 'Repo A',
+        nodeId: 'Function:a',
+        name: 'handlerA',
+        type: 'Function',
+        filePath: 'src/a.ts',
+        startLine: 1,
+        endLine: 5,
+      },
+      {
+        repoId: 'Repo A',
+        nodeId: 'Function:b',
+        name: 'handlerB',
+        type: 'Function',
+        filePath: 'src/b.ts',
+        startLine: 10,
+        endLine: 20,
+      },
+    ]);
+    vi.mocked(executeReadCypher).mockImplementation(async (query: string, params?: any) => {
+      if (query.includes('STEP_IN_PROCESS')) {
+        expect(query).toContain('UNWIND $nodeIds AS nodeId');
+        expect(query).toContain('MATCH (n:CodeNode {repoId: $repoId, id: nodeId})');
+        expect(params).toEqual({ repoId: 'Repo A', nodeIds: ['Function:a', 'Function:b'] });
+        return [
+          {
+            nodeId: 'Function:a',
+            pid: 'Process:A',
+            label: 'Process A',
+            heuristicLabel: 'Process A',
+            processType: 'intra_community',
+            stepCount: 2,
+            step: 1,
+          },
+          {
+            nodeId: 'Function:b',
+            pid: 'Process:B',
+            label: 'Process B',
+            heuristicLabel: 'Process B',
+            processType: 'intra_community',
+            stepCount: 2,
+            step: 2,
+          },
+        ];
+      }
+      if (query.includes('MEMBER_OF')) {
+        expect(query).toContain('UNWIND $nodeIds AS nodeId');
+        expect(query).toContain('MATCH (n:CodeNode {repoId: $repoId, id: nodeId})');
+        expect(params).toEqual({ repoId: 'Repo A', nodeIds: ['Function:a', 'Function:b'] });
+        return [
+          { nodeId: 'Function:a', cohesion: 0.7, module: 'Module A' },
+          { nodeId: 'Function:b', cohesion: 0.4, module: 'Module B' },
+        ];
+      }
+      return [];
+    });
+
+    const result = await (backend as any).query(
+      {
+        id: 'repo-a',
+        name: 'Repo A',
+        repoPath: '/repo/a',
+        storagePath: '/repo/a/.gitnexus',
+        lbugPath: '/repo/a/.gitnexus/lbug',
+        indexedAt: '2026-05-30',
+        lastCommit: 'a',
+      },
+      { query: 'handler', limit: 1, max_symbols: 2 },
+    );
+
+    expect(executeReadCypher).toHaveBeenCalledTimes(2);
+    expect(result.processes.map((process: any) => process.id)).toEqual(['Process:A']);
+    expect(result.process_symbols.map((symbol: any) => symbol.id)).toContain('Function:a');
   });
 
   it('uses Neo4j cross-repo discovery directly for repo-less query calls', async () => {
