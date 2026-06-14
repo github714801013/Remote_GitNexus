@@ -228,7 +228,7 @@ const runGit = (args: string[], cwd: string): Promise<string> =>
 const fetchOriginRef = async (ref: string | undefined, cwd: string): Promise<void> => {
   if (!ref?.startsWith('origin/')) return;
   const branch = ref.slice('origin/'.length);
-  await runGit(['fetch', 'origin', `${branch}:refs/remotes/origin/${branch}`, '--depth', '1'], cwd);
+  await runGit(['fetch', 'origin', `${branch}:refs/remotes/origin/${branch}`], cwd);
 };
 
 export interface EnsureWorktreeParams {

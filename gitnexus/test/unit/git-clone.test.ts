@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import {
   buildWebhookBranchSyncCommands,
   extractRepoName,
@@ -9,6 +11,12 @@ import {
 } from '../../src/server/git-clone.js';
 
 describe('git-clone', () => {
+  it('does not build shallow clone or fetch commands', () => {
+    const source = readFileSync(path.resolve(__dirname, '../../src/server/git-clone.ts'), 'utf-8');
+
+    expect(source).not.toContain("'--depth'");
+  });
+
   describe('extractRepoName', () => {
     it('extracts name from HTTPS URL', () => {
       expect(extractRepoName('https://github.com/user/my-repo.git')).toBe('my-repo');
@@ -134,7 +142,7 @@ describe('git-clone', () => {
     it('uses stable remote-tracking refs so divergent local webhook mirrors do not depend on FETCH_HEAD', () => {
       expect(buildWebhookBranchSyncCommands('https://example.com/org/repo.git', 'dev')).toEqual([
         ['remote', 'set-url', 'origin', 'https://example.com/org/repo.git'],
-        ['fetch', 'origin', '+refs/heads/dev:refs/remotes/origin/dev', '--depth', '1'],
+        ['fetch', 'origin', '+refs/heads/dev:refs/remotes/origin/dev'],
         ['reset', '--hard', 'refs/remotes/origin/dev'],
         ['clean', '-fd', '-e', '.gitnexus', '-e', '.gitnexus/'],
         ['checkout', '-B', 'dev', 'refs/remotes/origin/dev'],

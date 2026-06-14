@@ -1,7 +1,7 @@
 /**
  * Git Clone Utility
  *
- * Shallow-clones repositories into ~/.gitnexus/repos/{name}/.
+ * Clones repositories into ~/.gitnexus/repos/{name}/.
  * If already cloned, does git pull instead.
  */
 
@@ -188,7 +188,7 @@ export function isGitObjectDatabaseCorruption(err: unknown): boolean {
 
 /**
  * Clone or pull a git repository.
- * If targetDir doesn't exist: git clone --depth 1
+ * If targetDir doesn't exist: git clone
  * If targetDir exists with .git: git pull --ff-only
  */
 export async function cloneOrPull(
@@ -203,12 +203,13 @@ export async function cloneOrPull(
 
   if (exists) {
     onProgress?.({ phase: 'pulling', message: 'Pulling latest changes...' });
+    await ensureFullHistory(targetDir);
     await runGit(['pull', '--ff-only'], targetDir);
   } else {
     validateGitUrl(url);
     await fs.mkdir(path.dirname(targetDir), { recursive: true });
     onProgress?.({ phase: 'cloning', message: `Cloning ${url}...` });
-    await runGit(['clone', '--depth', '1', url, targetDir]);
+    await runGit(['clone', url, targetDir]);
   }
 
   return targetDir;
@@ -238,6 +239,7 @@ export async function cloneOrResetToBranch(
     onProgress?.({ phase: 'pulling', message: `Synchronizing ${branch}...` });
     await fs.rm(path.join(targetDir, '.git', 'index.lock'), { force: true });
     try {
+      await ensureFullHistory(targetDir);
       for (const args of buildWebhookBranchSyncCommands(authenticatedUrl, branch)) {
         await runGit(args, targetDir);
       }
@@ -251,7 +253,7 @@ export async function cloneOrResetToBranch(
   } else {
     await fs.mkdir(path.dirname(targetDir), { recursive: true });
     onProgress?.({ phase: 'cloning', message: `Cloning ${url}...` });
-    await runGit(['clone', '--depth', '1', '--branch', branch, authenticatedUrl, targetDir]);
+    await runGit(['clone', '--branch', branch, authenticatedUrl, targetDir]);
   }
 
   return targetDir;
@@ -268,7 +270,7 @@ async function rebuildCorruptWebhookMirror(
     await fs.rm(targetDir, { recursive: true, force: true });
     await fs.mkdir(path.dirname(targetDir), { recursive: true });
     onProgress?.({ phase: 'cloning', message: `Re-cloning ${branch} after git corruption...` });
-    await runGit(['clone', '--depth', '1', '--branch', branch, url, targetDir]);
+    await runGit(['clone', '--branch', branch, url, targetDir]);
     if (metadataDir) {
       await fs.cp(metadataDir, path.join(targetDir, '.gitnexus'), { recursive: true, force: true });
     }
@@ -295,13 +297,20 @@ export function buildWebhookBranchSyncCommands(url: string, branch: string): str
   const remoteRef = `refs/remotes/origin/${branch}`;
   return [
     ['remote', 'set-url', 'origin', url],
-    ['fetch', 'origin', `+refs/heads/${branch}:${remoteRef}`, '--depth', '1'],
+    ['fetch', 'origin', `+refs/heads/${branch}:${remoteRef}`],
     ['reset', '--hard', remoteRef],
     ['clean', '-fd', '-e', '.gitnexus', '-e', '.gitnexus/'],
     ['checkout', '-B', branch, remoteRef],
     ['reset', '--hard', remoteRef],
     ['clean', '-fd', '-e', '.gitnexus', '-e', '.gitnexus/'],
   ];
+}
+
+async function ensureFullHistory(targetDir: string): Promise<void> {
+  const shallow = (await runGitOutput(['rev-parse', '--is-shallow-repository'], targetDir)).trim();
+  if (shallow === 'true') {
+    await runGit(['fetch', '--unshallow', 'origin'], targetDir);
+  }
 }
 
 export function getAuthenticatedGitUrl(url: string): string {
@@ -349,6 +358,41 @@ function runGit(args: string[], cwd?: string): Promise<void> {
       if (code === 0) resolve();
       else {
         // Log full stderr internally but don't expose it to API callers (SSRF mitigation)
+        if (stderr.trim()) console.error(`git ${args[0]} stderr: ${sanitizeGitStderr(stderr)}`);
+        reject(new Error(`git ${args[0]} failed (exit code ${code})`));
+      }
+    });
+
+    proc.on('error', (err) => {
+      reject(new Error(`Failed to spawn git: ${err.message}`));
+    });
+  });
+}
+
+function runGitOutput(args: string[], cwd?: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('git', args, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_ASKPASS: process.platform === 'win32' ? 'echo' : '/bin/true',
+      },
+    });
+
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk;
+    });
+    proc.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk;
+    });
+
+    proc.on('close', (code) => {
+      if (code === 0) resolve(stdout);
+      else {
         if (stderr.trim()) console.error(`git ${args[0]} stderr: ${sanitizeGitStderr(stderr)}`);
         reject(new Error(`git ${args[0]} failed (exit code ${code})`));
       }

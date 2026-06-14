@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
 const { repoManagerMocks } = vi.hoisted(() => ({
   repoManagerMocks: {
@@ -153,6 +154,37 @@ describe('LocalBackend git_author_trace tool', () => {
 
     expect(out.commits).toEqual([]);
     expect(out.truncatedHistory).toBe(false);
+  });
+
+  it('does not report authors when a shallow clone creates blame boundary lines', async () => {
+    const remotePath = path.join(tmpDir, 'remote.git');
+    const shallowPath = path.join(tmpDir, 'shallow');
+    git(['clone', '--bare', repoPath, remotePath], tmpDir);
+    git(['clone', '--depth', '1', pathToFileURL(remotePath).href, shallowPath], tmpDir);
+
+    repoManagerMocks.listRegisteredRepos.mockResolvedValue([
+      {
+        name: 'shallow',
+        path: shallowPath,
+        storagePath: path.join(tmpDir, 'shallow-storage'),
+        indexedAt: '2026-06-14T00:00:00.000Z',
+        lastCommit: git(['rev-parse', 'HEAD'], shallowPath),
+        stats: { files: 1, nodes: 1, communities: 0, processes: 0 },
+      },
+    ]);
+
+    const backend = new LocalBackend();
+
+    const out = await backend.callTool('git_author_trace', {
+      repo: 'shallow',
+      filePath: 'src/sample.ts',
+      startLine: 1,
+      endLine: 2,
+    });
+
+    expect(out.primaryAuthors).toEqual([]);
+    expect(out.commits).toEqual([]);
+    expect(out.warnings).toContain('浅克隆,无法获取真正修改人');
   });
 
   it('rejects paths outside the repository root', async () => {

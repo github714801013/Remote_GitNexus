@@ -209,6 +209,7 @@ type GitBlameLine = {
   authorEmail: string;
   authorTime?: string;
   summary?: string;
+  boundary?: boolean;
 };
 
 type GitHistoryCommit = {
@@ -1588,6 +1589,8 @@ export class LocalBackend {
         if (Number.isFinite(seconds)) current.authorTime = new Date(seconds * 1000).toISOString();
       } else if (line.startsWith('summary ')) {
         current.summary = line.slice('summary '.length);
+      } else if (line === 'boundary') {
+        current.boundary = true;
       } else if (line.startsWith('\t')) {
         if (
           current.commit &&
@@ -1602,6 +1605,7 @@ export class LocalBackend {
             authorEmail: current.authorEmail,
             authorTime: current.authorTime,
             summary: current.summary,
+            boundary: current.boundary,
           });
         }
         current = null;
@@ -1670,6 +1674,8 @@ export class LocalBackend {
       '--',
       filePath,
     ];
+    const isShallowRepository =
+      (await runGit(['rev-parse', '--is-shallow-repository'], 1024)).trim() === 'true';
 
     let blameOutput: string;
     try {
@@ -1679,6 +1685,19 @@ export class LocalBackend {
     }
 
     const blameLines = this.parseGitBlamePorcelain(blameOutput);
+    if (isShallowRepository && blameLines.some((line) => line.boundary)) {
+      return {
+        repo: repo.name,
+        headCommit: repo.lastCommit,
+        filePath,
+        startLine,
+        endLine,
+        primaryAuthors: [],
+        commits: [],
+        truncatedHistory: false,
+        warnings: ['浅克隆,无法获取真正修改人'],
+      };
+    }
     const authors = new Map<
       string,
       {

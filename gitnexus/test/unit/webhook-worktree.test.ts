@@ -208,6 +208,15 @@ describe('webhook worktree helpers', () => {
     expect(await git(['rev-parse', 'HEAD'], worktree)).toBe(sourceCommit);
   });
 
+  it('does not request shallow history when fetching worktree source refs', async () => {
+    const source = await readFile(
+      path.resolve(__dirname, '../../src/server/webhook-worktree.ts'),
+      'utf-8',
+    );
+
+    expect(source).not.toContain("'--depth'");
+  });
+
   it('copies a main index and rewrites meta for the worktree registry entry', async () => {
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'gitnexus-worktree-test-'));
     const mainRepo = path.join(tempRoot, 'main');
