@@ -186,6 +186,7 @@ function logQueryTiming(query: string, phases: Record<string, number>): void {
 const DEFAULT_CODE_SNIPPET_MAX_LINES = 300;
 const DEFAULT_CODE_SNIPPET_MAX_CHARS = 80_000;
 const DEFAULT_CODE_SNIPPET_RETRY_DELAY_MS = 50;
+const DEFAULT_GIT_AUTHOR_TRACE_MAX_COMMITS = 10;
 
 function envPositiveInt(name: string, fallback: number): number {
   const parsed = Number.parseInt(process.env[name] ?? '', 10);
@@ -200,6 +201,23 @@ function isPathInside(parent: string, child: string): boolean {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+type GitBlameLine = {
+  commit: string;
+  line: number;
+  authorName: string;
+  authorEmail: string;
+  authorTime?: string;
+  summary?: string;
+};
+
+type GitHistoryCommit = {
+  hash: string;
+  authorName: string;
+  authorEmail: string;
+  date: string;
+  summary: string;
+};
 
 export interface CodebaseContext {
   projectName: string;
@@ -1517,12 +1535,217 @@ export class LocalBackend {
         return this.apiImpact(repo, params);
       case 'code_snippet':
         return this.codeSnippet(repo, params);
+      case 'git_author_trace':
+        return this.gitAuthorTrace(repo, params);
       default:
         throw new Error(`Unknown tool: ${method}`);
     }
   }
 
   // ─── Tool Implementations ────────────────────────────────────────
+
+  private validateLineRange(startLine: number, endLine: number, maxLines: number): void {
+    if (!Number.isFinite(startLine) || !Number.isFinite(endLine) || startLine < 1 || endLine < 1) {
+      throw new Error('startLine and endLine must be positive 1-based line numbers.');
+    }
+    if (endLine < startLine) throw new Error('endLine must be greater than or equal to startLine.');
+    if (endLine - startLine + 1 > maxLines) {
+      throw new Error(`Requested line range exceeds maximum of ${maxLines} lines.`);
+    }
+  }
+
+  private resolveRepoFilePath(
+    repo: RepoHandle,
+    filePath: string,
+  ): { repoRoot: string; targetPath: string } {
+    const repoRoot = path.resolve(repo.repoPath);
+    const targetPath = path.resolve(repoRoot, filePath);
+    if (targetPath === repoRoot || !isPathInside(repoRoot, targetPath)) {
+      throw new Error(`Requested filePath is outside repository root: ${filePath}`);
+    }
+    return { repoRoot, targetPath };
+  }
+
+  private parseGitBlamePorcelain(output: string): GitBlameLine[] {
+    const lines = output.split(/\r?\n/);
+    const entries: GitBlameLine[] = [];
+    let current: Partial<GitBlameLine> | null = null;
+
+    for (const line of lines) {
+      const header = line.match(/^([0-9a-f]{40})\s+\d+\s+(\d+)(?:\s+\d+)?$/);
+      if (header) {
+        current = { commit: header[1], line: Number.parseInt(header[2], 10) };
+        continue;
+      }
+
+      if (!current) continue;
+      if (line.startsWith('author ')) {
+        current.authorName = line.slice('author '.length);
+      } else if (line.startsWith('author-mail ')) {
+        current.authorEmail = line.slice('author-mail '.length).replace(/^<|>$/g, '');
+      } else if (line.startsWith('author-time ')) {
+        const seconds = Number.parseInt(line.slice('author-time '.length), 10);
+        if (Number.isFinite(seconds)) current.authorTime = new Date(seconds * 1000).toISOString();
+      } else if (line.startsWith('summary ')) {
+        current.summary = line.slice('summary '.length);
+      } else if (line.startsWith('\t')) {
+        if (
+          current.commit &&
+          Number.isFinite(current.line) &&
+          current.authorName &&
+          current.authorEmail
+        ) {
+          entries.push({
+            commit: current.commit,
+            line: current.line,
+            authorName: current.authorName,
+            authorEmail: current.authorEmail,
+            authorTime: current.authorTime,
+            summary: current.summary,
+          });
+        }
+        current = null;
+      }
+    }
+
+    return entries;
+  }
+
+  private parseGitLogHistory(output: string): GitHistoryCommit[] {
+    return output
+      .split('\x1e')
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .map((entry) => {
+        const [header] = entry.split(/\r?\n/, 1);
+        const [hash, authorName, authorEmail, date, summary] = header.split('\x00');
+        return { hash, authorName, authorEmail, date, summary };
+      })
+      .filter(
+        (commit) =>
+          commit.hash && commit.authorName && commit.authorEmail && commit.date && commit.summary,
+      );
+  }
+
+  private async gitAuthorTrace(
+    repo: RepoHandle,
+    params: {
+      filePath?: string;
+      startLine?: number;
+      endLine?: number;
+      includeHistory?: boolean;
+      maxCommits?: number;
+    },
+  ): Promise<any> {
+    const filePath = params.filePath?.trim();
+    if (!filePath) throw new Error('filePath parameter is required.');
+
+    const startLine = Math.trunc(Number(params.startLine));
+    const endLine = Math.trunc(Number(params.endLine));
+    const maxLines = envPositiveInt(
+      'GITNEXUS_GIT_AUTHOR_TRACE_MAX_LINES',
+      DEFAULT_CODE_SNIPPET_MAX_LINES,
+    );
+    this.validateLineRange(startLine, endLine, maxLines);
+    const { targetPath } = this.resolveRepoFilePath(repo, filePath);
+    const stat = await fs.stat(targetPath);
+    if (!stat.isFile()) throw new Error(`filePath is not a file: ${filePath}`);
+
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const execFileAsync = promisify(execFile);
+    const runGit = async (args: string[], maxBuffer: number): Promise<string> => {
+      const { stdout } = await execFileAsync('git', args, {
+        cwd: repo.repoPath,
+        encoding: 'utf-8',
+        maxBuffer,
+      });
+      return stdout;
+    };
+    const blameArgs = [
+      'blame',
+      '--line-porcelain',
+      '-L',
+      `${startLine},${endLine}`,
+      '--',
+      filePath,
+    ];
+
+    let blameOutput: string;
+    try {
+      blameOutput = await runGit(blameArgs, 16 * 1024 * 1024);
+    } catch (err: any) {
+      throw new Error(`Git blame failed: ${err.message}`);
+    }
+
+    const blameLines = this.parseGitBlamePorcelain(blameOutput);
+    const authors = new Map<
+      string,
+      {
+        name: string;
+        email: string;
+        lines: number[];
+        lastCommit: string;
+        lastCommitDate?: string;
+        lastSummary?: string;
+      }
+    >();
+
+    for (const line of blameLines) {
+      const key = `${line.authorName}\x00${line.authorEmail}\x00${line.commit}`;
+      const existing = authors.get(key);
+      if (existing) {
+        existing.lines.push(line.line);
+      } else {
+        authors.set(key, {
+          name: line.authorName,
+          email: line.authorEmail,
+          lines: [line.line],
+          lastCommit: line.commit,
+          lastCommitDate: line.authorTime,
+          lastSummary: line.summary,
+        });
+      }
+    }
+
+    const includeHistory = params.includeHistory ?? true;
+    const requestedMaxCommits = Math.trunc(
+      Number(params.maxCommits ?? DEFAULT_GIT_AUTHOR_TRACE_MAX_COMMITS),
+    );
+    const maxCommits =
+      Number.isFinite(requestedMaxCommits) && requestedMaxCommits > 0
+        ? Math.min(requestedMaxCommits, 100)
+        : DEFAULT_GIT_AUTHOR_TRACE_MAX_COMMITS;
+
+    let commits: GitHistoryCommit[] = [];
+    if (includeHistory) {
+      const logArgs = [
+        'log',
+        `--max-count=${maxCommits}`,
+        `-L${startLine},${endLine}:${filePath}`,
+        '-s',
+        '--format=%x1e%H%x00%an%x00%ae%x00%aI%x00%s',
+      ];
+      try {
+        const logOutput = await runGit(logArgs, 32 * 1024 * 1024);
+        commits = this.parseGitLogHistory(logOutput);
+      } catch (err: any) {
+        throw new Error(`Git history lookup failed: ${err.message}`);
+      }
+    }
+
+    return {
+      repo: repo.name,
+      headCommit: repo.lastCommit,
+      filePath,
+      startLine,
+      endLine,
+      primaryAuthors: Array.from(authors.values()).sort((a, b) => a.lines[0] - b.lines[0]),
+      commits,
+      truncatedHistory: includeHistory ? commits.length >= maxCommits : false,
+      warnings: blameLines.length === 0 ? ['No blame lines found for the requested range.'] : [],
+    };
+  }
 
   private async codeSnippet(
     repo: RepoHandle,
@@ -1537,24 +1760,14 @@ export class LocalBackend {
 
     const startLine = Math.trunc(Number(params.startLine));
     const endLine = Math.trunc(Number(params.endLine));
-    if (!Number.isFinite(startLine) || !Number.isFinite(endLine) || startLine < 1 || endLine < 1) {
-      throw new Error('startLine and endLine must be positive 1-based line numbers.');
-    }
-    if (endLine < startLine) throw new Error('endLine must be greater than or equal to startLine.');
 
     const maxLines = envPositiveInt(
       'GITNEXUS_CODE_SNIPPET_MAX_LINES',
       DEFAULT_CODE_SNIPPET_MAX_LINES,
     );
-    if (endLine - startLine + 1 > maxLines) {
-      throw new Error(`Requested line range exceeds maximum of ${maxLines} lines.`);
-    }
+    this.validateLineRange(startLine, endLine, maxLines);
 
-    const repoRoot = path.resolve(repo.repoPath);
-    const targetPath = path.resolve(repoRoot, filePath);
-    if (targetPath === repoRoot || !isPathInside(repoRoot, targetPath)) {
-      throw new Error(`Requested filePath is outside repository root: ${filePath}`);
-    }
+    const { targetPath } = this.resolveRepoFilePath(repo, filePath);
 
     const maxFileBytes = envPositiveInt(
       'GITNEXUS_CODE_SNIPPET_MAX_FILE_SIZE_BYTES',

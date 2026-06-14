@@ -64,6 +64,9 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
     case 'code_snippet':
       return `\n\n---\n**Next:** If you need relationships for this code, use context({name: "<symbol_name>"${repoParam}}) or impact({target: "<symbol_name>", direction: "upstream"${repoParam}}).`;
 
+    case 'git_author_trace':
+      return `\n\n---\n**Next:** Review primaryAuthors for current ownership and commits for history. If the code path matters, use context({name: "<symbol_name>"${repoParam}}) or impact({target: "<symbol_name>", direction: "upstream"${repoParam}}).`;
+
     case 'cypher':
       return `\n\n---\n**Next:** To explore a result symbol, use context({name: "<name>"${repoParam}}). For schema reference, READ gitnexus://repo/${repoPath}/schema.`;
 

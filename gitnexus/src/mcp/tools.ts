@@ -561,6 +561,51 @@ Performance model: resolves the repo from the registry, validates the requested 
     },
   },
   {
+    name: 'git_author_trace',
+    description: `Find Git blame authors and commit history for a repository-relative file line range.
+
+WHEN TO USE: After query(), context(), impact(), cypher(), or code_snippet returns a concrete file path and line number, use this to identify who last changed those lines and which commits touched the range.
+
+Performance model: resolves the repo from the registry, validates the requested path stays inside the repo root, runs bounded git blame and optional git log -L history using argument arrays, and caps line range plus commit count.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filePath: {
+          type: 'string',
+          description: 'Repository-relative file path to inspect.',
+          minLength: 1,
+        },
+        startLine: {
+          type: 'number',
+          description: '1-based start line.',
+          minimum: 1,
+        },
+        endLine: {
+          type: 'number',
+          description: '1-based end line.',
+          minimum: 1,
+        },
+        includeHistory: {
+          type: 'boolean',
+          description: 'Include git log -L commit history for the range (default: true).',
+          default: true,
+        },
+        maxCommits: {
+          type: 'number',
+          description: 'Maximum history commits to return (default: 10).',
+          default: 10,
+          minimum: 1,
+          maximum: 100,
+        },
+        repo: {
+          type: 'string',
+          description: 'Repository name or path. Omit if only one repo is indexed.',
+        },
+      },
+      required: ['filePath', 'startLine', 'endLine'],
+    },
+  },
+  {
     name: 'group_list',
     description: `List all configured repository groups, or return details for one group (repos, manifest links).
 

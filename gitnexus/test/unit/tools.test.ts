@@ -13,8 +13,8 @@ import { GITNEXUS_TOOLS } from '../../src/mcp/tools.js';
 const GROUP_TOOLS = new Set(['group_list', 'group_sync']);
 
 describe('GITNEXUS_TOOLS', () => {
-  it('exports all tools (7 base + 3 route/tool/shape + 1 api_impact + 2 group + code_snippet)', () => {
-    expect(GITNEXUS_TOOLS).toHaveLength(14);
+  it('exports all tools (7 base + 3 route/tool/shape + 1 api_impact + 2 group + code_snippet + git_author_trace)', () => {
+    expect(GITNEXUS_TOOLS).toHaveLength(15);
   });
 
   it('contains all expected tool names', () => {
@@ -30,6 +30,7 @@ describe('GITNEXUS_TOOLS', () => {
         'impact',
         'api_impact',
         'code_snippet',
+        'git_author_trace',
       ]),
     );
   });
@@ -202,6 +203,18 @@ describe('GITNEXUS_TOOLS', () => {
     expect(tool.inputSchema.properties.filePath.type).toBe('string');
     expect(tool.inputSchema.properties.startLine.minimum).toBe(1);
     expect(tool.inputSchema.properties.endLine.minimum).toBe(1);
+  });
+
+  it('git_author_trace requires filePath and line range', () => {
+    const tool = GITNEXUS_TOOLS.find((t) => t.name === 'git_author_trace')!;
+    expect(tool).toBeDefined();
+    expect(tool.inputSchema.required).toEqual(['filePath', 'startLine', 'endLine']);
+    expect(tool.inputSchema.properties.repo).toBeDefined();
+    expect(tool.inputSchema.properties.filePath.type).toBe('string');
+    expect(tool.inputSchema.properties.startLine.minimum).toBe(1);
+    expect(tool.inputSchema.properties.endLine.minimum).toBe(1);
+    expect(tool.inputSchema.properties.includeHistory.type).toBe('boolean');
+    expect(tool.inputSchema.properties.maxCommits.minimum).toBe(1);
   });
 
   it('impact relationTypes is array of strings', () => {
