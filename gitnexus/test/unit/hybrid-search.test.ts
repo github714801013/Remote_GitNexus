@@ -8,10 +8,14 @@
  * - Limit parameter
  * - Empty inputs
  */
-import { describe, it, expect } from 'vitest';
-import { mergeWithRRF } from '../../src/core/search/hybrid-search.js';
-import type { BM25SearchResult } from '../../src/core/search/bm25-index.js';
+import { beforeEach, describe, it, expect, vi } from 'vitest';
+import { hybridSearch, mergeWithRRF } from '../../src/core/search/hybrid-search.js';
+import { searchFTSFromLbug, type BM25SearchResult } from '../../src/core/search/bm25-index.js';
 import type { SemanticSearchResult } from '../../src/core/embeddings/types.js';
+
+vi.mock('../../src/core/search/bm25-index.js', () => ({
+  searchFTSFromLbug: vi.fn(),
+}));
 
 let bm25Rank = 0;
 function makeBM25(filePath: string, score: number): BM25SearchResult {
@@ -122,5 +126,29 @@ describe('mergeWithRRF', () => {
     const result = mergeWithRRF(bm25, semantic);
     expect(result[0].bm25Score).toBe(15);
     expect(result[0].semanticScore).toBeCloseTo(0.7); // 1 - distance
+  });
+});
+
+describe('hybridSearch', () => {
+  beforeEach(() => {
+    vi.mocked(searchFTSFromLbug).mockReset();
+  });
+
+  it('falls back to BM25 results when semantic vector index is missing', async () => {
+    vi.mocked(searchFTSFromLbug).mockResolvedValue([makeBM25('src/member.ts', 12)]);
+
+    const semanticSearch = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "Binder exception: Table CodeEmbedding doesn't have an index with name code_embedding_idx.",
+        ),
+      );
+
+    const result = await hybridSearch('会员购物统计', 10, vi.fn(), semanticSearch);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].filePath).toBe('src/member.ts');
+    expect(result[0].sources).toEqual(['bm25']);
   });
 });

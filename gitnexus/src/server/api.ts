@@ -51,6 +51,17 @@ import { hybridSearch } from '../core/search/hybrid-search.js';
 // at server startup — crashes on unsupported Node ABI versions (#89)
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { mountMCPEndpoints } from './mcp-http.js';
+import {
+  buildNeo4jGraph,
+  listNeo4jFilePaths,
+  queryNeo4jBackend,
+  queryNeo4jClusterDetail,
+  queryNeo4jClusters,
+  queryNeo4jProcessDetail,
+  queryNeo4jProcesses,
+  runNeo4jEmbeddingRepair,
+  searchNeo4jBackend,
+} from './search.js';
 import { fork } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { JobManager } from './analyze-job.js';
@@ -1633,6 +1644,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const includeContent = req.query.includeContent === 'true';
       const stream = req.query.stream === 'true';
 
+      if (isNeo4jBackendEnabled()) {
+        if (stream) {
+          res.status(400).json({ error: 'Graph streaming is not supported for Neo4j backend yet' });
+          return;
+        }
+        const graph = await buildNeo4jGraph(entry.name, includeContent);
+        res.json(graph);
+        return;
+      }
+
       if (stream) {
         const abortController = new AbortController();
         let responseFinished = false;
@@ -1707,6 +1728,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
+      if (isNeo4jBackendEnabled()) {
+        const result = await queryNeo4jBackend(cypher);
+        res.json({ result });
+        return;
+      }
       const lbugPath = path.join(entry.storagePath, 'lbug');
       const result = await withLbugDb(lbugPath, () => executeQuery(cypher));
       res.json({ result });
@@ -1736,6 +1762,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         : 10;
       const mode: string = req.body.mode ?? 'hybrid';
       const enrich: boolean = req.body.enrich !== false; // default true
+
+      if (isNeo4jBackendEnabled()) {
+        const results = await searchNeo4jBackend({
+          repoName: entry.name,
+          query,
+          mode,
+          limit,
+        });
+        res.json({ results });
+        return;
+      }
 
       const results = await withLbugDb(lbugPath, async () => {
         let searchResults: any[];
@@ -1965,15 +2002,19 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const repoRoot = path.resolve(entry.path);
 
       // Get file paths from the graph (lightweight — no content loaded)
-      const lbugPath = path.join(entry.storagePath, 'lbug');
-      const fileRows = await withLbugDb(lbugPath, () =>
-        executeQuery(`MATCH (n:File) WHERE n.content IS NOT NULL RETURN n.filePath AS filePath`),
-      );
+      const filePaths = isNeo4jBackendEnabled()
+        ? await listNeo4jFilePaths(entry.name)
+        : (
+            await withLbugDb(path.join(entry.storagePath, 'lbug'), () =>
+              executeQuery(
+                `MATCH (n:File) WHERE n.content IS NOT NULL RETURN n.filePath AS filePath`,
+              ),
+            )
+          ).map((row) => row.filePath || '');
 
       // Search files on disk one at a time (constant memory)
-      for (const row of fileRows) {
+      for (const filePath of filePaths) {
         if (results.length >= limit) break;
-        const filePath: string = row.filePath || '';
         const fullPath = path.resolve(repoRoot, filePath);
 
         // Path traversal guard
@@ -2005,6 +2046,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // List all processes
   app.get('/api/processes', async (req, res) => {
     try {
+      if (isNeo4jBackendEnabled()) {
+        const entry = await resolveRepo(requestedRepo(req));
+        if (!entry) {
+          res.status(404).json({ error: 'Repository not found' });
+          return;
+        }
+        const result = await queryNeo4jProcesses(entry.name);
+        res.json(result);
+        return;
+      }
       const result = await backend.queryProcesses(requestedRepo(req));
       res.json(result);
     } catch (err: any) {
@@ -2018,6 +2069,21 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const name = String(req.query.name ?? '').trim();
       if (!name) {
         res.status(400).json({ error: 'Missing "name" query parameter' });
+        return;
+      }
+
+      if (isNeo4jBackendEnabled()) {
+        const entry = await resolveRepo(requestedRepo(req));
+        if (!entry) {
+          res.status(404).json({ error: 'Repository not found' });
+          return;
+        }
+        const result = await queryNeo4jProcessDetail(name, entry.name);
+        if (result?.error) {
+          res.status(404).json({ error: result.error });
+          return;
+        }
+        res.json(result);
         return;
       }
 
@@ -2037,6 +2103,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // List all clusters
   app.get('/api/clusters', async (req, res) => {
     try {
+      if (isNeo4jBackendEnabled()) {
+        const entry = await resolveRepo(requestedRepo(req));
+        if (!entry) {
+          res.status(404).json({ error: 'Repository not found' });
+          return;
+        }
+        const result = await queryNeo4jClusters(entry.name);
+        res.json(result);
+        return;
+      }
       const result = await backend.queryClusters(requestedRepo(req));
       res.json(result);
     } catch (err: any) {
@@ -2050,6 +2126,21 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const name = String(req.query.name ?? '').trim();
       if (!name) {
         res.status(400).json({ error: 'Missing "name" query parameter' });
+        return;
+      }
+
+      if (isNeo4jBackendEnabled()) {
+        const entry = await resolveRepo(requestedRepo(req));
+        if (!entry) {
+          res.status(404).json({ error: 'Repository not found' });
+          return;
+        }
+        const result = await queryNeo4jClusterDetail(name, entry.name);
+        if (result?.error) {
+          res.status(404).json({ error: result.error });
+          return;
+        }
+        res.json(result);
         return;
       }
 
@@ -2611,47 +2702,52 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       // Run embedding pipeline asynchronously
       (async () => {
         try {
-          const lbugPath = path.join(entry.storagePath, 'lbug');
-          await withLbugDb(lbugPath, async () => {
-            const { runEmbeddingPipeline } =
-              await import('../core/embeddings/embedding-pipeline.js');
-            // Fetch existing content hashes for incremental embedding.
-            // Delegated to lbug-adapter which owns the DB query logic and legacy-fallback handling.
-            const { fetchExistingEmbeddingHashes } = await import('../core/lbug/lbug-adapter.js');
-            const existingEmbeddings = await fetchExistingEmbeddingHashes(executeQuery);
-            if (existingEmbeddings && existingEmbeddings.size > 0) {
-              console.log(
-                `[embed] ${existingEmbeddings.size} nodes already embedded — incremental run with content-hash comparison`,
-              );
-            }
-            await runEmbeddingPipeline(
-              executeQuery,
-              executeWithReusedStatement,
-              (p) => {
-                embedJobManager.updateJob(job.id, {
-                  progress: {
-                    phase:
-                      p.phase === 'ready' ? 'complete' : p.phase === 'error' ? 'failed' : p.phase,
-                    percent: p.percent,
-                    message:
-                      p.phase === 'loading-model'
-                        ? 'Loading embedding model...'
-                        : p.phase === 'embedding'
-                          ? `Embedding nodes (${p.percent}%)...`
-                          : p.phase === 'indexing'
-                            ? 'Creating vector index...'
-                            : p.phase === 'ready'
-                              ? 'Embeddings complete'
-                              : `${p.phase} (${p.percent}%)`,
-                  },
-                });
+          const updateEmbedProgress = (p: any) => {
+            embedJobManager.updateJob(job.id, {
+              progress: {
+                phase: p.phase === 'ready' ? 'complete' : p.phase === 'error' ? 'failed' : p.phase,
+                percent: p.percent,
+                message:
+                  p.phase === 'loading-model'
+                    ? 'Loading embedding model...'
+                    : p.phase === 'embedding'
+                      ? `Embedding nodes (${p.percent}%)...`
+                      : p.phase === 'indexing'
+                        ? 'Creating vector index...'
+                        : p.phase === 'ready'
+                          ? 'Embeddings complete'
+                          : `${p.phase} (${p.percent}%)`,
               },
-              {}, // config: use defaults
-              undefined, // skipNodeIds
-              undefined, // context
-              existingEmbeddings,
-            );
-          });
+            });
+          };
+
+          if (isNeo4jBackendEnabled()) {
+            await runNeo4jEmbeddingRepair(entry.name, updateEmbedProgress);
+          } else {
+            const lbugPath = path.join(entry.storagePath, 'lbug');
+            await withLbugDb(lbugPath, async () => {
+              const { runEmbeddingPipeline } =
+                await import('../core/embeddings/embedding-pipeline.js');
+              // Fetch existing content hashes for incremental embedding.
+              // Delegated to lbug-adapter which owns the DB query logic and legacy-fallback handling.
+              const { fetchExistingEmbeddingHashes } = await import('../core/lbug/lbug-adapter.js');
+              const existingEmbeddings = await fetchExistingEmbeddingHashes(executeQuery);
+              if (existingEmbeddings && existingEmbeddings.size > 0) {
+                console.log(
+                  `[embed] ${existingEmbeddings.size} nodes already embedded — incremental run with content-hash comparison`,
+                );
+              }
+              await runEmbeddingPipeline(
+                executeQuery,
+                executeWithReusedStatement,
+                updateEmbedProgress,
+                {}, // config: use defaults
+                undefined, // skipNodeIds
+                undefined, // context
+                existingEmbeddings,
+              );
+            });
+          }
 
           clearTimeout(embedTimeout);
           releaseRepoLock(repoLockPath);
