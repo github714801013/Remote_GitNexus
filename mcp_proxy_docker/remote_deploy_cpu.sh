@@ -40,10 +40,10 @@ docker build --network=host --progress=plain \
 echo "=== 步骤 3: 推送镜像到私有仓库 ==="
 docker push "${full_image_name}"
 
-echo "=== 步骤 4: 同步配置文件到远端 ==="
+echo "=== 步骤 4: 同步部署文件到远端 ==="
 ssh "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p \"${REMOTE_PATH}\" \"${PROJECTS_PATH}\" \"${DATA_PATH}\" && if [ -f \"${REMOTE_PATH}/repos.json\" ]; then cp \"${REMOTE_PATH}/repos.json\" \"${REMOTE_PATH}/repos.json.bak\"; fi && if [ -f \"${PROJECTS_PATH}/repos.json\" ]; then cp \"${PROJECTS_PATH}/repos.json\" \"${PROJECTS_PATH}/repos.json.bak\"; fi && if [ -f \"${DATA_PATH}/registry.json\" ]; then cp \"${DATA_PATH}/registry.json\" \"${DATA_PATH}/registry.json.bak\"; fi && find \"${PROJECTS_PATH}\" -path '*/.gitnexus/meta.json' -type f -exec cp {} {}.bak \\;"
 scp mcp_proxy_docker/auto_verify.py repos.json "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/"
-scp repos.json "${REMOTE_USER}@${REMOTE_HOST}:${PROJECTS_PATH}/"
+echo "保留远端运行配置: ${PROJECTS_PATH}/repos.json，不使用本地 repos.json 覆盖"
 
 echo "=== 步骤 5: 通过 SSH 隧道远端拉取并启动 ==="
 # 使用 -R 将远端的 1088 端口转发到本地可以访问的 harbor 地址
