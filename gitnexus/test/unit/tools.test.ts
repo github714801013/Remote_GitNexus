@@ -217,6 +217,19 @@ describe('GITNEXUS_TOOLS', () => {
     expect(tool.inputSchema.properties.maxCommits.minimum).toBe(1);
   });
 
+  it('documents author lookup after locating concrete file lines', () => {
+    const queryTool = GITNEXUS_TOOLS.find((t) => t.name === 'query')!;
+    const contextTool = GITNEXUS_TOOLS.find((t) => t.name === 'context')!;
+    const snippetTool = GITNEXUS_TOOLS.find((t) => t.name === 'code_snippet')!;
+    const authorTool = GITNEXUS_TOOLS.find((t) => t.name === 'git_author_trace')!;
+
+    expect(queryTool.description).toContain('git_author_trace');
+    expect(contextTool.description).toContain('git_author_trace');
+    expect(snippetTool.description).toContain('git_author_trace');
+    expect(authorTool.description).toContain('concrete file path and line number');
+    expect(authorTool.description).toContain('who last changed those lines');
+  });
+
   it('impact relationTypes is array of strings', () => {
     const impactTool = GITNEXUS_TOOLS.find((t) => t.name === 'impact')!;
     const relProp = impactTool.inputSchema.properties.relationTypes;

@@ -220,7 +220,7 @@ gitnexus group status <name>     # Check staleness of repos in a group
 
 ### What Your AI Agent Gets
 
-**16 tools** exposed via MCP (11 per-repo + 5 group):
+**15 tools** exposed via MCP (13 per-repo + 2 group):
 
 | Tool               | What It Does                                                      | `repo` Param |
 | ------------------ | ----------------------------------------------------------------- | -------------- |
@@ -231,13 +231,18 @@ gitnexus group status <name>     # Check staleness of repos in a group
 | `detect_changes` | Git-diff impact — maps changed lines to affected processes       | Optional       |
 | `rename`         | Multi-file coordinated rename with graph + text search            | Optional       |
 | `cypher`         | Raw Cypher graph queries                                          | Optional       |
+| `route_map`      | Route to handler and consumer map                                 | Optional       |
+| `shape_check`    | Response shape vs consumer property access checks                 | Optional       |
+| `tool_map`       | MCP/RPC tool definitions and handlers                             | Optional       |
+| `api_impact`     | API route impact with consumers, middleware, and shape checks     | Optional       |
+| `code_snippet`   | Bounded source snippet by repository-relative file line range     | Optional       |
+| `git_author_trace` | Git blame authors and bounded commit history for concrete lines | Optional       |
 | `group_list`     | List configured repository groups                                 | —             |
 | `group_sync`     | Extract contracts and match across repos/services                 | —             |
-| `group_contracts`| Inspect extracted contracts and cross-links                       | —             |
-| `group_query`    | Search execution flows across all repos in a group                | —             |
-| `group_status`   | Check staleness of repos in a group                               | —             |
 
 > When only one repo is indexed, the `repo` parameter is optional. With multiple repos, use `list_repos` to discover available targets, or call `query` without `repo` to let GitNexus auto-discover relevant repos. After narrowing the target, specify `repo` for graph-backed tools such as `context`, `impact`, `cypher`, `detect_changes`, `rename`, and route/shape tools: `context({name: "validateUser", repo: "my-app"})`.
+>
+> To answer "who wrote this" or "which commit changed this", first use `query`, `context`, `impact`, `cypher`, or `code_snippet` to get a concrete repository-relative `filePath` and line range, then call `git_author_trace({filePath, startLine, endLine, repo})`.
 
 **Resources** for instant context:
 

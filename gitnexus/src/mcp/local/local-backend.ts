@@ -277,8 +277,50 @@ const CROSS_REPO_ZOEKT_DISCOVERY_LIMIT = 200;
 const CROSS_REPO_VECTOR_MATCHES_PER_REPO = 5;
 const CROSS_REPO_VECTOR_DISCOVERY_CONCURRENCY = 4;
 const MATCH_SNIPPET_MAX_CHARS = 240;
+const PATH_MATCH_LIMIT = 10;
+const PATH_HINT_MAX_COUNT = 5;
 
 type QueryMatchSource = 'zoekt' | 'vector';
+
+type FileMatchSource = 'bm25' | 'zoekt' | 'path';
+
+interface QuerySearchResult {
+  nodeId?: string;
+  name?: string;
+  type?: string;
+  filePath?: string;
+  startLine?: number;
+  endLine?: number;
+  bm25Score?: number;
+  zoektScore?: number;
+  fileMatchSource?: FileMatchSource;
+}
+
+interface Neo4jFileSearchRow {
+  id?: string;
+  name?: string;
+  type?: string;
+  filePath?: string;
+  score?: number;
+}
+
+interface FileMatchSummary {
+  repo: string;
+  name: string;
+  type: 'File';
+  filePath: string;
+  score: number;
+  source: FileMatchSource;
+  matchKind: 'exact_path' | 'suffix_path' | 'basename' | 'content';
+}
+
+interface PathDiagnostics {
+  backend: 'neo4j' | 'ladybugdb';
+  searchedHints: string[];
+  exactPathFound: boolean;
+  nearest: FileMatchSummary[];
+  ftsAvailable?: boolean;
+}
 
 interface QueryMatchSummary {
   repo: string;
@@ -1014,6 +1056,140 @@ export class LocalBackend {
     return {
       keywordQuery,
       semanticQuery: semanticQuery || keywordQuery,
+    };
+  }
+
+  private extractPathLikeHints(...texts: Array<string | undefined>): string[] {
+    const hints = new Set<string>();
+    const addHint = (raw: string) => {
+      const hint = raw
+        .trim()
+        .replace(/^["'`({\[]+/, '')
+        .replace(/["'`)}\]]+$/, '')
+        .replace(/\\/g, '/')
+        .replace(/^\/+/, '');
+      if (!hint) return;
+      const looksLikePath = hint.includes('/') || /\.[A-Za-z0-9]{2,8}$/.test(hint);
+      if (!looksLikePath) return;
+      hints.add(hint);
+      const basename = hint.split('/').pop();
+      if (basename && basename !== hint && /\.[A-Za-z0-9]{2,8}$/.test(basename)) {
+        hints.add(basename);
+      }
+    };
+
+    for (const text of texts) {
+      if (!text) continue;
+      const normalized = text.replace(/\\/g, '/');
+      const quoted = normalized.match(/"([^"]+)"/g) ?? [];
+      for (const part of quoted) addHint(part);
+
+      for (const token of normalized.split(/\s+|\b(?:AND|OR|NOT)\b|[(),]+/)) {
+        addHint(token);
+      }
+    }
+
+    return [...hints].slice(0, PATH_HINT_MAX_COUNT);
+  }
+
+  private getFileMatchKind(filePath: string, hints: string[]): FileMatchSummary['matchKind'] {
+    const normalizedPath = filePath.replace(/\\/g, '/').toLowerCase();
+    const basename = normalizedPath.split('/').pop() || normalizedPath;
+    for (const hint of hints) {
+      const normalizedHint = hint.replace(/\\/g, '/').toLowerCase();
+      if (normalizedPath === normalizedHint) return 'exact_path';
+      if (basename === normalizedHint) return 'basename';
+      if (normalizedPath.endsWith(`/${normalizedHint}`)) return 'suffix_path';
+    }
+    return 'content';
+  }
+
+  private escapeLuceneQuery(query: string): string {
+    return query.replace(/([+\-!(){}[\]^"~*?:\\/])/g, '\\$1');
+  }
+
+  private fileMatchRank(kind: FileMatchSummary['matchKind']): number {
+    switch (kind) {
+      case 'exact_path':
+        return 0;
+      case 'suffix_path':
+        return 1;
+      case 'basename':
+        return 2;
+      case 'content':
+        return 3;
+    }
+  }
+
+  private fileMatchSourceRank(source: FileMatchSource): number {
+    switch (source) {
+      case 'path':
+        return 0;
+      case 'bm25':
+        return 1;
+      case 'zoekt':
+        return 2;
+    }
+  }
+
+  private shouldReplaceFileMatch(existing: FileMatchSummary, next: FileMatchSummary): boolean {
+    const kindDiff = this.fileMatchRank(next.matchKind) - this.fileMatchRank(existing.matchKind);
+    if (kindDiff !== 0) return kindDiff < 0;
+    const sourceDiff =
+      this.fileMatchSourceRank(next.source) - this.fileMatchSourceRank(existing.source);
+    if (sourceDiff !== 0) return sourceDiff < 0;
+    return next.score > existing.score;
+  }
+
+  private buildFileMatchesFromResults(
+    repo: RepoHandle,
+    results: QuerySearchResult[],
+    hints: string[],
+  ): FileMatchSummary[] {
+    const byPath = new Map<string, FileMatchSummary>();
+    for (const result of results) {
+      const filePath = result.filePath;
+      if (!filePath || result.type !== 'File') continue;
+      const match: FileMatchSummary = {
+        repo: repo.name,
+        name: result.name || filePath.split('/').pop() || filePath,
+        type: 'File',
+        filePath,
+        score: result.bm25Score ?? result.zoektScore ?? 0,
+        source: result.fileMatchSource ?? (result.bm25Score !== undefined ? 'bm25' : 'zoekt'),
+        matchKind: this.getFileMatchKind(filePath, hints),
+      };
+      const existing = byPath.get(filePath);
+      if (!existing || this.shouldReplaceFileMatch(existing, match)) byPath.set(filePath, match);
+    }
+    return [...byPath.values()]
+      .sort((a, b) => {
+        const kindDiff = this.fileMatchRank(a.matchKind) - this.fileMatchRank(b.matchKind);
+        if (kindDiff !== 0) return kindDiff;
+        const sourceDiff = this.fileMatchSourceRank(a.source) - this.fileMatchSourceRank(b.source);
+        if (sourceDiff !== 0) return sourceDiff;
+        return b.score - a.score;
+      })
+      .slice(0, PATH_MATCH_LIMIT);
+  }
+
+  private buildPathDiagnostics(
+    hints: string[],
+    fileMatches: FileMatchSummary[],
+    backend: PathDiagnostics['backend'],
+    ftsAvailable?: boolean,
+  ): PathDiagnostics {
+    const normalizedHints = hints.map((hint) => hint.replace(/\\/g, '/').toLowerCase());
+    const exactPathFound = fileMatches.some((match) => {
+      const filePath = match.filePath.replace(/\\/g, '/').toLowerCase();
+      return normalizedHints.some((hint) => filePath === hint);
+    });
+    return {
+      backend,
+      searchedHints: hints,
+      exactPathFound,
+      nearest: fileMatches.slice(0, PATH_MATCH_LIMIT),
+      ...(ftsAvailable !== undefined ? { ftsAvailable } : {}),
     };
   }
 
@@ -1917,6 +2093,7 @@ export class LocalBackend {
     const includeContent = params.include_content ?? false;
     const searchTexts = this.buildQuerySearchTexts(params);
     const searchQuery = searchTexts.keywordQuery;
+    const pathHints = this.extractPathLikeHints(params.query, params.zoekt);
 
     // Per-phase timing instrumentation (#553). Records wall time for each
     // observable sub-step of the search pipeline so production latency can
@@ -1934,7 +2111,7 @@ export class LocalBackend {
     const { ZoektClient, loadZoektConfig } = await import('../../core/search/zoekt-client.js');
     const zoektCfg = loadZoektConfig();
 
-    const [bm25SearchResult, semanticResults, zoektResult] = await Promise.all([
+    const [bm25SearchResult, semanticResults, zoektResult, pathResults] = await Promise.all([
       timer.time('bm25', this.bm25Search(repo, searchQuery, searchLimit)),
       timer.time('vector', this.semanticSearch(repo, searchTexts.semanticQuery, searchLimit)),
       zoektCfg.enabled
@@ -1949,6 +2126,9 @@ export class LocalBackend {
             matches: [],
             stats: { filesConsidered: 0, filesLoaded: 0, matchCount: 0, durationMs: 0 },
           }),
+      useNeo4jBackend
+        ? timer.time('path', this.findNeo4jFilePathMatches(repo, pathHints, searchLimit))
+        : Promise.resolve([]),
     ]);
 
     const bm25Results = bm25SearchResult.results;
@@ -1984,6 +2164,12 @@ export class LocalBackend {
 
     const zoektMatches = zoektResult.matches || [];
     const zoektSymbols = await this.resolveZoektMatchSymbols(repo, zoektMatches);
+    const zoektFileResults = zoektMatches.map((match) => ({
+      name: match.fileName.split('/').pop() || match.fileName,
+      type: 'File',
+      filePath: match.fileName,
+      zoektScore: match.score,
+    }));
     for (let i = 0; i < zoektMatches.length; i++) {
       const match = zoektMatches[i];
       // Map Zoekt line hits to graph symbols when possible; file result remains the fallback.
@@ -2003,6 +2189,17 @@ export class LocalBackend {
         scoreMap.set(key, { score: rrfScore, data: sym });
       }
     }
+    const fileMatches = this.buildFileMatchesFromResults(
+      repo,
+      [...pathResults, ...bm25Results, ...zoektFileResults],
+      pathHints,
+    );
+    const pathDiagnostics = this.buildPathDiagnostics(
+      pathHints,
+      fileMatches,
+      useNeo4jBackend ? 'neo4j' : 'ladybugdb',
+      ftsUsed,
+    );
 
     const merged = Array.from(scoreMap.entries())
       .sort((a, b) => b[1].score - a[1].score)
@@ -2274,6 +2471,8 @@ export class LocalBackend {
       processes,
       process_symbols: dedupedSymbols,
       definitions: definitions.slice(0, 20), // cap standalone definitions
+      file_matches: fileMatches,
+      path_diagnostics: pathDiagnostics,
       timing,
       warning:
         tip ||
@@ -2286,14 +2485,175 @@ export class LocalBackend {
   /**
    * BM25 keyword search helper - uses LadybugDB FTS for always-fresh results
    */
+  private mapNeo4jFileSearchRows(rows: Neo4jFileSearchRow[]): QuerySearchResult[] {
+    return rows
+      .filter((row) => row.filePath)
+      .map((row) => ({
+        nodeId: row.id,
+        name: row.name,
+        type: row.type ?? 'File',
+        filePath: row.filePath,
+        bm25Score: row.score ?? 0,
+      }));
+  }
+
+  private async searchNeo4jFileFTS(
+    repo: RepoHandle,
+    query: string,
+    limit: number,
+  ): Promise<{ results: QuerySearchResult[]; ftsUsed: boolean }> {
+    const trimmedQuery = query.trim();
+    if (!trimmedQuery) return { results: [], ftsUsed: false };
+
+    const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+    const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit)));
+    try {
+      const escapedQuery = this.escapeLuceneQuery(trimmedQuery);
+      const rows = await executeReadCypher(
+        `
+        CALL db.index.fulltext.queryNodes('file_fts', $query) YIELD node, score
+        WHERE node.repoId = $repoId
+        RETURN node.id AS id,
+               node.name AS name,
+               'File' AS type,
+               node.filePath AS filePath,
+               score AS score
+        ORDER BY score DESC
+        LIMIT $limit
+      `,
+        { repoId: repo.name, query: escapedQuery, limit: boundedLimit },
+      );
+      return {
+        results: this.mapNeo4jFileSearchRows(rows),
+        ftsUsed: true,
+      };
+    } catch (e) {
+      logQueryError('query:neo4j-file-fts', e);
+    }
+
+    try {
+      const needle = trimmedQuery.replace(/^"|"$/g, '').toLowerCase();
+      if (needle.length < 2) return { results: [], ftsUsed: false };
+      const rows = await executeReadCypher(
+        `
+        MATCH (node:File {repoId: $repoId})
+        WITH node,
+             replace(toLower(coalesce(node.filePath, '')), '\\\\', '/') AS normalizedPath,
+             toLower(coalesce(node.name, '')) AS normalizedName
+        WHERE normalizedPath CONTAINS $needle
+           OR normalizedName CONTAINS $needle
+        RETURN node.id AS id,
+               node.name AS name,
+               'File' AS type,
+               node.filePath AS filePath,
+               CASE
+                 WHEN normalizedPath = $needle THEN 100.0
+                 WHEN normalizedPath ENDS WITH $needle THEN 80.0
+                 WHEN normalizedName = $needle THEN 70.0
+                 ELSE 10.0
+               END AS score
+        ORDER BY score DESC, size(coalesce(node.filePath, '')) ASC
+        LIMIT $limit
+      `,
+        { repoId: repo.name, needle, limit: boundedLimit },
+      );
+      return {
+        results: this.mapNeo4jFileSearchRows(rows),
+        ftsUsed: false,
+      };
+    } catch (e) {
+      logQueryError('query:neo4j-file-fallback', e);
+      return { results: [], ftsUsed: false };
+    }
+  }
+
+  private async findNeo4jFilePathMatches(
+    repo: RepoHandle,
+    hints: string[],
+    limit: number,
+  ): Promise<QuerySearchResult[]> {
+    // Worktree repos (dev-oanew, dev-autoTransfer, etc.) may share Neo4j
+    // File nodes indexed under the base repo's name (oanew, autoTransfer).
+    // Derive candidate repoIds from repo name and path to handle this.
+    const candidateRepoIds = this.deriveNeo4jRepoIdCandidates(repo);
+    const normalizedHints = [
+      ...new Set(
+        hints
+          .map((hint) => hint.replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase().trim())
+          .filter((hint) => hint.length >= 2),
+      ),
+    ];
+    if (normalizedHints.length === 0) return [];
+
+    const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+    const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit)));
+    try {
+      const rows = await executeReadCypher(
+        `
+        UNWIND $hints AS hint
+        MATCH (node:File)
+        WHERE node.repoId IN $repoIds
+        WITH node,
+             hint,
+             replace(toLower(coalesce(node.filePath, '')), '\\\\', '/') AS normalizedPath,
+             toLower(coalesce(node.name, '')) AS normalizedName
+        WITH node,
+             CASE
+               WHEN normalizedPath = hint THEN 100.0
+               WHEN normalizedPath ENDS WITH '/' + hint THEN 90.0
+               WHEN normalizedName = hint THEN 80.0
+               WHEN normalizedPath CONTAINS hint THEN 20.0
+               ELSE 0.0
+             END AS score
+        WHERE score > 0
+        RETURN node.id AS id,
+               node.name AS name,
+               'File' AS type,
+               node.filePath AS filePath,
+               max(score) AS score
+        ORDER BY score DESC, size(coalesce(node.filePath, '')) ASC
+        LIMIT $limit
+      `,
+        { repoIds: candidateRepoIds, hints: normalizedHints, limit: boundedLimit },
+      );
+      return this.mapNeo4jFileSearchRows(rows).map((row) => ({
+        ...row,
+        fileMatchSource: 'path' as const,
+      }));
+    } catch (e) {
+      logQueryError('query:neo4j-file-path', e);
+      return [];
+    }
+  }
+
+  private deriveNeo4jRepoIdCandidates(repo: RepoHandle): string[] {
+    const candidates = new Set<string>();
+    const primary = repo.name;
+    candidates.add(primary);
+
+    // Derive base repo name by stripping common env prefixes from the
+    // last path segment.  e.g. OA_CSharp/dev-oanew → oanew, iteng-saasoanew → saasoanew
+    const pathSegments = repo.repoPath
+      .replace(/^[/\\]+/, '')
+      .replace(/\/+/g, '/')
+      .split('/');
+    const lastSegment = pathSegments[pathSegments.length - 1] || '';
+    if (lastSegment && lastSegment !== primary) candidates.add(lastSegment);
+
+    const stripped = lastSegment.replace(/^(dev|iteng|pro)-/, '').replace(/-(dev|iteng|pro)$/, '');
+    if (stripped && stripped !== lastSegment && stripped !== primary) candidates.add(stripped);
+
+    return [...candidates];
+  }
+
   private async bm25Search(
     repo: RepoHandle,
     query: string,
     limit: number,
-  ): Promise<{ results: any[]; ftsUsed: boolean }> {
+  ): Promise<{ results: QuerySearchResult[]; ftsUsed: boolean }> {
     const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
     if (isNeo4jBackendEnabled()) {
-      return { results: [], ftsUsed: true };
+      return this.searchNeo4jFileFTS(repo, query, limit);
     }
 
     const { searchFTSFromLbug } = await import('../../core/search/bm25-index.js');
@@ -2307,7 +2667,7 @@ export class LocalBackend {
 
     const ftsUsed = bm25Results.length === 0 || bm25Results[0]?.ftsUsed !== false;
 
-    const results: any[] = [];
+    const results: QuerySearchResult[] = [];
 
     for (const bm25Result of bm25Results) {
       const fullPath = bm25Result.filePath;

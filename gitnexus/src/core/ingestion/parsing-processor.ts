@@ -371,6 +371,15 @@ const processParsingSequential = async (
       });
     } catch (parseError) {
       console.warn(`Skipping unparseable file: ${file.path}`);
+      graph.addNode({
+        id: generateId('File', file.path),
+        label: 'File',
+        properties: {
+          name: file.path.split('/').pop() || file.path,
+          filePath: file.path,
+          language,
+        },
+      });
       continue;
     }
 

@@ -38,6 +38,9 @@ describe('Neo4j schema statements', () => {
     expect(statements.indexes).toContain(
       'CREATE INDEX gitnexus_Method_repo_name IF NOT EXISTS FOR (n:`Method`) ON (n.repoId, n.name)',
     );
+    expect(statements.indexes).toContain(
+      'CREATE FULLTEXT INDEX file_fts IF NOT EXISTS FOR (n:`File`) ON EACH [n.name, n.filePath, n.content]',
+    );
   });
 
   it('creates the CodeEmbedding constraint and vector index', async () => {

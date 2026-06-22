@@ -37,7 +37,7 @@ import { getResourceDefinitions, getResourceTemplates, readResource } from './re
  * Design: Each hint is a short, actionable instruction (not a suggestion).
  * The hint references the specific tool/resource to use next.
  */
-function getNextStepHint(toolName: string, args: Record<string, any> | undefined): string {
+export function getNextStepHint(toolName: string, args: Record<string, any> | undefined): string {
   const repo = args?.repo;
   const repoParam = repo ? `, repo: "${repo}"` : '';
   const repoPath = repo || '{name}';
@@ -61,8 +61,14 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
     case 'rename':
       return `\n\n---\n**Next:** Run detect_changes(${repoParam ? `{repo: "${repo}"}` : ''}) to verify no unexpected side effects from the rename.`;
 
-    case 'code_snippet':
-      return `\n\n---\n**Next:** If you need relationships for this code, use context({name: "<symbol_name>"${repoParam}}) or impact({target: "<symbol_name>", direction: "upstream"${repoParam}}).`;
+    case 'code_snippet': {
+      const filePath = typeof args?.filePath === 'string' ? args.filePath : '<filePath>';
+      const startLineArg = Number(args?.startLine);
+      const startLine = Number.isFinite(startLineArg) ? startLineArg : 1;
+      const endLineArg = Number(args?.endLine);
+      const endLine = Number.isFinite(endLineArg) ? endLineArg : startLine;
+      return `\n\n---\n**Next:** If you need relationships for this code, use context({name: "<symbol_name>"${repoParam}}) or impact({target: "<symbol_name>", direction: "upstream"${repoParam}}). If you need ownership or commit history for these lines, use git_author_trace({filePath: "${filePath}", startLine: ${startLine}, endLine: ${endLine}${repoParam}}).`;
+    }
 
     case 'git_author_trace':
       return `\n\n---\n**Next:** Review primaryAuthors for current ownership and commits for history. If the code path matters, use context({name: "<symbol_name>"${repoParam}}) or impact({target: "<symbol_name>", direction: "upstream"${repoParam}}).`;

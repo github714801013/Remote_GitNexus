@@ -67,6 +67,8 @@ vi.spyOn(zoektClient, 'loadZoektConfig').mockReturnValue({
 describe('Neo4j cross-repo vector discovery', () => {
   afterEach(() => {
     vi.clearAllMocks();
+    vi.mocked(executeReadCypher).mockReset();
+    vi.mocked(executeReadCypher).mockResolvedValue([]);
   });
 
   it('queries Neo4j once with all repo ids', async () => {
@@ -165,8 +167,17 @@ describe('Neo4j cross-repo vector discovery', () => {
     expect(embedQuery).toHaveBeenCalledWith('年包次数已用完');
   });
 
-  it('does not use LadybugDB BM25 in Neo4j backend mode', async () => {
+  it('uses Neo4j file FTS instead of LadybugDB BM25 in Neo4j backend mode', async () => {
     const backend = new LocalBackend();
+    vi.mocked(executeReadCypher).mockResolvedValueOnce([
+      {
+        id: 'File:Views/productkc/kcTransferList.cshtml',
+        name: 'kcTransferList.cshtml',
+        type: 'File',
+        filePath: 'Views/productkc/kcTransferList.cshtml',
+        score: 3.5,
+      },
+    ]);
 
     const result = await (backend as any).bm25Search(
       {
@@ -182,9 +193,256 @@ describe('Neo4j cross-repo vector discovery', () => {
       10,
     );
 
-    expect(result).toEqual({ results: [], ftsUsed: true });
+    expect(result).toEqual({
+      results: [
+        {
+          nodeId: 'File:Views/productkc/kcTransferList.cshtml',
+          name: 'kcTransferList.cshtml',
+          type: 'File',
+          filePath: 'Views/productkc/kcTransferList.cshtml',
+          bm25Score: 3.5,
+        },
+      ],
+      ftsUsed: true,
+    });
+    expect(executeReadCypher).toHaveBeenCalledWith(expect.stringContaining('file_fts'), {
+      repoId: 'Repo A',
+      query: 'handler',
+      limit: 10,
+    });
     expect(executeQuery).not.toHaveBeenCalled();
     expect(executeParameterized).not.toHaveBeenCalled();
+  });
+
+  it('returns file_matches and path_diagnostics for path-like Neo4j query hits', async () => {
+    const backend = new LocalBackend();
+    vi.mocked(semanticSearch).mockResolvedValueOnce([]);
+    vi.mocked(executeReadCypher).mockImplementation(async (query: string, params?: any) => {
+      if (query.includes('db.index.fulltext.queryNodes')) {
+        expect(params).toMatchObject({
+          repoId: 'Repo A',
+          query: 'oa999UI\\/Views\\/productkc\\/kcTransferList.cshtml',
+        });
+        return [
+          {
+            id: 'File:oa999UI/Views/productkc/kcTransferList.cshtml',
+            name: 'kcTransferList.cshtml',
+            type: 'File',
+            filePath: 'oa999UI/Views/productkc/kcTransferList.cshtml',
+            score: 8,
+          },
+        ];
+      }
+      return [];
+    });
+
+    const result = await (backend as any).query(
+      {
+        id: 'repo-a',
+        name: 'Repo A',
+        repoPath: '/repo/a',
+        storagePath: '/repo/a/.gitnexus',
+        lbugPath: '/repo/a/.gitnexus/lbug',
+        indexedAt: '2026-05-30',
+        lastCommit: 'a',
+      },
+      { query: 'oa999UI/Views/productkc/kcTransferList.cshtml', limit: 1 },
+    );
+
+    expect(result.file_matches).toEqual([
+      expect.objectContaining({
+        repo: 'Repo A',
+        filePath: 'oa999UI/Views/productkc/kcTransferList.cshtml',
+        name: 'kcTransferList.cshtml',
+        type: 'File',
+        source: 'bm25',
+      }),
+    ]);
+    expect(result.path_diagnostics).toEqual(
+      expect.objectContaining({
+        backend: 'neo4j',
+        exactPathFound: true,
+        searchedHints: expect.arrayContaining([
+          'oa999UI/Views/productkc/kcTransferList.cshtml',
+          'kcTransferList.cshtml',
+        ]),
+        ftsAvailable: true,
+      }),
+    );
+  });
+
+  it('falls back to Neo4j File path matching when file FTS is unavailable', async () => {
+    const backend = new LocalBackend();
+    vi.mocked(semanticSearch).mockResolvedValueOnce([]);
+    vi.mocked(executeReadCypher).mockImplementation(async (query: string, params?: any) => {
+      if (query.includes('db.index.fulltext.queryNodes')) {
+        throw new Error('There is no such fulltext schema index: file_fts');
+      }
+      if (query.includes('UNWIND $hints AS hint')) {
+        expect(params.repoIds).toEqual(expect.arrayContaining(['Repo A']));
+        return [
+          {
+            id: 'File:oa999UI/Views/productKC/kcTransferList.cshtml',
+            name: 'kcTransferList.cshtml',
+            type: 'File',
+            filePath: 'oa999UI/Views/productKC/kcTransferList.cshtml',
+            score: 100,
+          },
+        ];
+      }
+      return [];
+    });
+
+    const result = await (backend as any).query(
+      {
+        id: 'repo-a',
+        name: 'Repo A',
+        repoPath: '/repo/a',
+        storagePath: '/repo/a/.gitnexus',
+        lbugPath: '/repo/a/.gitnexus/lbug',
+        indexedAt: '2026-05-30',
+        lastCommit: 'a',
+      },
+      {
+        query: 'oa999UI/Views/productKC/kcTransferList.cshtml 批量审核',
+        zoekt: '"oa999UI/Views/productKC/kcTransferList.cshtml" OR "批量审核"',
+        limit: 1,
+      },
+    );
+
+    expect(result.file_matches).toEqual([
+      expect.objectContaining({
+        repo: 'Repo A',
+        filePath: 'oa999UI/Views/productKC/kcTransferList.cshtml',
+        name: 'kcTransferList.cshtml',
+        type: 'File',
+        source: 'path',
+        matchKind: 'exact_path',
+      }),
+    ]);
+    expect(result.path_diagnostics).toEqual(
+      expect.objectContaining({
+        backend: 'neo4j',
+        exactPathFound: true,
+        searchedHints: expect.arrayContaining([
+          'oa999UI/Views/productKC/kcTransferList.cshtml',
+          'kcTransferList.cshtml',
+        ]),
+        ftsAvailable: false,
+      }),
+    );
+  });
+
+  it('derives Neo4j repoId candidates for worktree repos', async () => {
+    const backend = new LocalBackend();
+    vi.mocked(semanticSearch).mockResolvedValueOnce([]);
+    vi.mocked(executeReadCypher).mockImplementation(async (query: string, params?: any) => {
+      if (query.includes('db.index.fulltext.queryNodes')) {
+        throw new Error('There is no such fulltext schema index: file_fts');
+      }
+      if (query.includes('UNWIND $hints AS hint')) {
+        expect(params).toMatchObject({
+          repoIds: expect.arrayContaining(['Repo A']),
+          hints: expect.arrayContaining([
+            'oa999ui/views/productkc/kctransferlist.cshtml',
+            'kctransferlist.cshtml',
+          ]),
+        });
+        return [
+          {
+            id: 'File:oa999UI/Views/productKC/kcTransferList.cshtml',
+            name: 'kcTransferList.cshtml',
+            type: 'File',
+            filePath: 'oa999UI/Views/productKC/kcTransferList.cshtml',
+            score: 100,
+          },
+        ];
+      }
+      return [];
+    });
+
+    const result = await (backend as any).query(
+      {
+        id: 'repo-a',
+        name: 'Repo A',
+        repoPath: '/repo/a',
+        storagePath: '/repo/a/.gitnexus',
+        lbugPath: '/repo/a/.gitnexus/lbug',
+        indexedAt: '2026-05-30',
+        lastCommit: 'a',
+      },
+      {
+        query: 'oa999UI/Views/productKC/kcTransferList.cshtml 批量审核',
+        zoekt: '"oa999UI/Views/productKC/kcTransferList.cshtml" OR "批量审核"',
+        limit: 1,
+      },
+    );
+
+    expect(result.file_matches).toEqual([
+      expect.objectContaining({
+        repo: 'Repo A',
+        filePath: 'oa999UI/Views/productKC/kcTransferList.cshtml',
+        name: 'kcTransferList.cshtml',
+        type: 'File',
+        source: 'path',
+        matchKind: 'exact_path',
+      }),
+    ]);
+    expect(result.path_diagnostics).toEqual(
+      expect.objectContaining({
+        backend: 'neo4j',
+        exactPathFound: true,
+        searchedHints: expect.arrayContaining([
+          'oa999UI/Views/productKC/kcTransferList.cshtml',
+          'kcTransferList.cshtml',
+        ]),
+        ftsAvailable: false,
+      }),
+    );
+  });
+
+  it('derives Neo4j repoId candidates for worktree repos', async () => {
+    const backend = new LocalBackend();
+
+    const getCandidates = (repo: any) => (backend as any).deriveNeo4jRepoIdCandidates(repo);
+
+    const devOanew = {
+      id: 'dev-oanew',
+      name: 'dev-oanew',
+      repoPath: '/projects/OA_CSharp/dev-oanew',
+      storagePath: '/projects/OA_CSharp/dev-oanew/.gitnexus',
+      lbugPath: '/projects/OA_CSharp/dev-oanew/.gitnexus/lbug',
+      indexedAt: '1',
+      lastCommit: 'a',
+    };
+    expect(getCandidates(devOanew)).toEqual(expect.arrayContaining(['dev-oanew', 'oanew']));
+
+    const itengSaasoanew = {
+      id: 'iteng-saasoanew',
+      name: 'iteng-saasoanew',
+      repoPath: '/projects/OA_CSharp/iteng-saasoanew',
+      storagePath: '/projects/OA_CSharp/iteng-saasoanew/.gitnexus',
+      lbugPath: '/projects/OA_CSharp/iteng-saasoanew/.gitnexus/lbug',
+      indexedAt: '2',
+      lastCommit: 'b',
+    };
+    expect(getCandidates(itengSaasoanew)).toEqual(
+      expect.arrayContaining(['iteng-saasoanew', 'saasoanew']),
+    );
+
+    // Non-worktree repos should only have their own name
+    const oanew = {
+      id: 'oanew',
+      name: 'oanew',
+      repoPath: '/projects/OA_CSharp/oanew',
+      storagePath: '/projects/OA_CSharp/oanew/.gitnexus',
+      lbugPath: '/projects/OA_CSharp/oanew/.gitnexus/lbug',
+      indexedAt: '3',
+      lastCommit: 'c',
+    };
+    const candidates = getCandidates(oanew);
+    expect(candidates).toContain('oanew');
+    expect(candidates).toHaveLength(1); // no extra candidates for base repo
   });
 
   it('does not initialize LadybugDB for query in Neo4j backend mode', async () => {
@@ -298,7 +556,7 @@ describe('Neo4j cross-repo vector discovery', () => {
       { query: 'handler', limit: 1, max_symbols: 2 },
     );
 
-    expect(executeReadCypher).toHaveBeenCalledTimes(2);
+    expect(executeReadCypher).toHaveBeenCalledTimes(3);
     expect(result.processes.map((process: any) => process.id)).toEqual(['Process:A']);
     expect(result.process_symbols.map((symbol: any) => symbol.id)).toContain('Function:a');
   });

@@ -42,6 +42,7 @@ export const getNeo4jSchemaStatements = (
   ];
   const indexes = [
     'CREATE INDEX gitnexus_File_repo_filePath IF NOT EXISTS FOR (n:`File`) ON (n.repoId, n.filePath)',
+    'CREATE FULLTEXT INDEX file_fts IF NOT EXISTS FOR (n:`File`) ON EACH [n.name, n.filePath, n.content]',
     ...SYMBOL_NAME_INDEX_LABELS.map(indexForLabelName),
   ];
   const vectorIndexes = [

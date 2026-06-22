@@ -13,7 +13,7 @@
  * directly through the MCP Server's handler dispatch.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { createMCPServer } from '../../src/mcp/server.js';
+import { createMCPServer, getNextStepHint } from '../../src/mcp/server.js';
 
 // ─── Mock backend ──────────────────────────────────────────────────
 
@@ -71,6 +71,20 @@ describe('getNextStepHint (via tool call response)', () => {
     // so we verify the handler was registered by creating the server without error.
     // The actual hint logic is tested via the integration path.
     expect(backend.callTool).not.toHaveBeenCalled(); // not called until request
+  });
+
+  it('code_snippet hint points to git_author_trace for ownership lookup', () => {
+    const hint = getNextStepHint('code_snippet', {
+      repo: 'my-app',
+      filePath: 'src/auth.ts',
+      startLine: 10,
+      endLine: 20,
+    });
+
+    expect(hint).toContain('git_author_trace');
+    expect(hint).toContain('filePath: "src/auth.ts"');
+    expect(hint).toContain('startLine: 10');
+    expect(hint).toContain('endLine: 20');
   });
 });
 

@@ -57,10 +57,10 @@ detect_changes, rename, and code_snippet should specify "repo".`,
     description: `Query the code knowledge graph for execution flows related to a concept.
 Returns processes (call chains) ranked by relevance, each with its symbols and file locations.
 
-GRAPH-FIRST WORKFLOW: Do not start by reading large source files. Use query() to find relevant flows, then context() on specific symbols. Use code_snippet only for bounded verification after a tool returns a file path and line number.
+GRAPH-FIRST WORKFLOW: Do not start by reading large source files. Use query() to find relevant flows, then context() on specific symbols. Use code_snippet only for bounded verification after a tool returns a file path and line number. When you need to know who wrote or last changed located lines, call git_author_trace with that concrete file path and line range.
 
 WHEN TO USE: Understanding how code works together. Use this when you need execution flows and relationships, not just file matches. Complements precise text search, but should come before broad file reading.
-AFTER THIS: Use context() on a specific symbol for 360-degree view (callers, callees, categorized refs).
+AFTER THIS: Use context() on a specific symbol for 360-degree view (callers, callees, categorized refs). If you already have a concrete file path and line range and need authorship, use git_author_trace.
 
 Returns results grouped by process (execution flow):
 - processes: ranked execution flows with relevance priority
@@ -209,7 +209,7 @@ Shows categorized incoming/outgoing references (calls, imports, extends, impleme
 GRAPH-FIRST WORKFLOW: When you already have a method/class/function name, call context() before reading its file. This gives the definition location, callers, callees, field accesses, and related processes in one bounded response.
 
 WHEN TO USE: After query(), or whenever you need to know all callers, callees, and what execution flows a symbol participates in.
-AFTER THIS: Use impact() if planning changes. Use code_snippet for 10-20 lines around the definition only when you need to verify exact implementation details.
+AFTER THIS: Use impact() if planning changes. Use code_snippet for 10-20 lines around the definition only when you need to verify exact implementation details. Use git_author_trace on concrete file lines when you need ownership or commit history.
 
 Handles disambiguation: if multiple symbols share the same name, returns ranked candidates (each with a relevance score) for you to pick from. Use uid for zero-ambiguity lookup, or narrow the search with file_path and/or kind hints.
 
@@ -529,9 +529,9 @@ Returns: single route object when one match, or { routes: [...], total: N } for 
     name: 'code_snippet',
     description: `Read a bounded source-code snippet directly from an indexed repository by file path and line range.
 
-LOCATE -> VERIFY -> EXPAND: First locate with query(), context(), impact(), or cypher(). Then verify with code_snippet for roughly 10-20 relevant lines. Expand only if the snippet reveals unknown variables or control flow that graph tools cannot resolve.
+LOCATE -> VERIFY -> EXPAND: First locate with query(), context(), impact(), or cypher(). Then verify with code_snippet for roughly 10-20 relevant lines. If you need ownership, pass the same concrete file path and line range to git_author_trace. Expand only if the snippet reveals unknown variables or control flow that graph tools cannot resolve.
 
-WHEN TO USE: After query, context, impact, or cypher returns a file path and line number, use this to fetch the exact surrounding source without reading the whole file.
+WHEN TO USE: After query, context, impact, or cypher returns a file path and line number, use this to fetch the exact surrounding source without reading the whole file. If the follow-up question is "who wrote this" or "which commit changed this", use git_author_trace next.
 
 Performance model: resolves the repo from the registry, validates the requested path stays inside the repo root, reads the file directly without repo locks, and retries once on transient filesystem errors. Returned content is capped by file size, line count, and character count.`,
     inputSchema: {

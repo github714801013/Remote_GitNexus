@@ -124,8 +124,16 @@ Your AI agent gets these tools automatically:
 | `detect_changes` | Git-diff impact — maps changed lines to affected processes | Optional |
 | `rename` | Multi-file coordinated rename with graph + text search | Optional |
 | `cypher` | Raw Cypher graph queries | Optional |
+| `route_map` | Route to handler and consumer map | Optional |
+| `shape_check` | Response shape vs consumer property access checks | Optional |
+| `tool_map` | MCP/RPC tool definitions and handlers | Optional |
+| `api_impact` | API route impact with consumers, middleware, and shape checks | Optional |
+| `code_snippet` | Bounded source snippet by repository-relative file line range | Optional |
+| `git_author_trace` | Git blame authors and bounded commit history for concrete lines | Optional |
 
 > With one indexed repo, the `repo` param is optional. With multiple, specify which: `query({query: "auth", repo: "my-app"})`.
+>
+> To answer "who wrote this" or "which commit changed this", first use `query`, `context`, `impact`, `cypher`, or `code_snippet` to get a concrete repository-relative `filePath` and line range, then call `git_author_trace({filePath, startLine, endLine, repo})`.
 
 ## MCP Resources
 
