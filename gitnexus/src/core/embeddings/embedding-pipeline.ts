@@ -48,6 +48,29 @@ import {
 import { loadVectorExtension } from '../lbug/lbug-adapter.js';
 
 const isDev = process.env.NODE_ENV === 'development';
+
+// ── Per-step timeouts (prevent permanently-hung pipeline → leaked repo lock) ──
+// Read once at module load. Node-level AST work (chunkNode, extractStructuralNames)
+// has its own budget; batch-level work (embed HTTP + DB insert) gets a larger budget
+// because remote embedding latency dominates.
+const NODE_TIMEOUT_MS = (() => {
+  const raw = parseInt(process.env.GITNEXUS_EMBEDDING_NODE_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 120_000;
+})();
+const BATCH_TIMEOUT_MS = (() => {
+  const raw = parseInt(process.env.GITNEXUS_EMBEDDING_BATCH_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 300_000;
+})();
+
+/** Race a promise against a wall-clock timeout. Mirrors pool-adapter.ts style. */
+const withTimeout = <T>(promise: Promise<T>, ms: number, label: string): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`[embed] ${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer!));
+};
+
 /**
  * Bump this when the embedding text template changes in a way that should
  * invalidate existing vectors, such as metadata/header shape changes,
@@ -128,9 +151,13 @@ export interface EmbeddingPipelineStorage {
       endLine: number;
       embedding: number[];
       contentHash?: string;
+      summaryText?: string;
     }>,
   ) => Promise<void>;
   deleteEmbeddingsForNodeIds?: (nodeIds: string[]) => Promise<void>;
+  updateNodeDescriptions?: (
+    updates: Array<{ nodeId: string; label: string; description: string }>,
+  ) => Promise<void>;
   ensureVectorIndex?: () => Promise<void>;
 }
 
@@ -223,9 +250,10 @@ export const batchInsertEmbeddings = async (
     endLine: number;
     embedding: number[];
     contentHash?: string;
+    summaryText?: string;
   }>,
 ): Promise<void> => {
-  const cypher = `CREATE (e:${EMBEDDING_TABLE_NAME} {id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: $startLine, endLine: $endLine, embedding: $embedding, contentHash: $contentHash})`;
+  const cypher = `CREATE (e:${EMBEDDING_TABLE_NAME} {id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: $startLine, endLine: $endLine, embedding: $embedding, contentHash: $contentHash, summaryText: $summaryText})`;
   const paramsList = updates.map((u) => ({
     id: `${u.nodeId}:${u.chunkIndex}`,
     nodeId: u.nodeId,
@@ -234,6 +262,7 @@ export const batchInsertEmbeddings = async (
     endLine: u.endLine,
     embedding: u.embedding,
     contentHash: u.contentHash ?? STALE_HASH_SENTINEL,
+    summaryText: u.summaryText ?? '',
   }));
   await executeWithReusedStatement(cypher, paramsList);
 };
@@ -455,7 +484,12 @@ export const runEmbeddingPipeline = async (
         startLine: number;
         endLine: number;
         contentHash: string;
+        summaryText?: string;
       }> = [];
+      const descriptionUpdates = new Map<
+        string,
+        { nodeId: string; label: string; description: string }
+      >();
 
       for (const node of batch) {
         const isShort = isShortLabel(node.label);
@@ -465,7 +499,11 @@ export const runEmbeddingPipeline = async (
         // Extract structural names for class-like nodes via AST extractors
         if (!isShort && STRUCTURAL_LABELS.has(node.label)) {
           try {
-            const names = await extractStructuralNames(node.content, node.filePath);
+            const names = await withTimeout(
+              extractStructuralNames(node.content, node.filePath),
+              NODE_TIMEOUT_MS,
+              `extractStructuralNames(${node.filePath})`,
+            );
             node.methodNames = names.methodNames;
             node.fieldNames = names.fieldNames;
           } catch {
@@ -475,25 +513,40 @@ export const runEmbeddingPipeline = async (
 
         // Compute content hash once per node (re-use cached value for stale nodes)
         const hash = computedStaleHashes.get(node.id) ?? contentHashForNode(node, finalConfig);
-        const nodeSummaryPrefix = await buildKeywordSummaryPrefix(
-          node,
-          generateEmbeddingText(node, node.content, finalConfig),
-          hash,
+        const nodeSummaryPrefix = await withTimeout(
+          buildKeywordSummaryPrefix(
+            node,
+            generateEmbeddingText(node, node.content, finalConfig),
+            hash,
+          ),
+          NODE_TIMEOUT_MS,
+          `buildKeywordSummaryPrefix(${node.filePath})`,
         );
+        if (nodeSummaryPrefix) {
+          descriptionUpdates.set(node.id, {
+            nodeId: node.id,
+            label: node.label,
+            description: nodeSummaryPrefix,
+          });
+        }
 
         let chunks: Array<{ text: string; chunkIndex: number; startLine: number; endLine: number }>;
         if (isShort) {
           chunks = [{ text: node.content, chunkIndex: 0, startLine, endLine }];
         } else {
           try {
-            chunks = await chunkNode(
-              node.label,
-              node.content,
-              node.filePath,
-              startLine,
-              endLine,
-              chunkSize,
-              overlap,
+            chunks = await withTimeout(
+              chunkNode(
+                node.label,
+                node.content,
+                node.filePath,
+                startLine,
+                endLine,
+                chunkSize,
+                overlap,
+              ),
+              NODE_TIMEOUT_MS,
+              `chunkNode(${node.label}, ${node.filePath})`,
             );
           } catch (chunkErr) {
             if (isDev) {
@@ -522,6 +575,7 @@ export const runEmbeddingPipeline = async (
             startLine: chunk.startLine,
             endLine: chunk.endLine,
             contentHash: hash,
+            summaryText: nodeSummaryPrefix,
           });
           prevTail = overlap > 0 ? chunk.text.slice(-overlap) : '';
         }
@@ -541,7 +595,11 @@ export const runEmbeddingPipeline = async (
 
         let embeddings: Float32Array[];
         try {
-          embeddings = await embedBatch(subTexts);
+          embeddings = await withTimeout(
+            embedBatch(subTexts),
+            BATCH_TIMEOUT_MS,
+            `embedBatch(${subTexts.length} texts, first="${subTexts[0]?.substring(0, 60)}...")`,
+          );
         } catch (embedErr) {
           console.error(
             `❌ embedBatch failed for ${subTexts.length} texts (first: "${subTexts[0]?.substring(0, 80)}..."):`,
@@ -556,19 +614,37 @@ export const runEmbeddingPipeline = async (
         }));
 
         if (storage?.insertEmbeddings) {
-          await storage.insertEmbeddings(dbUpdates);
+          await withTimeout(
+            storage.insertEmbeddings(dbUpdates),
+            BATCH_TIMEOUT_MS,
+            `insertEmbeddings(${dbUpdates.length} rows)`,
+          );
         } else {
-          await batchInsertEmbeddings(executeWithReusedStatement, dbUpdates);
+          await withTimeout(
+            batchInsertEmbeddings(executeWithReusedStatement, dbUpdates),
+            BATCH_TIMEOUT_MS,
+            `batchInsertEmbeddings(${dbUpdates.length} rows)`,
+          );
         }
+      }
+
+      if (storage?.updateNodeDescriptions && descriptionUpdates.size > 0) {
+        await withTimeout(
+          storage.updateNodeDescriptions([...descriptionUpdates.values()]),
+          BATCH_TIMEOUT_MS,
+          `updateNodeDescriptions(${descriptionUpdates.size} nodes)`,
+        );
       }
 
       processedNodes += batch.length;
       totalChunks += allUpdates.length;
 
+      // Use one decimal place so progress is visible even for large node counts
+      // (Math.round would stay pinned at 20 until ~13% of nodes are processed).
       const embeddingProgress = 20 + (processedNodes / totalNodes) * 70;
       onProgress({
         phase: 'embedding',
-        percent: Math.round(embeddingProgress),
+        percent: Math.round(embeddingProgress * 10) / 10,
         nodesProcessed: processedNodes,
         totalNodes,
         currentBatch: Math.floor(batchIndex / batchSize) + 1,

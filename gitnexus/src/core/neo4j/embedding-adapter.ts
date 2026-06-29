@@ -6,6 +6,8 @@ import {
   type EmbeddableNode,
   type ExistingEmbeddingHashes,
 } from '../embeddings/types.js';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import neo4j from 'neo4j-driver';
 import { withNeo4jSession } from './driver.js';
 import { applyNeo4jSchema } from './graph-loader.js';
@@ -17,6 +19,13 @@ export interface Neo4jEmbeddingInput {
   endLine: number;
   embedding: number[];
   contentHash?: string;
+  summaryText?: string;
+}
+
+export interface Neo4jDescriptionInput {
+  nodeId: string;
+  label: string;
+  description: string;
 }
 
 export interface Neo4jSemanticSearchResult {
@@ -44,6 +53,43 @@ const toNumber = (value: any, fallback = 0): number => {
 
 const EMBEDDABLE_LABEL_EXPRESSION = EMBEDDABLE_LABELS.map((label) => `\`${label}\``).join('|');
 export const DELETE_EMBEDDINGS_NODE_ID_BATCH_SIZE = 500;
+const SOURCE_SNIPPET_CONTEXT_LINES = 2;
+const MAX_SOURCE_SNIPPET_CHARS = 5000;
+
+const isPathInside = (parent: string, child: string): boolean => {
+  const relative = path.relative(parent, child);
+  return (
+    relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative))
+  );
+};
+
+const loadSourceSnippet = async (
+  repoPath: string,
+  node: Pick<EmbeddableNode, 'filePath' | 'startLine' | 'endLine'>,
+  fileCache: Map<string, string | null>,
+): Promise<string> => {
+  if (!node.filePath || node.startLine <= 0 || node.endLine <= 0) return '';
+
+  const root = path.resolve(repoPath);
+  const resolvedFilePath = path.resolve(root, node.filePath);
+  if (!isPathInside(root, resolvedFilePath)) return '';
+
+  let fileContent = fileCache.get(resolvedFilePath);
+  if (fileContent === undefined) {
+    try {
+      fileContent = await fs.readFile(resolvedFilePath, 'utf-8');
+    } catch {
+      fileContent = null;
+    }
+    fileCache.set(resolvedFilePath, fileContent);
+  }
+  if (!fileContent) return '';
+
+  const lines = fileContent.split(/\r?\n/);
+  const startIndex = Math.max(0, node.startLine - SOURCE_SNIPPET_CONTEXT_LINES - 1);
+  const endIndex = Math.min(lines.length, node.endLine + SOURCE_SNIPPET_CONTEXT_LINES);
+  return lines.slice(startIndex, endIndex).join('\n').slice(0, MAX_SOURCE_SNIPPET_CHARS);
+};
 
 export const fetchExistingEmbeddingHashes = async (
   repoId: string,
@@ -68,7 +114,10 @@ export const fetchExistingEmbeddingHashes = async (
   });
 };
 
-export const loadEmbeddableNodes = async (repoId: string): Promise<EmbeddableNode[]> => {
+export const loadEmbeddableNodes = async (
+  repoId: string,
+  repoPath?: string,
+): Promise<EmbeddableNode[]> => {
   const nodes: EmbeddableNode[] = [];
 
   await withNeo4jSession(async (session) => {
@@ -119,7 +168,17 @@ RETURN n.id AS id,
     });
   });
 
-  return nodes.filter((node) => node.id);
+  const embeddableNodes = nodes.filter((node) => node.id);
+  if (!repoPath) return embeddableNodes;
+
+  const fileCache = new Map<string, string | null>();
+  return await Promise.all(
+    embeddableNodes.map(async (node) => {
+      if (node.content.trim()) return node;
+      const content = await loadSourceSnippet(repoPath, node, fileCache);
+      return content ? { ...node, content } : node;
+    }),
+  );
 };
 
 export const deleteEmbeddingsForNodes = async (
@@ -167,12 +226,43 @@ export const upsertEmbeddings = async (
                 endLine: update.endLine,
                 embedding: update.embedding,
                 contentHash: update.contentHash ?? '',
+                summaryText: update.summaryText ?? '',
               },
             };
           }),
         },
       );
     });
+  });
+};
+
+export const updateNodeDescriptions = async (
+  repoId: string,
+  updates: Neo4jDescriptionInput[],
+): Promise<void> => {
+  const grouped = new Map<string, Array<{ nodeId: string; description: string }>>();
+  const allowedLabels = new Set<string>(EMBEDDABLE_LABELS);
+
+  for (const update of updates) {
+    if (!allowedLabels.has(update.label)) continue;
+    const description = update.description.trim();
+    if (!description) continue;
+    const bucket = grouped.get(update.label) ?? [];
+    bucket.push({ nodeId: update.nodeId, description });
+    grouped.set(update.label, bucket);
+  }
+
+  if (grouped.size === 0) return;
+
+  await withNeo4jSession(async (session) => {
+    for (const [label, rows] of grouped) {
+      await session.executeWrite(async (tx) => {
+        await tx.run(
+          `UNWIND $updates AS row MATCH (n:\`${label}\` {repoId: $repoId, id: row.nodeId}) SET n.description = row.description`,
+          { repoId, updates: rows },
+        );
+      });
+    }
   });
 };
 

@@ -191,7 +191,8 @@ describe('LadybugDB Schema', () => {
   describe('embedding schema', () => {
     it('creates CodeEmbedding table', () => {
       expect(EMBEDDING_SCHEMA).toContain(`CREATE NODE TABLE ${EMBEDDING_TABLE_NAME}`);
-      expect(EMBEDDING_SCHEMA).toContain('embedding FLOAT[384]');
+      expect(EMBEDDING_SCHEMA).toMatch(/embedding FLOAT\[\d+\]/);
+      expect(EMBEDDING_SCHEMA).toContain('summaryText STRING');
     });
 
     it('has vector index query', () => {

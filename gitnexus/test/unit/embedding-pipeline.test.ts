@@ -109,6 +109,11 @@ describe('EMBEDDING_SCHEMA', () => {
     const { EMBEDDING_SCHEMA } = await import('../../src/core/lbug/schema.js');
     expect(EMBEDDING_SCHEMA).toContain('contentHash STRING');
   });
+
+  it('includes summaryText STRING column for embedding auditability', async () => {
+    const { EMBEDDING_SCHEMA } = await import('../../src/core/lbug/schema.js');
+    expect(EMBEDDING_SCHEMA).toContain('summaryText STRING');
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -313,6 +318,64 @@ describe('runEmbeddingPipeline incremental filter', () => {
     const insertParams = createCalls[0].params;
     expect(insertParams.some((p: any) => p.nodeId === node.id)).toBe(true);
     expect(insertParams[0].contentHash).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it('stores keyword summary text and updates node descriptions when summaries are generated', async () => {
+    mockEmbedderSetup();
+    process.env.GITNEXUS_KEYWORD_SUMMARY_ENABLED = 'true';
+    process.env.GITNEXUS_KEYWORD_SUMMARY_URL = 'http://keyword-summary:8080/v1';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content:
+                  '{"businessKeywords":["短链","投诉短信"],"technicalKeywords":["SHORT_URL"],"intent":"调用短链服务生成短信链接","aliases":["短链接"]}',
+              },
+            },
+          ],
+        }),
+      }),
+    );
+
+    const node = makeNode({
+      id: 'Method:src/sms.ts:SmsService.getShortUrl#3',
+      name: 'getShortUrl',
+      label: 'Method',
+      filePath: 'src/sms.ts',
+      content:
+        'public String getShortUrl(Long xtenant, String fullUrl, String des) { params.put("description", des); return HttpClientUtil.post(UrlConstant.SHORT_URL, params); }',
+      startLine: 10,
+      endLine: 20,
+    });
+    const inserted: any[] = [];
+    const updatedDescriptions: any[] = [];
+
+    const { runEmbeddingPipeline } =
+      await import('../../src/core/embeddings/embedding-pipeline.js');
+
+    await runEmbeddingPipeline(vi.fn(), vi.fn(), onProgress, {}, undefined, undefined, new Map(), {
+      loadNodes: async () => [node],
+      insertEmbeddings: async (updates) => {
+        inserted.push(...updates);
+      },
+      updateNodeDescriptions: async (updates: any[]) => {
+        updatedDescriptions.push(...updates);
+      },
+      ensureVectorIndex: async () => {},
+    } as any);
+
+    expect(inserted[0].summaryText).toContain('业务词: 短链, 投诉短信');
+    expect(updatedDescriptions).toEqual([
+      {
+        nodeId: node.id,
+        label: 'Method',
+        description: expect.stringContaining('意图: 调用短链服务生成短信链接'),
+      },
+    ]);
   });
 
   it('maps positional query rows with description/isExported columns correctly', async () => {

@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { spawn } from 'child_process';
 
-const POD_INSTALL_ARGS = ['install', '--allow-root', '--no-ansi'] as const;
+const POD_INSTALL_ARGS = ['install', '--repo-update', '--allow-root', '--no-ansi'] as const;
 const MAX_FAILURE_OUTPUT_CHARS = 12_000;
 
 export interface CommandResult {

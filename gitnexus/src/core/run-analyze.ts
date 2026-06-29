@@ -335,6 +335,7 @@ export async function runFullAnalysis(
         ensureNeo4jEmbeddingIndex,
         fetchExistingEmbeddingHashes: fetchExistingNeo4jEmbeddingHashes,
         loadEmbeddableNodes,
+        updateNodeDescriptions,
         upsertEmbeddings,
       } = await import('./neo4j/embedding-adapter.js');
       const { readServerMapping } = await import('./embeddings/server-mapping.js');
@@ -372,10 +373,12 @@ export async function runFullAnalysis(
             { repoName: projectNameInitial, serverName },
             existingEmbeddings,
             {
-              loadNodes: () => loadEmbeddableNodes(projectNameInitial),
+              loadNodes: () => loadEmbeddableNodes(projectNameInitial, repoPath),
               insertEmbeddings: (updates) => upsertEmbeddings(projectNameInitial, updates),
               deleteEmbeddingsForNodeIds: (nodeIds) =>
                 deleteEmbeddingsForNodes(projectNameInitial, nodeIds),
+              updateNodeDescriptions: (updates) =>
+                updateNodeDescriptions(projectNameInitial, updates),
               ensureVectorIndex: ensureNeo4jEmbeddingIndex,
             },
           ),

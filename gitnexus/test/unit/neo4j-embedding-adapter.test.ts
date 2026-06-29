@@ -1,4 +1,7 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 
 const txRun = vi.fn();
 const executeWrite = vi.fn(async (work: any) => work({ run: txRun }));
@@ -14,6 +17,10 @@ const record = (values: Record<string, any>) => ({
 });
 
 describe('Neo4j embedding adapter', () => {
+  beforeEach(() => {
+    txRun.mockResolvedValue({ records: [] });
+  });
+
   afterEach(() => {
     vi.clearAllMocks();
   });
@@ -53,6 +60,7 @@ describe('Neo4j embedding adapter', () => {
         endLine: 20,
         embedding: [0.1, 0.2],
         contentHash: 'hash-a',
+        summaryText: '[中文业务摘要]\n业务词: 登录',
       },
     ]);
 
@@ -75,7 +83,132 @@ describe('Neo4j embedding adapter', () => {
               endLine: 20,
               embedding: [0.1, 0.2],
               contentHash: 'hash-a',
+              summaryText: '[中文业务摘要]\n业务词: 登录',
             },
+          },
+        ],
+      },
+    );
+  });
+
+  it('hydrates missing node content from source file snippets', async () => {
+    const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-neo4j-embed-'));
+    const sourcePath = path.join(repoPath, 'src', 'a.ts');
+    await fs.mkdir(path.dirname(sourcePath), { recursive: true });
+    await fs.writeFile(
+      sourcePath,
+      [
+        'const before = true;',
+        'export function handler() {',
+        '  const orderId = readOrderId();',
+        '  return queryOrder(orderId);',
+        '}',
+        'const after = true;',
+      ].join('\n'),
+      'utf-8',
+    );
+    txRun.mockResolvedValueOnce({
+      records: [
+        record({
+          id: 'Function:handler',
+          name: 'handler',
+          filePath: 'src/a.ts',
+          content: '',
+          startLine: 2,
+          endLine: 5,
+          isExported: true,
+          description: null,
+        }),
+      ],
+    });
+    const { loadEmbeddableNodes } = await import('../../src/core/neo4j/embedding-adapter.js');
+
+    try {
+      const nodes = await loadEmbeddableNodes('repo-a', repoPath);
+
+      expect(nodes).toHaveLength(1);
+      expect(nodes[0]).toMatchObject({
+        id: 'Function:handler',
+        name: 'handler',
+        filePath: 'src/a.ts',
+      });
+      expect(nodes[0].content).toContain('export function handler()');
+      expect(nodes[0].content).toContain('return queryOrder(orderId);');
+    } finally {
+      await fs.rm(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps Neo4j node content when it is already populated', async () => {
+    const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-neo4j-embed-'));
+    const sourcePath = path.join(repoPath, 'src', 'a.ts');
+    await fs.mkdir(path.dirname(sourcePath), { recursive: true });
+    await fs.writeFile(sourcePath, 'export function fromDisk() {}', 'utf-8');
+    txRun.mockResolvedValueOnce({
+      records: [
+        record({
+          id: 'Function:handler',
+          name: 'handler',
+          filePath: 'src/a.ts',
+          content: 'export function fromNeo4j() {}',
+          startLine: 1,
+          endLine: 1,
+          isExported: true,
+          description: null,
+        }),
+      ],
+    });
+    const { loadEmbeddableNodes } = await import('../../src/core/neo4j/embedding-adapter.js');
+
+    try {
+      const nodes = await loadEmbeddableNodes('repo-a', repoPath);
+
+      expect(nodes).toHaveLength(1);
+      expect(nodes[0].content).toBe('export function fromNeo4j() {}');
+    } finally {
+      await fs.rm(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('updates symbol descriptions by repo and label', async () => {
+    const { updateNodeDescriptions } = await import('../../src/core/neo4j/embedding-adapter.js');
+
+    await updateNodeDescriptions('repo-a', [
+      {
+        nodeId: 'Method:a',
+        label: 'Method',
+        description: '[中文业务摘要]\n意图: 获取短链',
+      },
+      {
+        nodeId: 'Class:b',
+        label: 'Class',
+        description: '[中文业务摘要]\n意图: 订单请求体',
+      },
+    ]);
+
+    expect(executeWrite).toHaveBeenCalledTimes(2);
+    expect(txRun).toHaveBeenNthCalledWith(
+      1,
+      'UNWIND $updates AS row MATCH (n:`Method` {repoId: $repoId, id: row.nodeId}) SET n.description = row.description',
+      {
+        repoId: 'repo-a',
+        updates: [
+          {
+            nodeId: 'Method:a',
+            description: '[中文业务摘要]\n意图: 获取短链',
+          },
+        ],
+      },
+    );
+    expect(txRun).toHaveBeenNthCalledWith(
+      2,
+      'UNWIND $updates AS row MATCH (n:`Class` {repoId: $repoId, id: row.nodeId}) SET n.description = row.description',
+      {
+        repoId: 'repo-a',
+        updates: [
+          {
+            nodeId: 'Class:b',
+            description: '[中文业务摘要]\n意图: 订单请求体',
           },
         ],
       },

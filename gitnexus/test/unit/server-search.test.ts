@@ -10,6 +10,7 @@ const fetchExistingEmbeddingHashes = vi.fn();
 const loadEmbeddableNodes = vi.fn();
 const upsertEmbeddings = vi.fn();
 const executeReadCypher = vi.fn();
+const executeRepoScopedReadCypher = vi.fn();
 const runEmbeddingPipeline = vi.fn();
 const withEmbeddingBaseUrl = vi.fn(async (_url: string | undefined, fn: () => Promise<void>) =>
   fn(),
@@ -32,6 +33,7 @@ vi.mock('../../src/core/neo4j/embedding-adapter.js', () => ({
 
 vi.mock('../../src/core/neo4j/read-adapter.js', () => ({
   executeReadCypher,
+  executeRepoScopedReadCypher,
 }));
 
 vi.mock('../../src/core/embeddings/embedding-pipeline.js', () => ({
@@ -109,13 +111,46 @@ describe('server search helpers', () => {
     expect(neo4jSemanticSearch).not.toHaveBeenCalled();
   });
 
-  it('runs HTTP Cypher queries through Neo4j read adapter', async () => {
-    executeReadCypher.mockResolvedValue([{ c: 231208 }]);
+  it('rejects HTTP Cypher queries with repo scope but no explicit repoId filter', async () => {
+    executeRepoScopedReadCypher.mockRejectedValueOnce(new Error('repoId is required'));
+    const { queryNeo4jBackend } = await import('../../src/server/search.js');
+
+    await expect(queryNeo4jBackend('MATCH (n) RETURN count(n) AS c', 'saasoanew')).rejects.toThrow(
+      'repoId',
+    );
+
+    expect(executeRepoScopedReadCypher).toHaveBeenCalledWith(
+      'MATCH (n) RETURN count(n) AS c',
+      'saasoanew',
+    );
+  });
+
+  it('runs HTTP Cypher queries through Neo4j read adapter with repoId params', async () => {
+    executeRepoScopedReadCypher.mockResolvedValue([{ c: 231208 }]);
+
+    const { queryNeo4jBackend } = await import('../../src/server/search.js');
+    const result = await queryNeo4jBackend(
+      'MATCH (n {repoId: $repoId}) RETURN count(n) AS c',
+      'saasoanew',
+    );
+
+    expect(executeRepoScopedReadCypher).toHaveBeenCalledWith(
+      'MATCH (n {repoId: $repoId}) RETURN count(n) AS c',
+      'saasoanew',
+    );
+    expect(result).toEqual([{ c: 231208 }]);
+  });
+
+  it('keeps global HTTP Cypher queries available when repo scope is omitted', async () => {
+    executeRepoScopedReadCypher.mockResolvedValue([{ c: 231208 }]);
 
     const { queryNeo4jBackend } = await import('../../src/server/search.js');
     const result = await queryNeo4jBackend('MATCH (n) RETURN count(n) AS c');
 
-    expect(executeReadCypher).toHaveBeenCalledWith('MATCH (n) RETURN count(n) AS c');
+    expect(executeRepoScopedReadCypher).toHaveBeenCalledWith(
+      'MATCH (n) RETURN count(n) AS c',
+      undefined,
+    );
     expect(result).toEqual([{ c: 231208 }]);
   });
 

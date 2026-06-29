@@ -1,48 +1,67 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { LocalBackend } from '../../src/mcp/local/local-backend.js';
-import { executeReadCypher } from '../../src/core/neo4j/read-adapter.js';
-import { initLbug } from '../../src/core/lbug/pool-adapter.js';
+
+const txRun = vi.fn();
+const executeRead = vi.fn(async (work: any) => work({ run: txRun }));
+const withNeo4jSession = vi.fn(async (work: any) => work({ executeRead }));
 
 vi.mock('../../src/core/lbug/pool-adapter.js', () => ({
-  initLbug: vi.fn(),
-  executeQuery: vi.fn(),
-  executeParameterized: vi.fn(),
-  closeLbug: vi.fn(),
-  isLbugReady: vi.fn(() => false),
   isWriteQuery: vi.fn((query: string) => /DELETE|CREATE|SET|MERGE|DROP|ALTER/i.test(query)),
 }));
 
-vi.mock('../../src/core/neo4j/config.js', () => ({
-  isNeo4jBackendEnabled: vi.fn(() => true),
+vi.mock('../../src/core/neo4j/driver.js', () => ({
+  withNeo4jSession,
 }));
 
-vi.mock('../../src/core/neo4j/read-adapter.js', () => ({
-  executeReadCypher: vi.fn(async () => [{ name: 'handler' }]),
-}));
-
-describe('LocalBackend cypher with Neo4j backend', () => {
+describe('Neo4j repo-scoped cypher guard', () => {
   afterEach(() => {
     vi.clearAllMocks();
   });
 
-  it('executes read cypher through Neo4j without initializing LadybugDB', async () => {
-    const backend = new LocalBackend();
+  it('rejects repo-scoped Neo4j cypher that does not explicitly filter by repoId', async () => {
+    const { executeRepoScopedReadCypher } = await import('../../src/core/neo4j/read-adapter.js');
 
-    const result = await (backend as any).cypher(
-      {
-        id: 'repo-a',
-        name: 'Repo A',
-        repoPath: '/repo/a',
-        storagePath: '/repo/a/.gitnexus',
-        lbugPath: '/repo/a/.gitnexus/lbug',
-        indexedAt: '2026-05-30',
-        lastCommit: 'abc',
-      },
-      { query: 'MATCH (n) RETURN n.name AS name' },
+    await expect(
+      executeRepoScopedReadCypher('MATCH (n) RETURN n.name AS name', 'Repo A'),
+    ).rejects.toThrow('repoId');
+    expect(txRun).not.toHaveBeenCalled();
+  });
+
+  it('passes repoId params for repo-scoped Neo4j cypher', async () => {
+    txRun.mockResolvedValueOnce({
+      records: [
+        {
+          keys: ['name'],
+          get: (key: string) => ({ name: 'handler' })[key],
+        },
+      ],
+    });
+    const { executeRepoScopedReadCypher } = await import('../../src/core/neo4j/read-adapter.js');
+
+    const result = await executeRepoScopedReadCypher(
+      'MATCH (n {repoId: $repoId}) RETURN n.name AS name',
+      'Repo A',
     );
 
-    expect(executeReadCypher).toHaveBeenCalledWith('MATCH (n) RETURN n.name AS name');
-    expect(initLbug).not.toHaveBeenCalled();
+    expect(txRun).toHaveBeenCalledWith('MATCH (n {repoId: $repoId}) RETURN n.name AS name', {
+      repoId: 'Repo A',
+    });
+    expect(result).toEqual([{ name: 'handler' }]);
+  });
+
+  it('keeps global Neo4j cypher available when no repo scope is requested', async () => {
+    txRun.mockResolvedValueOnce({
+      records: [
+        {
+          keys: ['name'],
+          get: (key: string) => ({ name: 'handler' })[key],
+        },
+      ],
+    });
+    const { executeRepoScopedReadCypher } = await import('../../src/core/neo4j/read-adapter.js');
+
+    const result = await executeRepoScopedReadCypher('MATCH (n) RETURN n.name AS name');
+
+    expect(txRun).toHaveBeenCalledWith('MATCH (n) RETURN n.name AS name', {});
     expect(result).toEqual([{ name: 'handler' }]);
   });
 });

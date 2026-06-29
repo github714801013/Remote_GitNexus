@@ -1673,6 +1673,14 @@ export class LocalBackend {
       }
     }
 
+    if (method === 'cypher' && !p.repo && this.repos.size > 1) {
+      const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+      if (isNeo4jBackendEnabled()) {
+        const raw = await this.cypher(null, params);
+        return this.formatCypherAsMarkdown(raw);
+      }
+    }
+
     if (!p.repo && this.repos.size > 1 && CROSS_REPO_LOOP_TOOLS.has(method)) {
       return this.callToolAcrossRepos(method, params, headScope);
     }
@@ -2824,15 +2832,22 @@ export class LocalBackend {
     return this.cypher(repo, { query });
   }
 
-  private async cypher(repo: RepoHandle, params: { query: string }): Promise<any> {
+  private async cypher(repo: RepoHandle | null, params: { query: string }): Promise<any> {
     const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
     if (isNeo4jBackendEnabled()) {
       try {
-        const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
-        return await executeReadCypher(params.query);
+        const { executeRepoScopedReadCypher } = await import('../../core/neo4j/read-adapter.js');
+        return await executeRepoScopedReadCypher(params.query, repo?.name);
       } catch (err: any) {
         return { error: err.message || 'Query failed' };
       }
+    }
+
+    if (!repo) {
+      return {
+        error:
+          'LadybugDB cypher queries require a concrete repo. Specify repo in multi-repo setups.',
+      };
     }
 
     await this.ensureInitialized(repo.id);

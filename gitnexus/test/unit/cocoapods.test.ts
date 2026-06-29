@@ -40,7 +40,7 @@ describe('CocoaPods dependency preparation', () => {
     expect(calls).toEqual([
       {
         command: 'pod',
-        args: ['install', '--allow-root', '--no-ansi'],
+        args: ['install', '--repo-update', '--allow-root', '--no-ansi'],
         cwd: repoPath,
       },
     ]);

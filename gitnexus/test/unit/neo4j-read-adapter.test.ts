@@ -4,6 +4,10 @@ const txRun = vi.fn();
 const executeRead = vi.fn(async (work: any) => work({ run: txRun }));
 const withNeo4jSession = vi.fn(async (work: any) => work({ executeRead }));
 
+vi.mock('../../src/core/lbug/pool-adapter.js', () => ({
+  isWriteQuery: vi.fn((query: string) => /DELETE|CREATE|SET|MERGE|DROP|ALTER/i.test(query)),
+}));
+
 vi.mock('../../src/core/neo4j/driver.js', () => ({
   withNeo4jSession,
 }));

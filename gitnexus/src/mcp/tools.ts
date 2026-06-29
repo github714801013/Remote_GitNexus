@@ -147,6 +147,7 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
 
 WHEN TO USE: Complex structural queries that query/context/impact or text search can't answer, especially cross-file relationship questions. Prefer Cypher over reading many files when you can express the relationship directly. READ gitnexus://repo/{name}/schema first for the full schema.
 AFTER THIS: Use context() on result symbols for deeper context.
+REPO SCOPE: In Neo4j mode, when "repo" is provided, the query must explicitly filter with the $repoId parameter, for example MATCH (n {repoId: $repoId}) RETURN n.name LIMIT 10. Omit repo to run a global read query.
 
 SCHEMA:
 - Nodes: File, Folder, Function, Class, Interface, Method, CodeElement, Community, Process, Route, Tool
@@ -181,7 +182,7 @@ EXAMPLES:
   MATCH (d:Class)-[:CodeRelation {type: 'EXTENDS'}]->(b1), (d)-[:CodeRelation {type: 'EXTENDS'}]->(b2), (b1)-[:CodeRelation {type: 'EXTENDS'}]->(a), (b2)-[:CodeRelation {type: 'EXTENDS'}]->(a) WHERE b1 <> b2 RETURN d.name, b1.name, b2.name, a.name
 
 OUTPUT: Returns { markdown, row_count } — results formatted as a Markdown table for easy reading.
-MULTI-REPO: If "repo" is omitted and multiple repositories are indexed, the service runs the read query against visible repositories and merges rows with a repo column.
+MULTI-REPO: If "repo" is omitted and multiple repositories are indexed, the service runs one global read query across visible repositories.
 
 TIPS:
 - All relationships use single CodeRelation table — filter with {type: 'CALLS'} etc.
@@ -191,11 +192,15 @@ TIPS:
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Cypher query to execute' },
+        query: {
+          type: 'string',
+          description:
+            'Cypher query to execute. In Neo4j mode with repo set, include $repoId, for example MATCH (n {repoId: $repoId}) RETURN n LIMIT 10.',
+        },
         repo: {
           type: 'string',
           description:
-            'Repository name or path. Omit to run the read query across visible repositories in multi-repo setups.',
+            'Repository name or path. In Neo4j mode, queries scoped to a repo must filter with $repoId. Omit to run a global read query across visible repositories in multi-repo setups.',
         },
       },
       required: ['query'],

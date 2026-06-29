@@ -458,6 +458,7 @@ CREATE NODE TABLE ${EMBEDDING_TABLE_NAME} (
   endLine INT64,
   embedding FLOAT[${EMBEDDING_DIMS}],
   contentHash STRING,
+  summaryText STRING,
   PRIMARY KEY (id)
 )`;
 

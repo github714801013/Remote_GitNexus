@@ -121,16 +121,43 @@ export const repoNameFromPath = (repoPath: string): string => path.basename(repo
 
 export const shouldScheduleStartupEmbeddings = (
   meta:
-    | { embeddingStatus?: EmbeddingStatus; stats?: { nodes?: number; embeddings?: number } }
+    | {
+        embeddingStatus?: EmbeddingStatus;
+        indexedAt?: string;
+        stats?: { nodes?: number; embeddings?: number };
+      }
     | null
     | undefined,
   actualEmbeddings?: number,
 ): boolean => {
   const nodes = meta?.stats?.nodes ?? 0;
   const embeddings = actualEmbeddings ?? meta?.stats?.embeddings ?? 0;
-  const embeddingIncomplete =
-    meta?.embeddingStatus !== undefined && meta.embeddingStatus !== EMBEDDING_STATUS_COMPLETE;
+  // RUNNING 状态需区分"活跃 repair"与"僵尸状态"：
+  // 进程被杀时 RUNNING -> COMPLETE/FAILED 回写来不及执行，状态会永久卡住。
+  // 超时阈值内的 RUNNING 视为活跃（不重复 enqueue），超时则视为僵尸（允许重试）。
+  let embeddingIncomplete: boolean;
+  if (meta?.embeddingStatus === EMBEDDING_STATUS_RUNNING) {
+    embeddingIncomplete = isEmbeddingRunningStale(meta?.indexedAt);
+  } else {
+    embeddingIncomplete =
+      meta?.embeddingStatus !== undefined && meta.embeddingStatus !== EMBEDDING_STATUS_COMPLETE;
+  }
   return nodes > 0 && (embeddings <= 0 || embeddingIncomplete);
+};
+
+// RUNNING 状态超时判定：超过阈值视为僵尸进程（状态卡死），允许重新 enqueue。
+const DEFAULT_EMBEDDING_RUNNING_TIMEOUT_MS = 30 * 60 * 1000; // 30 分钟
+
+export const readEmbeddingRunningTimeoutMs = (): number => {
+  const raw = Number.parseInt(process.env.GITNEXUS_EMBEDDING_RUNNING_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_EMBEDDING_RUNNING_TIMEOUT_MS;
+};
+
+const isEmbeddingRunningStale = (indexedAt?: string): boolean => {
+  if (!indexedAt) return true; // 无时间戳无法判断，保守视为僵尸
+  const ts = Date.parse(indexedAt);
+  if (!Number.isFinite(ts)) return true;
+  return Date.now() - ts > readEmbeddingRunningTimeoutMs();
 };
 
 export const shouldScheduleStartupIncrementalAnalyze = (
@@ -1092,7 +1119,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 p.phase === 'loading-model'
                   ? 'Loading embedding model...'
                   : p.phase === 'embedding'
-                    ? `Embedding nodes (${p.percent}%)...`
+                    ? p.totalBatches
+                      ? `Embedding ${p.nodesProcessed ?? 0}/${p.totalNodes ?? '?'} nodes (batch ${p.currentBatch ?? 0}/${p.totalBatches}, ${p.percent}%)`
+                      : `Embedding nodes (${p.percent}%)...`
                     : p.phase === 'indexing'
                       ? 'Creating vector index...'
                       : p.phase === 'ready'
@@ -1119,6 +1148,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               ensureNeo4jEmbeddingIndex,
               fetchExistingEmbeddingHashes,
               loadEmbeddableNodes,
+              updateNodeDescriptions,
               upsertEmbeddings,
             } = await import('../core/neo4j/embedding-adapter.js');
             const { readServerMapping } = await import('../core/embeddings/server-mapping.js');
@@ -1134,10 +1164,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 { repoName: entry.name, serverName },
                 existingEmbeddings,
                 {
-                  loadNodes: () => loadEmbeddableNodes(entry.name),
+                  loadNodes: () => loadEmbeddableNodes(entry.name, entry.path),
                   insertEmbeddings: (updates) => upsertEmbeddings(entry.name, updates),
                   deleteEmbeddingsForNodeIds: (nodeIds) =>
                     deleteEmbeddingsForNodes(entry.name, nodeIds),
+                  updateNodeDescriptions: (updates) => updateNodeDescriptions(entry.name, updates),
                   ensureVectorIndex: ensureNeo4jEmbeddingIndex,
                 },
               ),
@@ -1729,7 +1760,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
       if (isNeo4jBackendEnabled()) {
-        const result = await queryNeo4jBackend(cypher);
+        const result = await queryNeo4jBackend(cypher, entry.name);
         res.json({ result });
         return;
       }
@@ -2722,7 +2753,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           };
 
           if (isNeo4jBackendEnabled()) {
-            await runNeo4jEmbeddingRepair(entry.name, updateEmbedProgress);
+            await runNeo4jEmbeddingRepair(entry.name, updateEmbedProgress, entry.path);
           } else {
             const lbugPath = path.join(entry.storagePath, 'lbug');
             await withLbugDb(lbugPath, async () => {

@@ -44,6 +44,24 @@ export const executeReadCypher = async (
   });
 };
 
+export const REPO_SCOPED_CYPHER_REQUIRES_REPO_ID =
+  'Repo-scoped Neo4j Cypher queries must explicitly filter with the $repoId parameter, for example: MATCH (n {repoId: $repoId}) RETURN n LIMIT 10.';
+
+const usesRepoIdParameter = (cypher: string): boolean => /\$repoId\b/.test(cypher);
+
+export const executeRepoScopedReadCypher = async (
+  cypher: string,
+  repoId?: string,
+): Promise<Record<string, any>[]> => {
+  if (!repoId) {
+    return await executeReadCypher(cypher);
+  }
+  if (!usesRepoIdParameter(cypher)) {
+    throw new Error(REPO_SCOPED_CYPHER_REQUIRES_REPO_ID);
+  }
+  return await executeReadCypher(cypher, { repoId });
+};
+
 export const findSymbolContext = async (
   repoId: string,
   target: string,

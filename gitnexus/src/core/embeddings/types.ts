@@ -219,6 +219,14 @@ export interface EmbeddingConfig {
   overlap: number;
   /** Maximum description length in characters */
   maxDescriptionLength: number;
+  /** Per-node timeout (ms) covering AST extraction / chunking / keyword summary.
+   *  Guards against tree-sitter hangs on pathological files (e.g. large generated vue/cshtml).
+   *  Default: 120_000 (2 min). Override via GITNEXUS_EMBEDDING_NODE_TIMEOUT_MS. */
+  nodeTimeoutMs?: number;
+  /** Per-batch timeout (ms) covering embed + DB insert for one sub-batch.
+   *  Guards against HTTP keepalive deadlocks when the embedding service swallows a request.
+   *  Default: 300_000 (5 min). Override via GITNEXUS_EMBEDDING_BATCH_TIMEOUT_MS. */
+  batchTimeoutMs?: number;
 }
 
 /**
@@ -281,6 +289,7 @@ export interface CachedEmbedding {
   endLine: number;
   embedding: number[];
   contentHash?: string;
+  summaryText?: string;
 }
 
 export interface ExistingEmbeddingInfo {

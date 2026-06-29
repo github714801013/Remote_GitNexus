@@ -36,9 +36,12 @@ export const searchNeo4jBackend = async ({
   }));
 };
 
-export const queryNeo4jBackend = async (cypher: string): Promise<Record<string, any>[]> => {
-  const { executeReadCypher } = await import('../core/neo4j/read-adapter.js');
-  return await executeReadCypher(cypher);
+export const queryNeo4jBackend = async (
+  cypher: string,
+  repoName?: string,
+): Promise<Record<string, any>[]> => {
+  const { executeRepoScopedReadCypher } = await import('../core/neo4j/read-adapter.js');
+  return await executeRepoScopedReadCypher(cypher, repoName);
 };
 
 export const queryNeo4jProcesses = async (
@@ -272,6 +275,7 @@ export type EmbeddingProgressCallback = (progress: any) => void;
 export const runNeo4jEmbeddingRepair = async (
   repoName: string,
   onProgress: EmbeddingProgressCallback,
+  repoPath?: string,
 ): Promise<number> => {
   const { runEmbeddingPipeline } = await import('../core/embeddings/embedding-pipeline.js');
   const { withEmbeddingBaseUrl } = await import('../core/embeddings/http-client.js');
@@ -281,9 +285,21 @@ export const runNeo4jEmbeddingRepair = async (
     ensureNeo4jEmbeddingIndex,
     fetchExistingEmbeddingHashes,
     loadEmbeddableNodes,
+    updateNodeDescriptions,
     upsertEmbeddings,
   } = await import('../core/neo4j/embedding-adapter.js');
   const { readServerMapping } = await import('../core/embeddings/server-mapping.js');
+  const resolvedRepoPath =
+    repoPath ??
+    (await import('../storage/repo-manager.js').then(
+      async ({ readRegistry, resolveRegistryEntry }) => {
+        try {
+          return resolveRegistryEntry(await readRegistry(), repoName).path;
+        } catch {
+          return undefined;
+        }
+      },
+    ));
 
   const serverName = await readServerMapping(repoName);
   const existingEmbeddings = await fetchExistingEmbeddingHashes(repoName);
@@ -297,9 +313,10 @@ export const runNeo4jEmbeddingRepair = async (
       { repoName, serverName },
       existingEmbeddings,
       {
-        loadNodes: () => loadEmbeddableNodes(repoName),
+        loadNodes: () => loadEmbeddableNodes(repoName, resolvedRepoPath),
         insertEmbeddings: (updates) => upsertEmbeddings(repoName, updates),
         deleteEmbeddingsForNodeIds: (nodeIds) => deleteEmbeddingsForNodes(repoName, nodeIds),
+        updateNodeDescriptions: (updates) => updateNodeDescriptions(repoName, updates),
         ensureVectorIndex: ensureNeo4jEmbeddingIndex,
       },
     ),
