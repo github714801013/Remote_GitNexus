@@ -39,8 +39,6 @@ if [ -n "$DOCKER_HELPER_PATH" ]; then
 fi
 
 echo "=== 步骤 1: 本地构建镜像 (使用缓存) ==="
-version=$(git rev-parse --short HEAD 2>/dev/null || echo "latest")
-full_image_tag="${REGISTRY_URL}/${IMAGE_NAME}:${version}"
 
 export DOCKER_BUILDKIT=1
 rm -f "${RAW_TAR_FILE}" "${TAR_FILE}"
@@ -50,7 +48,6 @@ fi
 docker buildx inspect "${BUILDX_BUILDER}" --bootstrap >/dev/null
 MSYS_NO_PATHCONV=1 docker buildx build \
     --builder "${BUILDX_BUILDER}" \
-    -t "${full_image_tag}" \
     -t "${IMAGE_NAME}:latest" \
     -f mcp_proxy_docker/Dockerfile \
     --build-arg VITE_BACKEND_URL=/ \
@@ -96,16 +93,22 @@ ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
     docker stop -t 30 "${KEYWORD_SUMMARY_CONTAINER}" 2>/dev/null || true
     docker rm "${KEYWORD_SUMMARY_CONTAINER}" 2>/dev/null || true
 
-    echo "启动 GitNexus + Zoekt + Keyword Summary (docker compose)..."
+    echo "启动 GitNexus + Zoekt (docker compose)..."
     GITEA_TOKEN="${gitnexus_gitea_token}" \
     GITNEXUS_KEYWORD_SUMMARY_URL="${GITNEXUS_KEYWORD_SUMMARY_URL}" \
     GITNEXUS_KEYWORD_SUMMARY_MODEL="${GITNEXUS_KEYWORD_SUMMARY_MODEL}" \
     GITNEXUS_KEYWORD_SUMMARY_API_KEY="${GITNEXUS_KEYWORD_SUMMARY_API_KEY}" \
     GITNEXUS_EMBEDDING_BATCH_SIZE="${GITNEXUS_EMBEDDING_BATCH_SIZE:-32}" \
-    docker compose -f docker-compose.yml up -d
+    docker compose -f docker-compose.yml up -d gitnexus-mcp-proxy
 
     echo "--- 执行自动验证 ---"
     python3 auto_verify.py
+
+    echo "--- 清理旧 GitNexus 镜像 ---"
+    docker images --format '{{.Repository}} {{.Tag}} {{.ID}}' \
+      | awk '\$1 == "${REGISTRY_URL}/${IMAGE_NAME}" { print \$1 ":" \$2 } \$1 == "${IMAGE_NAME}" && \$2 != "latest" { print \$1 ":" \$2 }' \
+      | xargs -r docker rmi 2>/dev/null || true
+    docker image prune -f
 EOF
 
 echo ""
