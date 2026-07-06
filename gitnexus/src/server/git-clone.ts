@@ -8,6 +8,7 @@
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs/promises';
+import os from 'os';
 import { isIP } from 'net';
 import { logger } from '../core/logger.js';
 import { parseRepoNameFromUrl } from '../storage/git.js';
@@ -488,6 +489,139 @@ export async function cloneOrPull(
   return safeTarget;
 }
 
+export function isGitObjectDatabaseCorruption(err: unknown): boolean {
+  const text = err instanceof Error ? err.message : String(err);
+  return (
+    /object file .* is empty/i.test(text) ||
+    /cannot read existing object info/i.test(text) ||
+    /invalid index-pack output/i.test(text) ||
+    /loose object .* is corrupt/i.test(text) ||
+    /fatal: bad object/i.test(text)
+  );
+}
+
+export async function cloneOrResetToBranch(
+  url: string,
+  targetDir: string,
+  branch: string,
+  onProgress?: (progress: CloneProgress) => void,
+): Promise<string> {
+  assertSafeGitRef(branch, 'branch');
+  validateGitUrl(url);
+  const safeTarget = path.resolve(targetDir);
+  const exists = await fs.access(path.join(safeTarget, '.git')).then(
+    () => true,
+    () => false,
+  );
+
+  if (exists) {
+    onProgress?.({ phase: 'pulling', message: `Synchronizing ${branch}...` });
+    await fs.rm(path.join(safeTarget, '.git', 'index.lock'), { force: true });
+    try {
+      await ensureFullHistory(safeTarget, url);
+      for (const args of buildWebhookBranchSyncCommands(url, branch)) {
+        await runGitWithDiagnostics(args, safeTarget, { url });
+      }
+    } catch (err) {
+      if (!isGitObjectDatabaseCorruption(err)) throw err;
+      logger.warn(
+        `[git] detected corrupt object database; deleting and re-cloning webhook mirror targetDir=${safeTarget}`,
+      );
+      await rebuildCorruptWebhookMirror(url, safeTarget, branch, onProgress);
+    }
+  } else {
+    await fs.mkdir(path.dirname(safeTarget), { recursive: true });
+    onProgress?.({ phase: 'cloning', message: `Cloning ${url}...` });
+    await runGitWithDiagnostics(['clone', '--branch', branch, '--', url, safeTarget], undefined, {
+      url,
+    });
+  }
+
+  return safeTarget;
+}
+
+export function buildWebhookBranchSyncCommands(url: string, branch: string): string[][] {
+  assertSafeGitRef(branch, 'branch');
+  const remoteRef = `refs/remotes/origin/${branch}`;
+  return [
+    ['remote', 'set-url', 'origin', url],
+    ['fetch', 'origin', `+refs/heads/${branch}:${remoteRef}`],
+    ['reset', '--hard', remoteRef],
+    ['clean', '-fd', '-e', '.gitnexus', '-e', '.gitnexus/'],
+    ['checkout', '-B', branch, remoteRef],
+    ['reset', '--hard', remoteRef],
+    ['clean', '-fd', '-e', '.gitnexus', '-e', '.gitnexus/'],
+  ];
+}
+
+export function getAuthenticatedGitUrl(url: string): string {
+  const token = process.env.GITEA_TOKEN;
+  if (!token || !url.startsWith('http')) return url;
+  const parsed = new URL(url);
+  parsed.username = token;
+  parsed.password = '';
+  return parsed.toString();
+}
+
+function assertSafeGitRef(value: string, fieldName: string): void {
+  if (
+    !value ||
+    value.startsWith('-') ||
+    value.startsWith('/') ||
+    value.endsWith('/') ||
+    value.includes('..') ||
+    /[\s\\~^:?*[\]\x00-\x1F\x7F]/.test(value)
+  ) {
+    throw new Error(`Invalid ${fieldName}`);
+  }
+}
+
+async function ensureFullHistory(targetDir: string, url: string): Promise<void> {
+  const shallow = (
+    await runGitOutput(['rev-parse', '--is-shallow-repository'], targetDir, {
+      url,
+    })
+  ).trim();
+  if (shallow === 'true') {
+    await runGitWithDiagnostics(['fetch', '--unshallow', 'origin'], targetDir, { url });
+  }
+}
+
+async function rebuildCorruptWebhookMirror(
+  url: string,
+  targetDir: string,
+  branch: string,
+  onProgress?: (progress: CloneProgress) => void,
+): Promise<void> {
+  const metadataDir = await preserveGitNexusMetadata(targetDir);
+  try {
+    await fs.rm(targetDir, { recursive: true, force: true });
+    await fs.mkdir(path.dirname(targetDir), { recursive: true });
+    onProgress?.({ phase: 'cloning', message: `Re-cloning ${branch} after git corruption...` });
+    await runGitWithDiagnostics(['clone', '--branch', branch, '--', url, targetDir], undefined, {
+      url,
+    });
+    if (metadataDir) {
+      await fs.cp(metadataDir, path.join(targetDir, '.gitnexus'), { recursive: true, force: true });
+    }
+  } finally {
+    if (metadataDir) await fs.rm(metadataDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function preserveGitNexusMetadata(targetDir: string): Promise<string | undefined> {
+  const source = path.join(targetDir, '.gitnexus');
+  const exists = await fs.access(source).then(
+    () => true,
+    () => false,
+  );
+  if (!exists) return undefined;
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-meta-'));
+  const dest = path.join(tempDir, '.gitnexus');
+  await fs.cp(source, dest, { recursive: true, force: true });
+  return dest;
+}
+
 /**
  * Hosts the per-request GitHub PAT may be sent to. Exported so the
  * /api/analyze boundary check and this injection-site check share one
@@ -532,6 +666,10 @@ function resolveGitCredential(options?: { token?: string; url?: string }): strin
   //    host-bind so the user's token is never sent off github.com).
   if (options.token && GITHUB_TOKEN_HOSTS.has(host)) {
     return Buffer.from(`x-access-token:${options.token}`).toString('base64');
+  }
+
+  if (process.env.GITEA_TOKEN) {
+    return Buffer.from(`${process.env.GITEA_TOKEN}:`).toString('base64');
   }
 
   // 2. Server-configured Azure DevOps PAT — Azure hosts only.
@@ -668,4 +806,75 @@ function runGit(
       reject(new Error(`Failed to spawn git: ${err.message}`));
     });
   });
+}
+
+function runGitWithDiagnostics(
+  args: string[],
+  cwd?: string,
+  options?: { token?: string; url?: string },
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('git', args, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      env: buildGitEnv(process.env, options),
+    });
+    let stderr = '';
+    proc.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk;
+    });
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      const sanitized = sanitizeGitStderr(stderr);
+      if (sanitized) logger.error(`git ${args[0]} stderr: ${sanitized}`);
+      reject(
+        new Error(`git ${args[0]} failed (exit code ${code})${sanitized ? `: ${sanitized}` : ''}`),
+      );
+    });
+    proc.on('error', (err) => reject(new Error(`Failed to spawn git: ${err.message}`)));
+  });
+}
+
+function runGitOutput(
+  args: string[],
+  cwd?: string,
+  options?: { token?: string; url?: string },
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('git', args, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      env: buildGitEnv(process.env, options),
+    });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk;
+    });
+    proc.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk;
+    });
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve(stdout);
+        return;
+      }
+      const sanitized = sanitizeGitStderr(stderr);
+      if (sanitized) logger.error(`git ${args[0]} stderr: ${sanitized}`);
+      reject(
+        new Error(`git ${args[0]} failed (exit code ${code})${sanitized ? `: ${sanitized}` : ''}`),
+      );
+    });
+    proc.on('error', (err) => reject(new Error(`Failed to spawn git: ${err.message}`)));
+  });
+}
+
+function sanitizeGitStderr(stderr: string): string {
+  const token = process.env.GITEA_TOKEN;
+  return token ? stderr.trim().replaceAll(token, '****') : stderr.trim();
 }

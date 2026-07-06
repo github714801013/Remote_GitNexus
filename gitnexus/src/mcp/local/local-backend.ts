@@ -136,6 +136,35 @@ function resolveAliasString(canonical: unknown, legacy: unknown): string | undef
   return undefined;
 }
 
+const DEFAULT_QUERY_SEMANTIC_TIMEOUT_MS = 5_000;
+const MAX_QUERY_SEMANTIC_TIMEOUT_MS = 60_000;
+
+function getQuerySemanticTimeoutMs(): number {
+  const raw = process.env.GITNEXUS_QUERY_SEMANTIC_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_QUERY_SEMANTIC_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_QUERY_SEMANTIC_TIMEOUT_MS;
+  return Math.min(parsed, MAX_QUERY_SEMANTIC_TIMEOUT_MS);
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -1353,6 +1382,9 @@ export class LocalBackend {
    * a pool entry even when their name-derived id transiently collides (#2067).
    */
   private async ensureInitialized(repo: RepoHandle): Promise<void> {
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) return;
+
     const poolKey = repo.lbugPath;
     // If a reinit is already in progress for this repo, wait for it
     const pending = this.reinitPromises.get(poolKey);
@@ -1692,12 +1724,209 @@ export class LocalBackend {
         return this.apiImpact(repo, params);
       case 'trace':
         return this.trace(repo, params);
+      case 'code_snippet':
+        return this.codeSnippet(repo, params);
+      case 'git_author_trace':
+        return this.gitAuthorTrace(repo, params);
       default:
         throw new Error(`Unknown tool: ${method}`);
     }
   }
 
   // ─── Tool Implementations ────────────────────────────────────────
+
+  private resolveSourcePath(repo: RepoHandle, filePath: string): string {
+    if (!filePath || typeof filePath !== 'string') {
+      throw new Error('filePath is required');
+    }
+    const repoRoot = path.resolve(repo.repoPath);
+    const candidate = path.isAbsolute(filePath)
+      ? path.resolve(filePath)
+      : path.resolve(repoRoot, filePath);
+    const rel = path.relative(repoRoot, candidate);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error('filePath is outside repository');
+    }
+    return candidate;
+  }
+
+  private async codeSnippet(
+    repo: RepoHandle,
+    params?: { filePath?: string; startLine?: number; endLine?: number; contextLines?: number },
+  ): Promise<any> {
+    const filePath = String(params?.filePath ?? '');
+    const startLine = Math.max(1, Math.trunc(Number(params?.startLine ?? 1)));
+    const endLine = Math.max(startLine, Math.trunc(Number(params?.endLine ?? startLine)));
+    if (endLine - startLine + 1 > 500) {
+      throw new Error('Line range too large');
+    }
+    const contextLines = Math.max(0, Math.min(50, Math.trunc(Number(params?.contextLines ?? 0))));
+    const fullPath = this.resolveSourcePath(repo, filePath);
+    const content = await fs.readFile(fullPath, 'utf-8');
+    const lines = content.split(/\r?\n/);
+    const from = Math.max(1, startLine - contextLines);
+    const to = Math.min(lines.length, endLine + contextLines);
+    const contentLines = lines.slice(from - 1, to);
+    const snippet = contentLines
+      .map((line, idx) => `${String(from + idx).padStart(4, ' ')} | ${line}`)
+      .join('\n');
+    return {
+      repo: repo.name,
+      filePath: path.relative(repo.repoPath, fullPath).replace(/\\/g, '/'),
+      startLine: from,
+      endLine: to,
+      actualStartLine: from,
+      actualEndLine: to,
+      commit: repo.lastCommit,
+      content: contentLines.join('\n'),
+      snippet,
+    };
+  }
+
+  private async gitAuthorTrace(
+    repo: RepoHandle,
+    params?: {
+      filePath?: string;
+      startLine?: number;
+      endLine?: number;
+      includeHistory?: boolean;
+      maxCommits?: number;
+    },
+  ): Promise<any> {
+    const filePath = String(params?.filePath ?? '');
+    const startLine = Math.max(1, Math.trunc(Number(params?.startLine ?? 1)));
+    const endLine = Math.max(startLine, Math.trunc(Number(params?.endLine ?? startLine)));
+    const fullPath = this.resolveSourcePath(repo, filePath);
+    const relPath = path.relative(repo.repoPath, fullPath).replace(/\\/g, '/');
+    const { execFileSync } = await import('child_process');
+    const shallow = execFileSync('git', ['rev-parse', '--is-shallow-repository'], {
+      cwd: repo.repoPath,
+      encoding: 'utf-8',
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    }).trim();
+    if (shallow === 'true') {
+      return {
+        repo: repo.name,
+        filePath: relPath,
+        startLine,
+        endLine,
+        primaryAuthors: [],
+        commits: [],
+        truncatedHistory: false,
+        warnings: ['浅克隆,无法获取真正修改人'],
+      };
+    }
+    const blame = execFileSync(
+      'git',
+      ['blame', '--line-porcelain', `-L`, `${startLine},${endLine}`, '--', relPath],
+      {
+        cwd: repo.repoPath,
+        encoding: 'utf-8',
+        maxBuffer: 1024 * 1024 * 5,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      },
+    );
+    const authors = new Map<
+      string,
+      { name: string; email: string; lines: number[]; lastSummary?: string }
+    >();
+    const blameCommits = new Map<
+      string,
+      { commit: string; authorName?: string; authorEmail?: string; summary?: string }
+    >();
+    const warnings: string[] = [];
+    let currentCommit = '';
+    let currentLine = startLine - 1;
+    for (const line of blame.split(/\r?\n/)) {
+      const header = /^(\^?[0-9a-f]{40})\s+\d+\s+(\d+)/.exec(line);
+      if (header) {
+        currentCommit = header[1];
+        currentLine = Number(header[2]);
+        if (currentCommit.startsWith('^')) {
+          if (!warnings.includes('浅克隆,无法获取真正修改人')) {
+            warnings.push('浅克隆,无法获取真正修改人');
+          }
+          currentCommit = '';
+          continue;
+        }
+        if (!blameCommits.has(currentCommit)) {
+          blameCommits.set(currentCommit, { commit: currentCommit });
+        }
+      } else if (line.startsWith('author ') && currentCommit) {
+        blameCommits.get(currentCommit)!.authorName = line.slice('author '.length);
+      } else if (line.startsWith('author-mail ') && currentCommit) {
+        blameCommits.get(currentCommit)!.authorEmail = line
+          .slice('author-mail '.length)
+          .replace(/^<|>$/g, '');
+      } else if (line.startsWith('summary ') && currentCommit) {
+        blameCommits.get(currentCommit)!.summary = line.slice('summary '.length);
+      } else if (line.startsWith('\t') && currentCommit) {
+        const commit = blameCommits.get(currentCommit);
+        if (commit?.authorName && commit.authorEmail) {
+          const key = `${commit.authorName}\n${commit.authorEmail}`;
+          const author =
+            authors.get(key) ??
+            ({
+              name: commit.authorName,
+              email: commit.authorEmail,
+              lines: [],
+              lastSummary: commit.summary,
+            } as { name: string; email: string; lines: number[]; lastSummary?: string });
+          author.lines.push(currentLine);
+          author.lastSummary = commit.summary;
+          authors.set(key, author);
+        }
+      }
+    }
+    const includeHistory = params?.includeHistory !== false;
+    const maxCommits = Math.max(1, Math.min(100, Math.trunc(Number(params?.maxCommits ?? 20))));
+    let commits: Array<{
+      commit: string;
+      authorName: string;
+      authorEmail: string;
+      summary: string;
+    }> = [];
+    let truncatedHistory = false;
+    if (includeHistory && warnings.length === 0) {
+      const log = execFileSync(
+        'git',
+        [
+          'log',
+          `--max-count=${maxCommits + 1}`,
+          '--format=%H%x1f%an%x1f%ae%x1f%s',
+          `-L`,
+          `${startLine},${endLine}:${relPath}`,
+        ],
+        {
+          cwd: repo.repoPath,
+          encoding: 'utf-8',
+          maxBuffer: 1024 * 1024 * 5,
+          env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+        },
+      );
+      const rows = log
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .filter((line) => /^[0-9a-f]{40}\x1f/.test(line))
+        .map((line) => {
+          const [commit, authorName, authorEmail, summary] = line.split('\x1f');
+          return { commit, authorName, authorEmail, summary };
+        });
+      truncatedHistory = rows.length > maxCommits;
+      commits = rows.slice(0, maxCommits);
+    }
+    return {
+      repo: repo.name,
+      filePath: relPath,
+      startLine,
+      endLine,
+      primaryAuthors: warnings.length ? [] : [...authors.values()],
+      commits: warnings.length ? [] : commits,
+      truncatedHistory,
+      warnings,
+    };
+  }
 
   /** Check repository graph invariants that are suitable for CI gating. */
   private async check(repo: RepoHandle, params?: { cycles?: boolean }): Promise<any> {
@@ -1771,6 +2000,8 @@ export class LocalBackend {
     const maxSymbolsPerProcess = params.max_symbols || 10;
     const includeContent = params.include_content ?? false;
     const searchQuery = rawQuery.trim();
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const neo4jBackendEnabled = isNeo4jBackendEnabled();
 
     // Per-phase timing instrumentation (#553). Records wall time for each
     // observable sub-step of the search pipeline so production latency can
@@ -1785,9 +2016,25 @@ export class LocalBackend {
     // each so both get independent wall-time records without fighting
     // over a single `current` phase slot.
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
+    let semanticSearchTimedOut = false;
+    const semanticTimeoutMs = getQuerySemanticTimeoutMs();
     const [bm25SearchResult, semanticResults] = await Promise.all([
       timer.time('bm25', this.bm25Search(repo, searchQuery, searchLimit)),
-      timer.time('vector', this.semanticSearch(repo, searchQuery, searchLimit)),
+      timer.time(
+        'vector',
+        withTimeout(
+          this.semanticSearch(repo, searchQuery, searchLimit),
+          semanticTimeoutMs,
+          `Semantic vector search exceeded ${semanticTimeoutMs}ms`,
+        ).catch((err) => {
+          semanticSearchTimedOut = true;
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err), timeoutMs: semanticTimeoutMs },
+            'GitNexus: semantic vector search degraded for query',
+          );
+          return [];
+        }),
+      ),
     ]);
 
     // Guard against undefined results (#1489) — when FTS is entirely
@@ -1878,15 +2125,26 @@ export class LocalBackend {
       // Processes each symbol participates in. `n.id AS nodeId` is prepended as
       // column 0 so rows from many symbols can be re-associated to their symbol.
       try {
-        const rows = await executeParameterized(
-          repo.lbugPath,
-          `
-          MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-          WHERE n.id IN $nodeIds
-          RETURN n.id AS nodeId, p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
-        `,
-          { nodeIds: ids },
-        );
+        const rows = neo4jBackendEnabled
+          ? await (
+              await import('../../core/neo4j/read-adapter.js')
+            ).executeReadCypher(
+              `
+              UNWIND $nodeIds AS nodeId
+              MATCH (n:CodeNode {repoId: $repoId, id: nodeId})-[r:STEP_IN_PROCESS]->(p:Process {repoId: $repoId})
+              RETURN n.id AS nodeId, p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
+            `,
+              { repoId: repo.name, nodeIds: ids },
+            )
+          : await executeParameterized(
+              repo.lbugPath,
+              `
+              MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+              WHERE n.id IN $nodeIds
+              RETURN n.id AS nodeId, p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
+            `,
+              { nodeIds: ids },
+            );
         for (const row of rows) {
           const nid = row.nodeId ?? row[0];
           let list = processRowsByNode.get(nid);
@@ -1902,15 +2160,26 @@ export class LocalBackend {
       // mirror the prior per-symbol `LIMIT 1` (each symbol keeps ITS community,
       // not one community for the whole batch).
       try {
-        const rows = await executeParameterized(
-          repo.lbugPath,
-          `
-          MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          WHERE n.id IN $nodeIds
-          RETURN n.id AS nodeId, c.cohesion AS cohesion, c.heuristicLabel AS module
-        `,
-          { nodeIds: ids },
-        );
+        const rows = neo4jBackendEnabled
+          ? await (
+              await import('../../core/neo4j/read-adapter.js')
+            ).executeReadCypher(
+              `
+              UNWIND $nodeIds AS nodeId
+              MATCH (n:CodeNode {repoId: $repoId, id: nodeId})-[:MEMBER_OF]->(c:Community {repoId: $repoId})
+              RETURN n.id AS nodeId, c.cohesion AS cohesion, c.heuristicLabel AS module
+            `,
+              { repoId: repo.name, nodeIds: ids },
+            )
+          : await executeParameterized(
+              repo.lbugPath,
+              `
+              MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+              WHERE n.id IN $nodeIds
+              RETURN n.id AS nodeId, c.cohesion AS cohesion, c.heuristicLabel AS module
+            `,
+              { nodeIds: ids },
+            );
         for (const row of rows) {
           const nid = row.nodeId ?? row[0];
           if (!cohesionByNode.has(nid)) {
@@ -1928,15 +2197,26 @@ export class LocalBackend {
       // Optionally fetch content for every matched symbol.
       if (includeContent) {
         try {
-          const rows = await executeParameterized(
-            repo.lbugPath,
-            `
-            MATCH (n)
-            WHERE n.id IN $nodeIds
-            RETURN n.id AS nodeId, n.content AS content
-          `,
-            { nodeIds: ids },
-          );
+          const rows = neo4jBackendEnabled
+            ? await (
+                await import('../../core/neo4j/read-adapter.js')
+              ).executeReadCypher(
+                `
+                UNWIND $nodeIds AS nodeId
+                MATCH (n:CodeNode {repoId: $repoId, id: nodeId})
+                RETURN n.id AS nodeId, n.content AS content
+              `,
+                { repoId: repo.name, nodeIds: ids },
+              )
+            : await executeParameterized(
+                repo.lbugPath,
+                `
+                MATCH (n)
+                WHERE n.id IN $nodeIds
+                RETURN n.id AS nodeId, n.content AS content
+              `,
+                { nodeIds: ids },
+              );
           for (const row of rows) {
             const nid = row.nodeId ?? row[0];
             contentByNode.set(nid, row.content ?? row[1]);
@@ -2152,6 +2432,11 @@ export class LocalBackend {
         'Symbol enrichment partially failed — some process/cohesion/content data may be missing from these results (see server logs).',
       );
     }
+    if (semanticSearchTimedOut) {
+      warnings.push(
+        `Semantic vector search timed out after ${semanticTimeoutMs}ms — results use keyword search only. Check GITNEXUS_EMBEDDING_URL or raise GITNEXUS_QUERY_SEMANTIC_TIMEOUT_MS if the embedding service is healthy but slow.`,
+      );
+    }
 
     return {
       processes,
@@ -2171,6 +2456,46 @@ export class LocalBackend {
     query: string,
     limit: number,
   ): Promise<{ results: any[]; ftsUsed: boolean }> {
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      try {
+        const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+        const rows = await executeReadCypher(
+          `
+          CALL db.index.fulltext.queryNodes('file_fts', $query, {limit: $limit})
+          YIELD node, score
+          WHERE node.repoId = $repoId
+          RETURN node.id AS id,
+                 node.name AS name,
+                 labels(node)[0] AS type,
+                 node.filePath AS filePath,
+                 node.startLine AS startLine,
+                 node.endLine AS endLine,
+                 score AS score
+        `,
+          { repoId: repo.name, query, limit },
+        );
+        return {
+          results: rows.map((row) => ({
+            nodeId: row.id,
+            name: row.name,
+            type: row.type,
+            filePath: row.filePath,
+            startLine: row.startLine,
+            endLine: row.endLine,
+            bm25Score: row.score,
+          })),
+          ftsUsed: true,
+        };
+      } catch (err: any) {
+        logger.warn(
+          { err: err?.message },
+          'GitNexus: Neo4j file FTS search failed — falling back to semantic-only',
+        );
+        return { results: [], ftsUsed: false };
+      }
+    }
+
     let searchFTSFromLbug;
     try {
       ({ searchFTSFromLbug } = await import('../../core/search/bm25-index.js'));
@@ -2278,6 +2603,15 @@ export class LocalBackend {
    */
   private async semanticSearch(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
     try {
+      const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+      if (isNeo4jBackendEnabled()) {
+        const { embedQuery } = await import('../core/embedder.js');
+        const queryVec = await embedQuery(query);
+        const { semanticSearch: neo4jSemanticSearch } =
+          await import('../../core/neo4j/embedding-adapter.js');
+        return await neo4jSemanticSearch(repo.name, queryVec, limit);
+      }
+
       // Check if embedding table exists before loading the model (avoids heavy model init when embeddings are off)
       const tableCheck = await executeQuery(
         repo.lbugPath,
@@ -2420,6 +2754,20 @@ export class LocalBackend {
     // still accepted (and the field the internal executeCypher() passes). New wins.
     request: { query?: string; statement?: string; params?: Record<string, unknown> },
   ): Promise<any> {
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      const cypherText = resolveAliasString(request.statement, request.query) ?? '';
+      if (!cypherText.trim()) {
+        return { error: 'statement (or legacy query) parameter is required and cannot be empty.' };
+      }
+      try {
+        const { executeRepoScopedReadCypher } = await import('../../core/neo4j/read-adapter.js');
+        return await executeRepoScopedReadCypher(cypherText, repo.name);
+      } catch (err: any) {
+        return { error: err.message || 'Query failed' };
+      }
+    }
+
     await this.ensureInitialized(repo);
 
     if (!isLbugReady(repo.lbugPath)) {
@@ -2944,6 +3292,50 @@ export class LocalBackend {
 
     if (!name && !uid) {
       return { error: 'Either "name" or "uid" parameter is required.' };
+    }
+
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      const { findSymbolContext } = await import('../../core/neo4j/read-adapter.js');
+      const rows = await findSymbolContext(repo.name, uid || name || '', 10, {
+        filePath: file_path,
+        kind,
+      });
+      if (rows.length === 0) {
+        return { error: `Symbol '${name || uid}' not found` };
+      }
+
+      const row = rows[0];
+      const categorizeNeo4jRefs = (refs: any[] | undefined, direction: 'incoming' | 'outgoing') => {
+        const cats: Record<string, any[]> = {};
+        for (const ref of refs ?? []) {
+          const relType = String(ref.type || '').toLowerCase();
+          if (!relType) continue;
+          const entry =
+            direction === 'incoming'
+              ? { uid: ref.source, name: ref.sourceName }
+              : { uid: ref.target, name: ref.targetName };
+          if (!cats[relType]) cats[relType] = [];
+          cats[relType].push(entry);
+        }
+        return cats;
+      };
+
+      return {
+        status: 'found',
+        symbol: {
+          uid: row.id,
+          name: row.name,
+          kind: row.type,
+          filePath: row.filePath,
+          startLine: row.startLine,
+          endLine: row.endLine,
+          ...(include_content && row.content ? { content: row.content } : {}),
+        },
+        incoming: categorizeNeo4jRefs(row.incoming, 'incoming'),
+        outgoing: categorizeNeo4jRefs(row.outgoing, 'outgoing'),
+        processes: [],
+      };
     }
 
     const outcome = await this.resolveSymbolCandidates(
@@ -4732,6 +5124,51 @@ export class LocalBackend {
     await this.ensureInitialized(repo);
 
     const { target, direction } = params;
+
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      const maxDepth = params.maxDepth || 3;
+      const { findImpact } = await import('../../core/neo4j/read-adapter.js');
+      const rows = await findImpact(repo.name, params.target_uid || target, direction, maxDepth, {
+        filePath: params.file_path,
+        kind: params.kind,
+      });
+      const byDepth: Record<string, any[]> = {};
+
+      for (const row of rows) {
+        const depth = String(row.depth ?? 1);
+        if (!byDepth[depth]) byDepth[depth] = [];
+        byDepth[depth].push({
+          uid: row.id,
+          name: row.name,
+          kind: row.type,
+          filePath: row.filePath,
+        });
+      }
+
+      let risk = 'LOW';
+      const directCount = byDepth['1']?.length ?? 0;
+      if (directCount >= 30 || rows.length >= 200) {
+        risk = 'CRITICAL';
+      } else if (directCount >= 15 || rows.length >= 100) {
+        risk = 'HIGH';
+      } else if (directCount >= 5 || rows.length >= 30) {
+        risk = 'MEDIUM';
+      }
+
+      return {
+        target: { name: target },
+        direction,
+        impactedCount: rows.length,
+        risk,
+        summary: {
+          directCallers: direction === 'upstream' ? directCount : undefined,
+          directCallees: direction === 'downstream' ? directCount : undefined,
+          totalAffected: rows.length,
+        },
+        byDepth,
+      };
+    }
 
     // ── Dispatch order (KTD5) ──────────────────────────────────────────
     // (1) Validate `mode`. Absent/'callgraph' → unchanged path; 'pdg' → the

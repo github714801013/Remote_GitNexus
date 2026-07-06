@@ -33,6 +33,9 @@ export interface LaunchOptions {
   embeddings?: boolean;
   dropEmbeddings?: boolean;
   registryName?: string;
+  registryBranch?: string;
+  allowDuplicateName?: boolean;
+  lockAlreadyHeld?: boolean;
 }
 
 const MAX_WORKER_RETRIES = 2;
@@ -47,10 +50,12 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
   ): void {
     // Acquire shared repo lock (keyed on storagePath to match embed handler)
     const analyzeLockKey = getStoragePath(targetPath);
-    const lockErr = acquireRepoLock(analyzeLockKey);
-    if (lockErr) {
-      jobManager.updateJob(job.id, { status: 'failed', error: lockErr });
-      return;
+    if (!opts.lockAlreadyHeld) {
+      const lockErr = acquireRepoLock(analyzeLockKey);
+      if (lockErr) {
+        jobManager.updateJob(job.id, { status: 'failed', error: lockErr });
+        return;
+      }
     }
 
     jobManager.updateJob(job.id, { repoPath: targetPath, status: 'analyzing' });
@@ -168,6 +173,10 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           embeddings: !!opts.embeddings,
           dropEmbeddings: !!opts.dropEmbeddings,
           ...(opts.registryName ? { registryName: opts.registryName } : {}),
+          ...(opts.registryBranch ? { registryBranch: opts.registryBranch } : {}),
+          ...(opts.allowDuplicateName !== undefined
+            ? { allowDuplicateName: opts.allowDuplicateName }
+            : {}),
         },
       });
     };

@@ -1,0 +1,216 @@
+services:
+  # ─── Zoekt 全文索引服务 ────────────────────────────────────────────────────────
+  zoekt-indexserver:
+    image: sourcegraph/zoekt-indexserver:latest
+    container_name: zoekt-indexserver
+    volumes:
+      - ${REMOTE_REPOS_PATH:-./repos}:/repos:ro
+      - zoekt-index:/data/index
+    entrypoint:
+      - sh
+      - -c
+      - |
+        INDEX_DIR=/data/index
+        TRIGGER_DIR=/data/index/triggers
+        REPOS_DIR=/repos
+        mkdir -p "$$TRIGGER_DIR"
+
+        index_repo() {
+          repo_dir="$$1"
+          zoekt-git-index -index "$$INDEX_DIR" "$$repo_dir" 2>/dev/null || true
+        }
+
+        # 清理已删除仓库的孤立 shard：shard 文件名含 URL 编码路径，
+        # 从 shard 名反推仓库路径，若目录不存在则删除对应 shard
+        prune_deleted_repos() {
+          for shard in "$$INDEX_DIR"/*.zoekt; do
+            [ -f "$$shard" ] || continue
+            # shard 文件名格式: <url-encoded-repo-path>_v<N>.<seq>.zoekt
+            encoded=$$(basename "$$shard" | sed 's/_v[0-9]*\.[0-9]*.zoekt$$//')
+            # URL 解码（%2F -> /）
+            repo_path=$$(printf '%b' "$$(echo "$$encoded" | sed 's/%/\\x/g')")
+            # repo_path 形如 host/group/repo，取最后两段作为本地路径
+            local_rel=$$(echo "$$repo_path" | sed 's|^[^/]*/||')
+            if [ -n "$$local_rel" ] && [ ! -d "$$REPOS_DIR/$$local_rel/.git" ]; then
+              rm -f "$$shard"
+            fi
+          done
+        }
+
+        # 启动时：先清理孤立 shard，再全量索引
+        prune_deleted_repos
+        find "$$REPOS_DIR" -maxdepth 4 -name HEAD -path "*/.git/HEAD" | while read h; do
+          index_repo "$$(dirname $$(dirname "$$h"))"
+        done
+
+        # 持续监听触发文件，每 30 分钟兜底全量扫描 + 清理
+        last_full=$$(date +%s)
+        while true; do
+          find "$$TRIGGER_DIR" -maxdepth 1 -name "*.reindex" | while read t; do
+            repo_name=$$(basename "$$t" .reindex | tr '_' '/')
+            repo_dir="$$REPOS_DIR/$$repo_name"
+            rm -f "$$t"
+            [ -d "$$repo_dir/.git" ] && index_repo "$$repo_dir"
+          done
+          now=$$(date +%s)
+          if [ $$((now - last_full)) -ge 1800 ]; then
+            prune_deleted_repos
+            find "$$REPOS_DIR" -maxdepth 4 -name HEAD -path "*/.git/HEAD" | while read h; do
+              index_repo "$$(dirname $$(dirname "$$h"))"
+            done
+            last_full=$$now
+          fi
+          sleep 5
+        done
+    restart: always
+
+  zoekt-webserver:
+    image: sourcegraph/zoekt-webserver:latest
+    container_name: zoekt-webserver
+    command: ['zoekt-webserver', '-listen', ':6070', '-index', '/data/index', '-rpc', '-html']
+    ports:
+      - '${HOST_ZOEKT_PORT:-6070}:6070'
+    volumes:
+      - zoekt-index:/data/index:ro
+    environment:
+      - DATA_DIR=/data/index
+    depends_on:
+      - zoekt-indexserver
+    restart: always
+
+  # ─── Neo4j 单库图及向量索引存储 ──────────────────────────────────────────────
+  neo4j:
+    image: neo4j:2026.04.0
+    container_name: gitnexus-neo4j
+    ports:
+      - '${HOST_NEO4J_HTTP_PORT:-7474}:7474'
+      - '${HOST_NEO4J_BOLT_PORT:-7687}:7687'
+    environment:
+      - NEO4J_AUTH=${GITNEXUS_NEO4J_USER:-neo4j}/${GITNEXUS_NEO4J_PASSWORD:?GITNEXUS_NEO4J_PASSWORD is required}
+      - NEO4J_server_memory_heap_initial__size=${GITNEXUS_NEO4J_HEAP_INITIAL:-2G}
+      - NEO4J_server_memory_heap_max__size=${GITNEXUS_NEO4J_HEAP_MAX:-8G}
+      - NEO4J_server_memory_pagecache_size=${GITNEXUS_NEO4J_PAGECACHE:-4G}
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'cypher-shell -u ${GITNEXUS_NEO4J_USER:-neo4j} -p ${GITNEXUS_NEO4J_PASSWORD:?GITNEXUS_NEO4J_PASSWORD is required} "RETURN 1"',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  # ─── 代码关键词摘要模型：为向量化前生成中文业务词摘要 ────────────────────────
+  keyword-summary:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    pull_policy: if_not_present
+    container_name: gitnexus-keyword-summary
+    ports:
+      - '${HOST_KEYWORD_SUMMARY_PORT:-955}:8080'
+    volumes:
+      - ${KEYWORD_SUMMARY_MODEL_DIR:-./models/keyword-summary}:/models:ro
+    command:
+      [
+        '-m',
+        '/models/${KEYWORD_SUMMARY_MODEL_FILE:-Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf}',
+        '--host',
+        '0.0.0.0',
+        '--port',
+        '8080',
+        '-c',
+        '4096',
+        '-ngl',
+        '99',
+        '-np',
+        '2',
+        '--parallel',
+        '2',
+        '--cont-batching',
+        '--jinja',
+      ]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: always
+
+  # ─── GitNexus MCP 代理 ────────────────────────────────────────────────────────
+  gitnexus-mcp-proxy:
+    image: gitnexus-mcp-proxy:latest
+    container_name: gitnexus-mcp-proxy
+    ports:
+      - '${HOST_GITNEXUS_HTTP_PORT:-1347}:1347'
+      - '${HOST_GITNEXUS_MCP_PORT:-1350}:1350'
+    volumes:
+      - ${REMOTE_REPOS_PATH:-./repos}:/projects
+      - ${REMOTE_PATH:-.}/models:/app/models
+      - ${REMOTE_GITNEXUS_DATA_PATH:-./.gitnexus}:/root/.gitnexus
+      - ${REMOTE_LBDB_PATH:-./.lbdb}:/root/.lbdb
+      - zoekt-index:/data/zoekt-index
+    environment:
+      - NODE_OPTIONS=--max-old-space-size=32768
+      - TZ=Asia/Shanghai
+      - GITEA_TOKEN=${GITEA_TOKEN:?GITEA_TOKEN is required}
+      - GITNEXUS_EMBEDDING_URL=${GITNEXUS_EMBEDDING_URL:?GITNEXUS_EMBEDDING_URL is required}
+      - GITNEXUS_INDEX_EMBEDDING_URL=${GITNEXUS_INDEX_EMBEDDING_URL:?GITNEXUS_INDEX_EMBEDDING_URL is required}
+      - GITNEXUS_EMBEDDING_MODEL=${GITNEXUS_EMBEDDING_MODEL:-qwen3-embedding-4b}
+      - GITNEXUS_EMBEDDING_DIMS=${GITNEXUS_EMBEDDING_DIMS:-2560}
+      - GITNEXUS_EMBEDDING_TIMEOUT_MS=3600000
+      - GITNEXUS_EMBEDDING_BATCH_SIZE=${GITNEXUS_EMBEDDING_BATCH_SIZE:-32}
+      - GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS=3600000
+      - GITNEXUS_WEBHOOK_ALLOWED_ENVS=dev,iteng
+      - GITNEXUS_STARTUP_WEBHOOK_REPOS_ENABLED=${GITNEXUS_STARTUP_WEBHOOK_REPOS_ENABLED:-false}
+      - GITNEXUS_ANALYZE_MAX_OLD_SPACE_MB=${GITNEXUS_ANALYZE_MAX_OLD_SPACE_MB:-32768}
+      - GITNEXUS_MAX_FILE_SIZE_BYTES=5242880
+      - GITNEXUS_MAX_PROCESSES=1000
+      - GITNEXUS_EMBEDDING_LIMIT=20000000
+      - GITNEXUS_ALLOW_REMOTE_MODELS=true
+      - GITNEXUS_PIPELINE_MEMORY_LOG=1
+      - GITNEXUS_NIGHTLY_PARALLEL_ENABLED=${GITNEXUS_NIGHTLY_PARALLEL_ENABLED:-true}
+      - GITNEXUS_NIGHTLY_PARALLEL_START_HOUR=${GITNEXUS_NIGHTLY_PARALLEL_START_HOUR:-22}
+      - GITNEXUS_NIGHTLY_PARALLEL_END_HOUR=${GITNEXUS_NIGHTLY_PARALLEL_END_HOUR:-9}
+      - GITNEXUS_STRUCTURE_PARALLEL_FREE_MEMORY_RATIO=${GITNEXUS_STRUCTURE_PARALLEL_FREE_MEMORY_RATIO:-0.4}
+      - GITNEXUS_STRUCTURE_PARALLEL_CONCURRENCY=${GITNEXUS_STRUCTURE_PARALLEL_CONCURRENCY:-2}
+      - GITNEXUS_EMBEDDING_PARALLEL_CONCURRENCY=${GITNEXUS_EMBEDDING_PARALLEL_CONCURRENCY:-3}
+      - GITNEXUS_EMBEDDING_REPAIR_CONCURRENCY=${GITNEXUS_EMBEDDING_REPAIR_CONCURRENCY:-3}
+      - GITNEXUS_KEYWORD_SUMMARY_ENABLED=${GITNEXUS_KEYWORD_SUMMARY_ENABLED:-true}
+      - GITNEXUS_KEYWORD_SUMMARY_URL=${GITNEXUS_KEYWORD_SUMMARY_URL:?GITNEXUS_KEYWORD_SUMMARY_URL is required}
+      - GITNEXUS_KEYWORD_SUMMARY_API_KEY=${GITNEXUS_KEYWORD_SUMMARY_API_KEY:?GITNEXUS_KEYWORD_SUMMARY_API_KEY is required}
+      - GITNEXUS_KEYWORD_SUMMARY_MODEL=${GITNEXUS_KEYWORD_SUMMARY_MODEL:-qwen3.6-35b-carnice}
+      - GITNEXUS_KEYWORD_SUMMARY_LANGUAGE=${GITNEXUS_KEYWORD_SUMMARY_LANGUAGE:-中文}
+      - GITNEXUS_KEYWORD_SUMMARY_MAX_CHARS=${GITNEXUS_KEYWORD_SUMMARY_MAX_CHARS:-6000}
+      - GITNEXUS_KEYWORD_SUMMARY_TIMEOUT_MS=${GITNEXUS_KEYWORD_SUMMARY_TIMEOUT_MS:-180000}
+      - GITNEXUS_PARALLEL_ENTRY_STAGGER_MS=${GITNEXUS_PARALLEL_ENTRY_STAGGER_MS:-60000}
+      - ZOEKT_ENDPOINTS=http://zoekt-webserver:6070
+      - ZOEKT_TRIGGER_DIR=/data/zoekt-index/triggers
+      - GITNEXUS_STORAGE_BACKEND=neo4j
+      - GITNEXUS_NEO4J_URI=bolt://neo4j:7687
+      - GITNEXUS_NEO4J_USER=${GITNEXUS_NEO4J_USER:-neo4j}
+      - GITNEXUS_NEO4J_PASSWORD=${GITNEXUS_NEO4J_PASSWORD:?GITNEXUS_NEO4J_PASSWORD is required}
+      - GITNEXUS_NEO4J_DATABASE=${GITNEXUS_NEO4J_DATABASE:-neo4j}
+    depends_on:
+      zoekt-webserver:
+        condition: service_started
+      neo4j:
+        condition: service_healthy
+    stop_grace_period: 5m
+    restart: always
+
+volumes:
+  zoekt-index:
+    driver: local
+  neo4j-data:
+    driver: local
+  neo4j-logs:
+    driver: local
+
+networks:
+  default:
+    name: gitnexus-network

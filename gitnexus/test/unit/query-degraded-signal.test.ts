@@ -7,26 +7,27 @@ import { _captureLogger, type LoggerCapture } from '../../src/core/logger.js';
 // real DB, so it cannot make ONE enrichment query throw while the rest succeed.
 const executeParameterizedMock = vi.fn();
 
-vi.mock('../../src/core/lbug/pool-adapter.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/core/lbug/pool-adapter.js')>();
-  return {
-    ...actual,
-    initLbug: vi.fn(),
-    executeParameterized: (...args: any[]) => executeParameterizedMock(...args),
-    closeLbug: vi.fn(),
-    isLbugReady: vi.fn().mockReturnValue(true),
-  };
-});
-vi.mock('../../src/mcp/core/lbug-adapter.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/mcp/core/lbug-adapter.js')>();
-  return {
-    ...actual,
-    initLbug: vi.fn(),
-    executeParameterized: (...args: any[]) => executeParameterizedMock(...args),
-    closeLbug: vi.fn(),
-    isLbugReady: vi.fn().mockReturnValue(true),
-  };
-});
+vi.mock('@ladybugdb/core', () => ({
+  default: {},
+}));
+
+vi.mock('../../src/core/lbug/pool-adapter.js', () => ({
+  initLbug: vi.fn(),
+  executeQuery: vi.fn(),
+  executeParameterized: (...args: any[]) => executeParameterizedMock(...args),
+  closeLbug: vi.fn(),
+  isLbugReady: vi.fn().mockReturnValue(true),
+  silenceStdout: vi.fn(),
+  restoreStdout: vi.fn(),
+  realStderrWrite: vi.fn(),
+}));
+vi.mock('../../src/mcp/core/lbug-adapter.js', () => ({
+  initLbug: vi.fn(),
+  executeQuery: vi.fn(),
+  executeParameterized: (...args: any[]) => executeParameterizedMock(...args),
+  closeLbug: vi.fn(),
+  isLbugReady: vi.fn().mockReturnValue(true),
+}));
 
 // Mock loadMeta so U10's reverse-direction CJK-mode-drift check can be
 // exercised without a real repo.lbugPath / meta.json on disk — the test's
@@ -131,6 +132,18 @@ describe('query: degraded-enrichment signal', () => {
     // Both messages present in the single composed warning — neither overwrites the other.
     expect(result.warning).toMatch(/FTS indexes missing|repair-fts/i);
     expect(result.warning.toLowerCase()).toContain('enrichment');
+  });
+
+  it('degrades semantic search on query timeout without dropping keyword results', async () => {
+    vi.stubEnv('GITNEXUS_QUERY_SEMANTIC_TIMEOUT_MS', '1');
+    const b = makeBackend(true);
+    (b.backend as any).semanticSearch = vi.fn(() => new Promise(() => undefined));
+    executeParameterizedMock.mockResolvedValue([]);
+
+    const result = await runQuery(b);
+
+    expect(result.definitions.map((d: any) => d.id)).toContain('func:x');
+    expect(result.warning).toMatch(/Semantic vector search timed out after 1ms/i);
   });
 
   it('warns when a CJK query hits a server resolving segmentation to none (#2331)', async () => {

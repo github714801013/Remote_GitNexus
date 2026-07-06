@@ -876,6 +876,53 @@ DESTINATION TRACE (cross-repo): for an "@groupName" trace, OMIT to/to_uid/to_fil
       required: [],
     },
   },
+  {
+    name: 'code_snippet',
+    description: `Fetch a small source snippet by file path and line range.
+
+WHEN TO USE: After query(), context(), impact(), or cypher() returns a concrete file path and line number, use this to verify the exact implementation without reading the whole file. Keep ranges small (about 10-20 lines).`,
+    annotations: READ_ONLY_TOOL_ANNOTATIONS,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string', description: 'Source file path returned by another tool.' },
+        startLine: { type: 'integer', description: '1-based start line.', minimum: 1 },
+        endLine: { type: 'integer', description: '1-based end line.', minimum: 1 },
+        contextLines: {
+          type: 'integer',
+          description: 'Optional extra lines before and after the range (default: 0, max: 50).',
+          default: 0,
+          minimum: 0,
+          maximum: 50,
+        },
+        repo: {
+          type: 'string',
+          description: 'Repository name or path. Omit if only one repo is indexed.',
+        },
+      },
+      required: ['filePath', 'startLine'],
+    },
+  },
+  {
+    name: 'git_author_trace',
+    description: `Show git authorship for a concrete file line range.
+
+WHEN TO USE: After code location is known, identify who last changed the lines and which commits touched the range.`,
+    annotations: READ_ONLY_TOOL_ANNOTATIONS,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string', description: 'Source file path.' },
+        startLine: { type: 'integer', description: '1-based start line.', minimum: 1 },
+        endLine: { type: 'integer', description: '1-based end line.', minimum: 1 },
+        repo: {
+          type: 'string',
+          description: 'Repository name or path. Omit if only one repo is indexed.',
+        },
+      },
+      required: ['filePath', 'startLine'],
+    },
+  },
 ];
 
 /**
@@ -900,6 +947,8 @@ const BRANCH_SCOPED_TOOLS = new Set([
   'shape_check',
   'api_impact',
   'trace',
+  'code_snippet',
+  'git_author_trace',
 ]);
 
 for (const tool of GITNEXUS_TOOLS) {

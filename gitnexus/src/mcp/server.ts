@@ -63,6 +63,10 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
 
     case 'cypher':
       return `\n\n---\n**Next:** To explore a result symbol, use context({name: "<name>"${repoParam}}). For schema reference, READ gitnexus://repo/${repoPath}/schema.`;
+    case 'code_snippet':
+      return `\n\n---\n**Next:** If you need ownership or commit history for these lines, use git_author_trace with the same file path and line range.`;
+    case 'git_author_trace':
+      return `\n\n---\n**Next:** Use context() or impact() on the related symbol if you need dependency or blast-radius context.`;
 
     // Legacy tool names — still return useful hints
     case 'search':
