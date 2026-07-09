@@ -1,5 +1,6 @@
 import { EMBEDDING_TABLE_NAME, NODE_TABLES } from 'gitnexus-shared';
 import { loadNeo4jConfig } from './config.js';
+import { FTS_INDEXES, type FTSIndexDefinition } from '../search/fts-schema.js';
 
 export interface Neo4jSchemaOptions {
   embeddingDims?: number;
@@ -31,6 +32,12 @@ const indexForLabelName = (label: string): string => {
   return `CREATE INDEX gitnexus_${label}_repo_name IF NOT EXISTS FOR (n:\`${label}\`) ON (n.repoId, n.name)`;
 };
 
+const fulltextIndexFor = ({ table, indexName, properties }: FTSIndexDefinition): string => {
+  const neo4jProperties = table === 'File' ? ['name', 'filePath', 'content'] : properties;
+  const columns = neo4jProperties.map((property) => `n.${property}`).join(', ');
+  return `CREATE FULLTEXT INDEX ${indexName} IF NOT EXISTS FOR (n:\`${table}\`) ON EACH [${columns}]`;
+};
+
 export const getNeo4jSchemaStatements = (
   options: Neo4jSchemaOptions = {},
 ): Neo4jSchemaStatements => {
@@ -42,7 +49,7 @@ export const getNeo4jSchemaStatements = (
   ];
   const indexes = [
     'CREATE INDEX gitnexus_File_repo_filePath IF NOT EXISTS FOR (n:`File`) ON (n.repoId, n.filePath)',
-    'CREATE FULLTEXT INDEX file_fts IF NOT EXISTS FOR (n:`File`) ON EACH [n.name, n.filePath, n.content]',
+    ...FTS_INDEXES.map(fulltextIndexFor),
     ...SYMBOL_NAME_INDEX_LABELS.map(indexForLabelName),
   ];
   const vectorIndexes = [

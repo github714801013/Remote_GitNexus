@@ -79,6 +79,7 @@ import {
   PDG_QUERY_DEFAULT_LIMIT,
   PDG_QUERY_MAX_LIMIT,
 } from '../tools.js';
+import { FTS_INDEXES } from '../../core/search/fts-schema.js';
 import { findImportCycles } from '../../core/graph/import-cycles.js';
 import { decodeTaintPath } from '../../core/ingestion/taint/path-codec.js';
 import { decodeReachingDefReason } from '../../core/ingestion/cfg/reaching-def-reason-codec.js';
@@ -139,9 +140,12 @@ function resolveAliasString(canonical: unknown, legacy: unknown): string | undef
 const DEFAULT_QUERY_SEMANTIC_TIMEOUT_MS = 5_000;
 const MAX_QUERY_SEMANTIC_TIMEOUT_MS = 60_000;
 
-function getQuerySemanticTimeoutMs(): number {
+function getQuerySemanticTimeoutMs(): number | undefined {
   const raw = process.env.GITNEXUS_QUERY_SEMANTIC_TIMEOUT_MS;
   if (raw === undefined || raw.trim() === '') return DEFAULT_QUERY_SEMANTIC_TIMEOUT_MS;
+  if (['0', 'false', 'no', 'off', 'none', 'never'].includes(raw.trim().toLowerCase())) {
+    return undefined;
+  }
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_QUERY_SEMANTIC_TIMEOUT_MS;
   return Math.min(parsed, MAX_QUERY_SEMANTIC_TIMEOUT_MS);
@@ -2018,16 +2022,20 @@ export class LocalBackend {
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
     let semanticSearchTimedOut = false;
     const semanticTimeoutMs = getQuerySemanticTimeoutMs();
+    const semanticSearchPromise = this.semanticSearch(repo, searchQuery, searchLimit);
     const [bm25SearchResult, semanticResults] = await Promise.all([
       timer.time('bm25', this.bm25Search(repo, searchQuery, searchLimit)),
       timer.time(
         'vector',
-        withTimeout(
-          this.semanticSearch(repo, searchQuery, searchLimit),
-          semanticTimeoutMs,
-          `Semantic vector search exceeded ${semanticTimeoutMs}ms`,
+        (semanticTimeoutMs === undefined
+          ? semanticSearchPromise
+          : withTimeout(
+              semanticSearchPromise,
+              semanticTimeoutMs,
+              `Semantic vector search exceeded ${semanticTimeoutMs}ms`,
+            )
         ).catch((err) => {
-          semanticSearchTimedOut = true;
+          semanticSearchTimedOut = semanticTimeoutMs !== undefined;
           logger.warn(
             { err: err instanceof Error ? err.message : String(err), timeoutMs: semanticTimeoutMs },
             'GitNexus: semantic vector search degraded for query',
@@ -2458,35 +2466,51 @@ export class LocalBackend {
   ): Promise<{ results: any[]; ftsUsed: boolean }> {
     const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
     if (isNeo4jBackendEnabled()) {
+      let ftsUsed = false;
+      const results: any[] = [];
+      const failures: string[] = [];
       try {
         const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
-        const rows = await executeReadCypher(
-          `
-          CALL db.index.fulltext.queryNodes('file_fts', $query, {limit: $limit})
-          YIELD node, score
-          WHERE node.repoId = $repoId
-          RETURN node.id AS id,
-                 node.name AS name,
-                 labels(node)[0] AS type,
-                 node.filePath AS filePath,
-                 node.startLine AS startLine,
-                 node.endLine AS endLine,
-                 score AS score
-        `,
-          { repoId: repo.name, query, limit },
-        );
-        return {
-          results: rows.map((row) => ({
-            nodeId: row.id,
-            name: row.name,
-            type: row.type,
-            filePath: row.filePath,
-            startLine: row.startLine,
-            endLine: row.endLine,
-            bm25Score: row.score,
-          })),
-          ftsUsed: true,
-        };
+        const { escapeNeo4jFulltextQuery } = await import('../../core/neo4j/fulltext-query.js');
+        const fulltextQuery = escapeNeo4jFulltextQuery(query);
+        for (const { indexName } of FTS_INDEXES) {
+          try {
+            const rows = await executeReadCypher(
+              `
+              CALL db.index.fulltext.queryNodes('${indexName}', $query, {limit: $limit})
+              YIELD node, score
+              WHERE node.repoId = $repoId
+              RETURN node.id AS id,
+                     node.name AS name,
+                     labels(node)[0] AS type,
+                     node.filePath AS filePath,
+                     node.startLine AS startLine,
+                     node.endLine AS endLine,
+                     score AS score
+            `,
+              { repoId: repo.name, query: fulltextQuery, limit },
+            );
+            ftsUsed = true;
+            for (const row of rows) {
+              results.push({
+                nodeId: row.id,
+                name: row.name,
+                type: row.type,
+                filePath: row.filePath,
+                startLine: row.startLine,
+                endLine: row.endLine,
+                bm25Score: row.score,
+              });
+            }
+          } catch (err: any) {
+            failures.push(`${indexName}: ${err?.message ?? String(err)}`);
+          }
+        }
+        if (ftsUsed) {
+          results.sort((a, b) => (b.bm25Score ?? 0) - (a.bm25Score ?? 0));
+          return { results: results.slice(0, limit), ftsUsed: true };
+        }
+        throw new Error(failures.join('; ') || 'No Neo4j fulltext indexes were queried');
       } catch (err: any) {
         logger.warn(
           { err: err?.message },

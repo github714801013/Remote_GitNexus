@@ -1,11 +1,15 @@
 import type { EmbeddableNode } from './types.js';
 import { isShortLabel } from './types.js';
+import { logger } from '../logger.js';
 
 const SUMMARY_PROMPT_VERSION = 'zh-business-keywords-v2';
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_CHARS = 6_000;
+const DEFAULT_MAX_TOKENS = 512;
 const DEFAULT_MODEL = 'qwen2.5-coder-14b-keyword-summary';
 const DEFAULT_LANGUAGE = '中文';
+const DEFAULT_FAILURE_COOLDOWN_MS = 5 * 60_000;
+const DEFAULT_SUMMARY_CONCURRENCY = 2;
 // Minimum code-body length (after trim) below which keyword summary is skipped.
 // Nodes whose code body is empty or trivially short carry no signal for keyword
 // extraction (the LLM would only see the symbol name + file path). Skipping them
@@ -92,9 +96,52 @@ const formatSummary = (payload: SummaryPayload, language: string): string | unde
 };
 
 const summaryCache = new Map<string, string | undefined>();
+let summaryDisabledUntil = 0;
+let activeSummaryRequests = 0;
+const summaryWaiters: Array<() => void> = [];
 
 export const clearKeywordSummaryCacheForTests = (): void => {
   summaryCache.clear();
+  summaryDisabledUntil = 0;
+  activeSummaryRequests = 0;
+  summaryWaiters.splice(0);
+};
+
+const readKeywordSummaryConcurrency = (): number =>
+  readPositiveInt(process.env.GITNEXUS_KEYWORD_SUMMARY_CONCURRENCY, DEFAULT_SUMMARY_CONCURRENCY);
+
+const acquireSummarySlot = async (): Promise<void> => {
+  while (activeSummaryRequests >= readKeywordSummaryConcurrency()) {
+    await new Promise<void>((resolve) => summaryWaiters.push(resolve));
+  }
+  activeSummaryRequests += 1;
+};
+
+const releaseSummarySlot = (): void => {
+  activeSummaryRequests = Math.max(0, activeSummaryRequests - 1);
+  summaryWaiters.shift()?.();
+};
+
+const keywordSummaryFailureFields = (err: unknown): Record<string, unknown> => {
+  if (!(err instanceof Error)) {
+    return { errorMessage: String(err) };
+  }
+
+  const cause = err.cause;
+  const causeFields =
+    cause && typeof cause === 'object'
+      ? {
+          causeCode: 'code' in cause ? (cause as { code?: unknown }).code : undefined,
+          causeHostname:
+            'hostname' in cause ? (cause as { hostname?: unknown }).hostname : undefined,
+        }
+      : {};
+
+  return {
+    errorType: err.name,
+    errorMessage: err.message,
+    ...causeFields,
+  };
 };
 
 export const buildKeywordSummaryPrefix = async (
@@ -119,8 +166,32 @@ export const buildKeywordSummaryPrefix = async (
     process.env.GITNEXUS_KEYWORD_SUMMARY_TIMEOUT_MS,
     DEFAULT_TIMEOUT_MS,
   );
+  const maxTokens = readPositiveInt(
+    process.env.GITNEXUS_KEYWORD_SUMMARY_MAX_TOKENS,
+    DEFAULT_MAX_TOKENS,
+  );
   const model = process.env.GITNEXUS_KEYWORD_SUMMARY_MODEL || DEFAULT_MODEL;
+  if (Date.now() < summaryDisabledUntil) return undefined;
 
+  const disableTemporarily = (err: unknown): void => {
+    if (Date.now() < summaryDisabledUntil) return;
+    const cooldownMs = readPositiveInt(
+      process.env.GITNEXUS_KEYWORD_SUMMARY_FAILURE_COOLDOWN_MS,
+      DEFAULT_FAILURE_COOLDOWN_MS,
+    );
+    summaryDisabledUntil = Date.now() + cooldownMs;
+    logger.debug(
+      {
+        ...keywordSummaryFailureFields(err),
+        model,
+        nodeId: node.id,
+        cooldownMs,
+      },
+      'Keyword summary request failed; temporarily disabling keyword summaries',
+    );
+  };
+
+  await acquireSummarySlot();
   try {
     const resp = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
@@ -132,7 +203,7 @@ export const buildKeywordSummaryPrefix = async (
       body: JSON.stringify({
         model,
         temperature: 0,
-        max_tokens: 160,
+        max_tokens: maxTokens,
         response_format: { type: 'json_object' },
         messages: [
           {
@@ -165,19 +236,28 @@ export const buildKeywordSummaryPrefix = async (
       }),
     });
 
-    if (!resp.ok) return undefined;
+    if (!resp.ok) {
+      disableTemporarily(new Error(`HTTP ${resp.status}`));
+      return undefined;
+    }
 
     const data = (await resp.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
+      choices?: Array<{
+        message?: { content?: string; reasoning?: string; reasoning_content?: string };
+      }>;
     };
-    const content = data.choices?.[0]?.message?.content;
+    const message = data.choices?.[0]?.message;
+    const content = message?.content || message?.reasoning || message?.reasoning_content;
     if (!content) return undefined;
 
     const parsed = JSON.parse(stripJsonFence(content)) as SummaryPayload;
     const formatted = formatSummary(parsed, language);
     summaryCache.set(cacheKey, formatted);
     return formatted;
-  } catch {
+  } catch (err) {
+    disableTemporarily(err);
     return undefined;
+  } finally {
+    releaseSummarySlot();
   }
 };

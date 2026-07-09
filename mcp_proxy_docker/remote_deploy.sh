@@ -33,9 +33,6 @@ read_windows_env() {
 REGISTRY_URL="${REGISTRY_HOST}:${REGISTRY_PORT}/${REGISTRY_NAMESPACE}"
 IMAGE_NAME="gitnexus-mcp-proxy"
 KEYWORD_SUMMARY_CONTAINER="gitnexus-keyword-summary"
-: "${KEYWORD_SUMMARY_MODEL_DIR:?KEYWORD_SUMMARY_MODEL_DIR environment variable is required}"
-KEYWORD_SUMMARY_MODEL_FILE="${KEYWORD_SUMMARY_MODEL_FILE:-Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf}"
-KEYWORD_SUMMARY_MODEL_PATH="${KEYWORD_SUMMARY_MODEL_DIR}/${KEYWORD_SUMMARY_MODEL_FILE}"
 TAR_FILE="gitnexus_noble_deploy.tar.gz"
 RAW_TAR_FILE="${TAR_FILE%.gz}"
 BUILDX_BUILDER="gitnexus-deploy-builder"
@@ -61,7 +58,13 @@ export GITEA_TOKEN="${GITNEXUS_GITEA_TOKEN}"
 if [ -z "${GITNEXUS_KEYWORD_SUMMARY_API_KEY:-}" ]; then
     GITNEXUS_KEYWORD_SUMMARY_API_KEY="$(read_windows_env GITNEXUS_KEYWORD_SUMMARY_API_KEY)"
 fi
-: "${GITNEXUS_KEYWORD_SUMMARY_URL:?GITNEXUS_KEYWORD_SUMMARY_URL environment variable is required}"
+LOCAL_KEYWORD_SUMMARY_URL="http://keyword-summary:8080"
+KEYWORD_SUMMARY_EXTERNAL_URL="${GITNEXUS_KEYWORD_SUMMARY_DEPLOY_URL:-}"
+if [ -z "${KEYWORD_SUMMARY_EXTERNAL_URL}" ] && [ -n "${GITNEXUS_KEYWORD_SUMMARY_URL:-}" ] && [ "${GITNEXUS_KEYWORD_SUMMARY_URL}" != "${LOCAL_KEYWORD_SUMMARY_URL}" ]; then
+    KEYWORD_SUMMARY_EXTERNAL_URL="${GITNEXUS_KEYWORD_SUMMARY_URL}"
+fi
+: "${KEYWORD_SUMMARY_EXTERNAL_URL:?GITNEXUS_KEYWORD_SUMMARY_DEPLOY_URL or remote GITNEXUS_KEYWORD_SUMMARY_URL environment variable is required}"
+GITNEXUS_KEYWORD_SUMMARY_URL="${KEYWORD_SUMMARY_EXTERNAL_URL}"
 export GITNEXUS_KEYWORD_SUMMARY_MODEL="${GITNEXUS_KEYWORD_SUMMARY_MODEL:-qwen3.6-35b-carnice}"
 export GITNEXUS_KEYWORD_SUMMARY_API_KEY="${GITNEXUS_KEYWORD_SUMMARY_API_KEY:-}"
 : "${GITNEXUS_KEYWORD_SUMMARY_API_KEY:?GITNEXUS_KEYWORD_SUMMARY_API_KEY environment variable is required}"
@@ -77,8 +80,6 @@ write_remote_env() {
         echo "REMOTE_REPOS_PATH=${REMOTE_REPOS_PATH}"
         echo "REMOTE_GITNEXUS_DATA_PATH=${REMOTE_GITNEXUS_DATA_PATH}"
         echo "REMOTE_LBDB_PATH=${REMOTE_LBDB_PATH}"
-        echo "KEYWORD_SUMMARY_MODEL_DIR=${KEYWORD_SUMMARY_MODEL_DIR}"
-        echo "KEYWORD_SUMMARY_MODEL_FILE=${KEYWORD_SUMMARY_MODEL_FILE}"
         echo "GITEA_TOKEN=${GITEA_TOKEN}"
         echo "GITNEXUS_EMBEDDING_URL=${GITNEXUS_EMBEDDING_URL}"
         echo "GITNEXUS_INDEX_EMBEDDING_URL=${GITNEXUS_INDEX_EMBEDDING_URL}"
@@ -87,6 +88,8 @@ write_remote_env() {
         echo "GITNEXUS_KEYWORD_SUMMARY_URL=${GITNEXUS_KEYWORD_SUMMARY_URL}"
         echo "GITNEXUS_KEYWORD_SUMMARY_MODEL=${GITNEXUS_KEYWORD_SUMMARY_MODEL}"
         echo "GITNEXUS_KEYWORD_SUMMARY_API_KEY=${GITNEXUS_KEYWORD_SUMMARY_API_KEY}"
+        echo "GITNEXUS_KEYWORD_SUMMARY_MAX_TOKENS=${GITNEXUS_KEYWORD_SUMMARY_MAX_TOKENS:-512}"
+        echo "GITNEXUS_KEYWORD_SUMMARY_ENABLED=true"
         echo "GITNEXUS_NEO4J_USER=${GITNEXUS_NEO4J_USER:-neo4j}"
         echo "GITNEXUS_NEO4J_PASSWORD=${GITNEXUS_NEO4J_PASSWORD}"
         echo "HOST_ZOEKT_PORT=${HOST_ZOEKT_PORT:-6070}"
@@ -130,14 +133,10 @@ echo "=== 步骤 3: 传输镜像和配置到远端 ==="
 write_remote_env
 ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
     set -e
-    mkdir -p "${REMOTE_PATH}/models" "${REMOTE_REPOS_PATH}" "${REMOTE_GITNEXUS_DATA_PATH}" "${REMOTE_LBDB_PATH}" "${KEYWORD_SUMMARY_MODEL_DIR}"
+    mkdir -p "${REMOTE_PATH}/models" "${REMOTE_REPOS_PATH}" "${REMOTE_GITNEXUS_DATA_PATH}" "${REMOTE_LBDB_PATH}"
     if [ -f "${REMOTE_PATH}/repos.json" ]; then cp "${REMOTE_PATH}/repos.json" "${REMOTE_PATH}/repos.json.bak"; fi
     if [ -f "${REMOTE_REPOS_PATH}/repos.json" ]; then cp "${REMOTE_REPOS_PATH}/repos.json" "${REMOTE_REPOS_PATH}/repos.json.bak"; fi
     if [ -f "${REMOTE_GITNEXUS_DATA_PATH}/registry.json" ]; then cp "${REMOTE_GITNEXUS_DATA_PATH}/registry.json" "${REMOTE_PATH}/registry.json.bak"; fi
-
-    if [ ! -f "${KEYWORD_SUMMARY_MODEL_PATH}" ]; then
-        echo "WARN: keyword summary model file is missing at ${KEYWORD_SUMMARY_MODEL_PATH}; GitNexus will fall back to raw embedding text if the summary service cannot start."
-    fi
 
     echo "Neo4j 模式不再备份 LadybugDB 索引 meta.json"
 EOF
@@ -168,6 +167,8 @@ ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
     docker rm "${IMAGE_NAME}" 2>/dev/null || true
     docker stop -t 30 "${KEYWORD_SUMMARY_CONTAINER}" 2>/dev/null || true
     docker rm "${KEYWORD_SUMMARY_CONTAINER}" 2>/dev/null || true
+
+    echo "使用远程 keyword summary 服务: ${GITNEXUS_KEYWORD_SUMMARY_URL}"
 
     echo "启动 GitNexus + Zoekt (docker compose)..."
     docker compose --env-file .env -f docker-compose.yml up -d gitnexus-mcp-proxy

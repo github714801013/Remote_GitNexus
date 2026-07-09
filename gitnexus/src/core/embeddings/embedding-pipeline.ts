@@ -18,6 +18,7 @@ import {
   isEmbedderReady,
 } from './embedder.js';
 import { generateEmbeddingText } from './text-generator.js';
+import { getKeywordSummaryHashSalt } from './keyword-summary.js';
 import { chunkNode, characterChunk } from './chunker.js';
 import { extractStructuralNames } from './structural-extractor.js';
 import {
@@ -100,7 +101,13 @@ export const contentHashForNode = (
     node.content,
     config,
   );
-  return createHash('sha1').update(EMBEDDING_TEXT_VERSION).update('\n').update(text).digest('hex');
+  return createHash('sha1')
+    .update(EMBEDDING_TEXT_VERSION)
+    .update('\n')
+    .update(getKeywordSummaryHashSalt())
+    .update('\n')
+    .update(text)
+    .digest('hex');
 };
 
 /**

@@ -5,6 +5,7 @@ FROM ubuntu:24.04
 
 # 避免交互式提示
 ENV DEBIAN_FRONTEND=noninteractive
+ARG NODE_VERSION=22.22.1
 
 # 1. 配置 Ubuntu 镜像并安装核心工具与 Node.js 22
 RUN if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
@@ -20,6 +21,7 @@ RUN if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
     ca-certificates \
     cron \
     tzdata \
+    xz-utils \
     python3 \
     git \
     ruby-full \
@@ -29,13 +31,32 @@ RUN if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
     libgomp1 \
     util-linux \
     && gem install cocoapods -N \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
     && git config --global user.email "gitnexus@example.com" \
     && git config --global user.name "GitNexus Builder" \
     && git config --global --add safe.directory "*" \
     && ln -s /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "${arch}" in \
+      amd64) node_arch="x64" ;; \
+      arm64) node_arch="arm64" ;; \
+      *) echo "Unsupported architecture: ${arch}" >&2; exit 1 ;; \
+    esac; \
+    node_dist="node-v${NODE_VERSION}-linux-${node_arch}"; \
+    node_tar="/tmp/${node_dist}.tar.xz"; \
+    for base_url in "https://npmmirror.com/mirrors/node" "https://nodejs.org/dist"; do \
+      if curl -fSL --retry 5 --retry-delay 3 --connect-timeout 20 \
+        "${base_url}/v${NODE_VERSION}/${node_dist}.tar.xz" -o "${node_tar}"; then \
+        break; \
+      fi; \
+    done; \
+    test -s "${node_tar}"; \
+    tar -xJf "${node_tar}" -C /usr/local --strip-components=1; \
+    rm -f "${node_tar}"; \
+    node --version; \
+    npm --version
 
 # 设置 npm 全局配置以增加稳定性
 RUN npm config set fetch-retry-maxtimeout 600000 && \

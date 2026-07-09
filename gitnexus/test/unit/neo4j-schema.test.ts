@@ -41,6 +41,12 @@ describe('Neo4j schema statements', () => {
     expect(statements.indexes).toContain(
       'CREATE FULLTEXT INDEX file_fts IF NOT EXISTS FOR (n:`File`) ON EACH [n.name, n.filePath, n.content]',
     );
+    expect(statements.indexes).toContain(
+      'CREATE FULLTEXT INDEX function_fts IF NOT EXISTS FOR (n:`Function`) ON EACH [n.name, n.content, n.description]',
+    );
+    expect(statements.indexes).toContain(
+      'CREATE FULLTEXT INDEX method_fts IF NOT EXISTS FOR (n:`Method`) ON EACH [n.name, n.content, n.description]',
+    );
   });
 
   it('creates the CodeEmbedding constraint and vector index', async () => {

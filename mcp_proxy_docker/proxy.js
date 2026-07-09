@@ -1,5 +1,9 @@
 const http = require('http');
-const handler = require('/usr/lib/node_modules/serve/node_modules/serve-handler');
+const { execFileSync } = require('child_process');
+const path = require('path');
+
+const npmRoot = execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim();
+const handler = require(path.join(npmRoot, 'serve', 'node_modules', 'serve-handler'));
 
 const server = http.createServer((req, res) => {
   // Route /api requests to the backend API server on port 1347

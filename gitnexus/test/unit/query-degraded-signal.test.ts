@@ -146,6 +146,27 @@ describe('query: degraded-enrichment signal', () => {
     expect(result.warning).toMatch(/Semantic vector search timed out after 1ms/i);
   });
 
+  it('does not time out semantic search when GITNEXUS_QUERY_SEMANTIC_TIMEOUT_MS is 0', async () => {
+    vi.stubEnv('GITNEXUS_QUERY_SEMANTIC_TIMEOUT_MS', '0');
+    const b = makeBackend(true);
+    (b.backend as any).semanticSearch = vi.fn(async () => [
+      {
+        id: 'semantic:x',
+        nodeId: 'semantic:x',
+        name: 'semanticX',
+        type: 'Function',
+        filePath: 'src/semantic.ts',
+        score: 1,
+      },
+    ]);
+    executeParameterizedMock.mockResolvedValue([]);
+
+    const result = await runQuery(b);
+
+    expect(result.warning ?? '').not.toMatch(/Semantic vector search timed out/i);
+    expect((b.backend as any).semanticSearch).toHaveBeenCalled();
+  });
+
   it('warns when a CJK query hits a server resolving segmentation to none (#2331)', async () => {
     const b = makeBackend(true);
     executeParameterizedMock.mockResolvedValue([]);

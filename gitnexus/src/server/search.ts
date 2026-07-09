@@ -278,7 +278,9 @@ export const runNeo4jEmbeddingRepair = async (
   repoPath?: string,
 ): Promise<number> => {
   const { contentHashForNode } = await import('../core/embeddings/embedding-pipeline.js');
+  const { shouldSummarizeNode } = await import('../core/embeddings/keyword-summary.js');
   const { embedBatch, embeddingToArray } = await import('../core/embeddings/embedder.js');
+  const { buildNeo4jEmbeddingText } = await import('./neo4j-embedding-text.js');
   const {
     countEmbeddings,
     deleteEmbeddingsForNodes,
@@ -313,6 +315,10 @@ export const runNeo4jEmbeddingRepair = async (
       staleNodeIds.push(node.id);
       return true;
     }
+    if (shouldSummarizeNode(node) && !existing.hasSummaryText) {
+      staleNodeIds.push(node.id);
+      return true;
+    }
     return false;
   });
 
@@ -324,27 +330,34 @@ export const runNeo4jEmbeddingRepair = async (
   let processed = 0;
   for (let i = 0; i < nodesToEmbed.length; i += BATCH_SIZE) {
     const batch = nodesToEmbed.slice(i, i + BATCH_SIZE);
-    const texts = batch.map((node) => node.content?.trim() || `${node.label} ${node.name}`);
+    const embeddingInputs = await Promise.all(
+      batch.map(async (node) => {
+        const contentHash = contentHashForNode(node);
+        const { embeddingText, summaryText } = await buildNeo4jEmbeddingText(node, contentHash);
+        return { node, contentHash, embeddingText, summaryText };
+      }),
+    );
+    const texts = embeddingInputs.map((input) => input.embeddingText);
     const vectors = await embedBatch(texts);
     await upsertEmbeddings(
       repoName,
-      batch.map((node, index) => ({
+      embeddingInputs.map(({ node, contentHash, summaryText }, index) => ({
         nodeId: node.id,
         chunkIndex: 0,
         startLine: node.startLine ?? 0,
         endLine: node.endLine ?? node.startLine ?? 0,
         embedding: embeddingToArray(vectors[index]),
-        contentHash: contentHashForNode(node),
-        summaryText: node.description,
+        contentHash,
+        summaryText,
       })),
     );
 
-    const descriptionUpdates = batch
-      .filter((node) => node.description?.trim())
-      .map((node) => ({
+    const descriptionUpdates = embeddingInputs
+      .filter((input) => input.summaryText?.trim())
+      .map(({ node, summaryText }) => ({
         nodeId: node.id,
         label: node.label,
-        description: node.description!,
+        description: summaryText!,
       }));
     await updateNodeDescriptions(repoName, descriptionUpdates);
 

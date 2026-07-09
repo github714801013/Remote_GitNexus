@@ -65,6 +65,18 @@ import {
 } from './git-clone.js';
 import { WebhookAnalyzeQueue, WebhookStartStaggerGate } from './webhook-analyze-queue.js';
 import { ResourceAwareConcurrencyController } from './resource-aware-concurrency.js';
+import { waitForJobManagerIdle } from './analyze-job-wait.js';
+import {
+  isAnalysisAlreadyInProgressError,
+  isJsonBodyParseError,
+  isRepoAlreadyActiveError,
+} from './error-classification.js';
+import { getKeywordSummaryHashSalt } from '../core/embeddings/keyword-summary.js';
+export {
+  isAnalysisAlreadyInProgressError,
+  isJsonBodyParseError,
+  isRepoAlreadyActiveError,
+} from './error-classification.js';
 import { checkStaleness, type StalenessInfo } from '../core/git-staleness.js';
 import {
   WebhookWorktreeError,
@@ -97,7 +109,6 @@ const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
 const DEFAULT_WEBHOOK_ANALYZE_CONCURRENCY = 1;
 const PROJECT_DISCOVERY_MAX_DEPTH = 4;
-const REPO_ALREADY_ACTIVE_MESSAGE = 'Another job is already active for this repository';
 const EMBEDDING_STATUS_COMPLETE = 'complete';
 const EMBEDDING_STATUS_FAILED = 'failed';
 const EMBEDDING_STATUS_RUNNING = 'running';
@@ -110,12 +121,6 @@ const envFlagEnabled = (value: string | undefined, defaultValue: boolean): boole
   if (value === undefined) return defaultValue;
   return !['0', 'false', 'no', 'off'].includes(value.trim().toLowerCase());
 };
-
-export const isRepoAlreadyActiveError = (err: unknown): boolean =>
-  String(err instanceof Error ? err.message : err).includes(REPO_ALREADY_ACTIVE_MESSAGE);
-
-export const isAnalysisAlreadyInProgressError = (err: unknown): boolean =>
-  String(err instanceof Error ? err.message : err).includes('Analysis already in progress');
 
 export const isRepairableIndexError = (err: unknown): boolean => {
   const msg = String(err instanceof Error ? err.message : err).toLowerCase();
@@ -143,16 +148,21 @@ const isEmbeddingRunningStale = (indexedAt?: string): boolean => {
   return !Number.isFinite(ts) || Date.now() - ts > readEmbeddingRunningTimeoutMs();
 };
 
+const shouldRepairExistingEmbeddingsForKeywordSummary = (): boolean =>
+  envFlagEnabled(process.env.GITNEXUS_KEYWORD_SUMMARY_REPAIR_EXISTING_EMBEDDINGS, false);
+
 export const shouldScheduleStartupEmbeddings = (
   meta:
     | {
         embeddingStatus?: EmbeddingStatus;
         indexedAt?: string;
         stats?: { nodes?: number; embeddings?: number };
+        keywordSummaryHashSalt?: string;
       }
     | null
     | undefined,
   actualEmbeddings?: number,
+  expectedKeywordSummaryHashSalt = getKeywordSummaryHashSalt(),
 ): boolean => {
   const nodes = meta?.stats?.nodes ?? 0;
   const embeddings = actualEmbeddings ?? meta?.stats?.embeddings ?? 0;
@@ -160,7 +170,12 @@ export const shouldScheduleStartupEmbeddings = (
     meta?.embeddingStatus === EMBEDDING_STATUS_RUNNING
       ? isEmbeddingRunningStale(meta?.indexedAt)
       : meta?.embeddingStatus !== undefined && meta.embeddingStatus !== EMBEDDING_STATUS_COMPLETE;
-  return nodes > 0 && (embeddings <= 0 || embeddingIncomplete);
+  const keywordSummaryChanged =
+    shouldRepairExistingEmbeddingsForKeywordSummary() &&
+    embeddings > 0 &&
+    meta?.embeddingStatus !== EMBEDDING_STATUS_RUNNING &&
+    meta?.keywordSummaryHashSalt !== expectedKeywordSummaryHashSalt;
+  return nodes > 0 && (embeddings <= 0 || embeddingIncomplete || keywordSummaryChanged);
 };
 
 export const shouldScheduleStartupIncrementalAnalyze = (
@@ -1166,6 +1181,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         try {
           await beforeAnalyze?.();
           await ensureCocoaPodsDependencies(repoPath);
+          await waitForJobManagerIdle(jobManager);
           job = startAnalyzeForPath(repoPath, params, true);
           releaseProgressListener = jobManager.onProgress(job.id, (progress) => {
             if (progress.phase === 'embeddings' && progress.percent >= 90) {
@@ -1223,6 +1239,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             branch: options.registryBranch ?? latestMeta?.branch ?? entry.branch,
             remoteUrl: latestMeta?.remoteUrl ?? entry.remoteUrl,
             embeddingStatus,
+            keywordSummaryHashSalt: getKeywordSummaryHashSalt(),
             stats,
           };
           await saveMeta(entry.storagePath, meta);
@@ -1399,6 +1416,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               allowDuplicateName: true,
             });
             queued.done.catch((analyzeErr) => {
+              if (isAnalysisAlreadyInProgressError(analyzeErr)) {
+                logger.debug(
+                  { repo: entry.name },
+                  'index repair skipped: analysis already in progress',
+                );
+                return;
+              }
               logger.error({ err: analyzeErr, repo: entry.name }, 'index repair failed');
             });
             continue;
@@ -1415,6 +1439,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             allowDuplicateName: true,
           });
           queued.done.catch((err) => {
+            if (isAnalysisAlreadyInProgressError(err)) {
+              logger.debug(
+                { repo: entry.name },
+                'stale index refresh skipped: analysis already in progress',
+              );
+              return;
+            }
             logger.error({ err, repo: entry.name }, 'stale index refresh failed');
           });
           continue;
@@ -2221,6 +2252,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         },
       );
       queued.done.catch((err) => {
+        if (isAnalysisAlreadyInProgressError(err)) {
+          logger.debug(
+            { repo: repo.fullName },
+            'gitea webhook analyze skipped: analysis already in progress',
+          );
+          return;
+        }
         logger.error({ err, repo: repo.fullName }, 'gitea webhook analyze failed');
       });
       res.status(202).json({
@@ -2286,6 +2324,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         registryBranch: sourceBranch,
       });
       queued.done.catch((err) => {
+        if (isAnalysisAlreadyInProgressError(err)) {
+          logger.debug(
+            { repo: registryName },
+            'worktree webhook analyze skipped: analysis already in progress',
+          );
+          return;
+        }
         logger.error({ err, repo: registryName }, 'worktree webhook analyze failed');
       });
       res.status(202).json({
@@ -2522,19 +2567,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           progress: { phase: 'analyzing', percent: 0, message: 'Starting embedding generation...' },
         });
 
-        // 30-minute timeout for embedding jobs (same as analyze jobs)
-        const EMBED_TIMEOUT_MS = 30 * 60 * 1000;
-        const embedTimeout = setTimeout(() => {
-          const current = embedJobManager.getJob(job.id);
-          if (current && current.status !== 'complete' && current.status !== 'failed') {
-            releaseRepoLock(repoLockPath);
-            embedJobManager.updateJob(job.id, {
-              status: 'failed',
-              error: 'Embedding timed out (30 minute limit)',
-            });
-          }
-        }, EMBED_TIMEOUT_MS);
-
         // Run embedding pipeline asynchronously
         (async () => {
           try {
@@ -2592,7 +2624,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               });
             }
 
-            clearTimeout(embedTimeout);
             releaseRepoLock(repoLockPath);
             // Don't overwrite 'failed' if the job was cancelled while the pipeline was running
             const current = embedJobManager.getJob(job.id);
@@ -2600,7 +2631,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               embedJobManager.updateJob(job.id, { status: 'complete' });
             }
           } catch (err: any) {
-            clearTimeout(embedTimeout);
             releaseRepoLock(repoLockPath);
             const current = embedJobManager.getJob(job.id);
             if (!current || current.status !== 'failed') {
@@ -2673,6 +2703,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   // Global error handler — catch anything the route handlers miss
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (isJsonBodyParseError(err)) {
+      logger.debug({ err }, 'Malformed JSON request body');
+      res.status(400).json({ error: 'Malformed JSON request body' });
+      return;
+    }
     logger.error({ err }, 'Unhandled error:');
     res.status(500).json({ error: 'Internal server error' });
   });

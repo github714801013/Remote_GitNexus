@@ -13,7 +13,7 @@
 
 import { CircuitOpenError, ResilientFetchExhaustedError, resilientFetch } from 'gitnexus-shared';
 
-const HTTP_TIMEOUT_MS = 30_000;
+const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 const HTTP_MAX_RETRIES = 2;
 const HTTP_RETRY_BACKOFF_MS = 1_000;
 const HTTP_BATCH_SIZE = 64;
@@ -56,6 +56,14 @@ const readConfig = (): HttpConfig | null => {
     apiKey: process.env.GITNEXUS_EMBEDDING_API_KEY ?? 'unused',
     dimensions,
   };
+};
+
+const readHttpTimeoutMs = (): number => {
+  const raw =
+    process.env.GITNEXUS_EMBEDDING_REQUEST_TIMEOUT_MS ?? process.env.GITNEXUS_EMBEDDING_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_HTTP_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_HTTP_TIMEOUT_MS;
 };
 
 /**
@@ -121,12 +129,13 @@ const httpEmbedBatch = async (
   }
 
   let resp: Response;
+  const timeoutMs = readHttpTimeoutMs();
   try {
     resp = await resilientFetch(
       url,
       {
         method: 'POST',
-        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+        signal: AbortSignal.timeout(timeoutMs),
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`,
@@ -146,7 +155,7 @@ const httpEmbedBatch = async (
     }
     if (err instanceof DOMException && err.name === 'TimeoutError') {
       throw new Error(
-        `Embedding request timed out after ${HTTP_TIMEOUT_MS}ms (${safeUrl(url)}, batch ${batchIndex})`,
+        `Embedding request timed out after ${timeoutMs}ms (${safeUrl(url)}, batch ${batchIndex})`,
       );
     }
     if (err instanceof ResilientFetchExhaustedError) {

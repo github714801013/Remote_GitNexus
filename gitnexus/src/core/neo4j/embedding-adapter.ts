@@ -11,7 +11,10 @@ import neo4j from 'neo4j-driver';
 import { withNeo4jSession } from './driver.js';
 import { applyNeo4jSchema } from './graph-loader.js';
 
-export type ExistingEmbeddingHashes = Map<string, { contentHash: string; chunkCount: number }>;
+export type ExistingEmbeddingHashes = Map<
+  string,
+  { contentHash: string; chunkCount: number; hasSummaryText: boolean }
+>;
 
 export interface Neo4jEmbeddingInput {
   nodeId: string;
@@ -98,7 +101,7 @@ export const fetchExistingEmbeddingHashes = async (
   return await withNeo4jSession(async (session) => {
     return await session.executeRead(async (tx) => {
       const result = await tx.run(
-        `MATCH (e:\`${EMBEDDING_TABLE_NAME}\` {repoId: $repoId}) RETURN e.nodeId AS nodeId, head(collect(e.contentHash)) AS contentHash, count(e) AS chunkCount`,
+        `MATCH (e:\`${EMBEDDING_TABLE_NAME}\` {repoId: $repoId}) RETURN e.nodeId AS nodeId, head(collect(e.contentHash)) AS contentHash, count(e) AS chunkCount, any(summary IN collect(e.summaryText) WHERE coalesce(summary, '') <> '') AS hasSummaryText`,
         { repoId },
       );
       const hashes: ExistingEmbeddingHashes = new Map();
@@ -108,6 +111,7 @@ export const fetchExistingEmbeddingHashes = async (
         hashes.set(nodeId, {
           contentHash: String(recordGet(record, 'contentHash') ?? ''),
           chunkCount: toNumber(recordGet(record, 'chunkCount'), 0),
+          hasSummaryText: Boolean(recordGet(record, 'hasSummaryText')),
         });
       }
       return hashes;
