@@ -250,6 +250,30 @@ describe('resolveLLMConfig', () => {
     expect(config.baseUrl).toBe('https://openrouter.ai/api/v1');
   });
 
+  it('uses dedicated Wiki LLM environment variables', async () => {
+    process.env.GITNEXUS_WIKI_LLM_PROVIDER = 'custom';
+    process.env.GITNEXUS_WIKI_LLM_URL = 'http://wiki-llm.example.com';
+    process.env.GITNEXUS_WIKI_LLM_MODEL = 'wiki-model';
+    process.env.GITNEXUS_WIKI_LLM_API_KEY = 'wiki-key';
+
+    vi.doMock('../../src/storage/repo-manager.js', () => ({
+      loadCLIConfig: vi.fn().mockResolvedValue({}),
+    }));
+
+    const { resolveLLMConfig } = await import('../../src/core/wiki/llm-client.js');
+    const config = await resolveLLMConfig();
+
+    expect(config.provider).toBe('custom');
+    expect(config.baseUrl).toBe('http://wiki-llm.example.com');
+    expect(config.model).toBe('wiki-model');
+    expect(config.apiKey).toBe('wiki-key');
+
+    delete process.env.GITNEXUS_WIKI_LLM_PROVIDER;
+    delete process.env.GITNEXUS_WIKI_LLM_URL;
+    delete process.env.GITNEXUS_WIKI_LLM_MODEL;
+    delete process.env.GITNEXUS_WIKI_LLM_API_KEY;
+  });
+
   it('CLI overrides take priority over saved config', async () => {
     vi.doMock('../../src/storage/repo-manager.js', () => ({
       loadCLIConfig: vi.fn().mockResolvedValue({

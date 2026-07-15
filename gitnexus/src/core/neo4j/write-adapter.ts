@@ -26,6 +26,11 @@ const CODE_NODE_LABEL = 'CodeNode';
 const WRITE_BATCH_SIZE = 500;
 const CLEAR_REPO_LABELS = [...NODE_TABLES, CODE_NODE_LABEL, EMBEDDING_TABLE_NAME] as const;
 
+export interface ClearRepoIndexOptions {
+  /** Keep existing vectors so unchanged nodes can be re-linked after a graph rebuild. */
+  preserveEmbeddings?: boolean;
+}
+
 const checkedNodeLabel = (label: string): NodeTableName => {
   if (!NODE_LABELS.has(label)) {
     throw new Error(`Unsupported Neo4j node label: ${label}`);
@@ -70,9 +75,15 @@ const asNumber = (value: unknown): number => {
   return Number(value ?? 0);
 };
 
-export const clearRepoIndex = async (repoId: string): Promise<void> => {
+export const clearRepoIndex = async (
+  repoId: string,
+  options: ClearRepoIndexOptions = {},
+): Promise<void> => {
+  const labels = options.preserveEmbeddings
+    ? CLEAR_REPO_LABELS.filter((label) => label !== EMBEDDING_TABLE_NAME)
+    : CLEAR_REPO_LABELS;
   await withNeo4jSession(async (session) => {
-    for (const label of CLEAR_REPO_LABELS) {
+    for (const label of labels) {
       let deleted = WRITE_BATCH_SIZE;
       while (deleted === WRITE_BATCH_SIZE) {
         deleted = await session.executeWrite(async (tx) => {

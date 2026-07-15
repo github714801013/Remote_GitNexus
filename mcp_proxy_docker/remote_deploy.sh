@@ -26,7 +26,6 @@ read_windows_env() {
 : "${REMOTE_PATH:?REMOTE_PATH environment variable is required}"
 : "${REMOTE_REPOS_PATH:?REMOTE_REPOS_PATH environment variable is required}"
 : "${REMOTE_GITNEXUS_DATA_PATH:?REMOTE_GITNEXUS_DATA_PATH environment variable is required}"
-: "${REMOTE_LBDB_PATH:?REMOTE_LBDB_PATH environment variable is required}"
 : "${REGISTRY_HOST:?REGISTRY_HOST environment variable is required}"
 : "${REGISTRY_PORT:?REGISTRY_PORT environment variable is required}"
 : "${REGISTRY_NAMESPACE:?REGISTRY_NAMESPACE environment variable is required}"
@@ -68,6 +67,12 @@ GITNEXUS_KEYWORD_SUMMARY_URL="${KEYWORD_SUMMARY_EXTERNAL_URL}"
 export GITNEXUS_KEYWORD_SUMMARY_MODEL="${GITNEXUS_KEYWORD_SUMMARY_MODEL:-qwen3.6-35b-carnice}"
 export GITNEXUS_KEYWORD_SUMMARY_API_KEY="${GITNEXUS_KEYWORD_SUMMARY_API_KEY:-}"
 : "${GITNEXUS_KEYWORD_SUMMARY_API_KEY:?GITNEXUS_KEYWORD_SUMMARY_API_KEY environment variable is required}"
+export GITNEXUS_WIKI_LLM_PROVIDER="${GITNEXUS_WIKI_LLM_PROVIDER:-custom}"
+export GITNEXUS_WIKI_LLM_URL="${GITNEXUS_WIKI_LLM_URL:-${GITNEXUS_KEYWORD_SUMMARY_URL}}"
+export GITNEXUS_WIKI_LLM_MODEL="${GITNEXUS_WIKI_LLM_MODEL:-${GITNEXUS_KEYWORD_SUMMARY_MODEL}}"
+export GITNEXUS_WIKI_LLM_API_KEY="${GITNEXUS_WIKI_LLM_API_KEY:-${GITNEXUS_KEYWORD_SUMMARY_API_KEY}}"
+: "${GITNEXUS_WIKI_LLM_URL:?GITNEXUS_WIKI_LLM_URL or GITNEXUS_KEYWORD_SUMMARY_URL environment variable is required}"
+: "${GITNEXUS_WIKI_LLM_API_KEY:?GITNEXUS_WIKI_LLM_API_KEY or GITNEXUS_KEYWORD_SUMMARY_API_KEY environment variable is required}"
 : "${GITNEXUS_EMBEDDING_URL:?GITNEXUS_EMBEDDING_URL environment variable is required}"
 : "${GITNEXUS_INDEX_EMBEDDING_URL:?GITNEXUS_INDEX_EMBEDDING_URL environment variable is required}"
 : "${GITNEXUS_NEO4J_PASSWORD:?GITNEXUS_NEO4J_PASSWORD environment variable is required}"
@@ -79,7 +84,6 @@ write_remote_env() {
         echo "REMOTE_PATH=${REMOTE_PATH}"
         echo "REMOTE_REPOS_PATH=${REMOTE_REPOS_PATH}"
         echo "REMOTE_GITNEXUS_DATA_PATH=${REMOTE_GITNEXUS_DATA_PATH}"
-        echo "REMOTE_LBDB_PATH=${REMOTE_LBDB_PATH}"
         echo "GITEA_TOKEN=${GITEA_TOKEN}"
         echo "GITNEXUS_EMBEDDING_URL=${GITNEXUS_EMBEDDING_URL}"
         echo "GITNEXUS_INDEX_EMBEDDING_URL=${GITNEXUS_INDEX_EMBEDDING_URL}"
@@ -90,6 +94,10 @@ write_remote_env() {
         echo "GITNEXUS_KEYWORD_SUMMARY_API_KEY=${GITNEXUS_KEYWORD_SUMMARY_API_KEY}"
         echo "GITNEXUS_KEYWORD_SUMMARY_MAX_TOKENS=${GITNEXUS_KEYWORD_SUMMARY_MAX_TOKENS:-512}"
         echo "GITNEXUS_KEYWORD_SUMMARY_ENABLED=true"
+        echo "GITNEXUS_WIKI_LLM_PROVIDER=${GITNEXUS_WIKI_LLM_PROVIDER}"
+        echo "GITNEXUS_WIKI_LLM_URL=${GITNEXUS_WIKI_LLM_URL}"
+        echo "GITNEXUS_WIKI_LLM_MODEL=${GITNEXUS_WIKI_LLM_MODEL}"
+        echo "GITNEXUS_WIKI_LLM_API_KEY=${GITNEXUS_WIKI_LLM_API_KEY}"
         echo "GITNEXUS_NEO4J_USER=${GITNEXUS_NEO4J_USER:-neo4j}"
         echo "GITNEXUS_NEO4J_PASSWORD=${GITNEXUS_NEO4J_PASSWORD}"
         echo "HOST_ZOEKT_PORT=${HOST_ZOEKT_PORT:-6070}"
@@ -133,7 +141,7 @@ echo "=== 步骤 3: 传输镜像和配置到远端 ==="
 write_remote_env
 ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
     set -e
-    mkdir -p "${REMOTE_PATH}/models" "${REMOTE_REPOS_PATH}" "${REMOTE_GITNEXUS_DATA_PATH}" "${REMOTE_LBDB_PATH}"
+    mkdir -p "${REMOTE_PATH}/models" "${REMOTE_REPOS_PATH}" "${REMOTE_GITNEXUS_DATA_PATH}"
     if [ -f "${REMOTE_PATH}/repos.json" ]; then cp "${REMOTE_PATH}/repos.json" "${REMOTE_PATH}/repos.json.bak"; fi
     if [ -f "${REMOTE_REPOS_PATH}/repos.json" ]; then cp "${REMOTE_REPOS_PATH}/repos.json" "${REMOTE_REPOS_PATH}/repos.json.bak"; fi
     if [ -f "${REMOTE_GITNEXUS_DATA_PATH}/registry.json" ]; then cp "${REMOTE_GITNEXUS_DATA_PATH}/registry.json" "${REMOTE_PATH}/registry.json.bak"; fi
@@ -171,7 +179,7 @@ ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
     echo "使用远程 keyword summary 服务: ${GITNEXUS_KEYWORD_SUMMARY_URL}"
 
     echo "启动 GitNexus + Zoekt (docker compose)..."
-    docker compose --env-file .env -f docker-compose.yml up -d gitnexus-mcp-proxy
+    docker compose --env-file .env -f docker-compose.yml up -d --force-recreate gitnexus-mcp-proxy
 
     echo "--- 执行自动验证 ---"
     python3 auto_verify.py

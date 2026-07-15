@@ -82,4 +82,26 @@ describe('Neo4j graph loader', () => {
     ]);
     expect(stats).toEqual({ nodes: 2, edges: 1 });
   });
+
+  it('preserves and re-links existing embeddings during a graph rebuild', async () => {
+    const graph = createKnowledgeGraph();
+    graph.addNode({
+      id: 'Function:a',
+      label: 'Function',
+      properties: { name: 'a', filePath: 'src/a.ts' },
+    });
+
+    const { loadGraphToNeo4j } = await import('../../src/core/neo4j/graph-loader.js');
+    await loadGraphToNeo4j('repo-a', graph, { preserveEmbeddings: true });
+
+    expect(clearRepoIndex).toHaveBeenCalledWith('repo-a', { preserveEmbeddings: true });
+    expect(txRun).toHaveBeenCalledWith(
+      'MATCH (e:CodeEmbedding {repoId: $repoId}) MATCH (n:CodeNode {repoId: $repoId, id: e.nodeId}) MERGE (e)-[:EMBEDS]->(n)',
+      { repoId: 'repo-a' },
+    );
+    expect(txRun).toHaveBeenCalledWith(
+      'MATCH (e:CodeEmbedding {repoId: $repoId}) WHERE NOT (e)-[:EMBEDS]->() DETACH DELETE e',
+      { repoId: 'repo-a' },
+    );
+  });
 });

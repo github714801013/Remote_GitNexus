@@ -30,6 +30,7 @@ RUN if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
     build-essential \
     libgomp1 \
     util-linux \
+    ripgrep \
     && gem install cocoapods -N \
     && git config --global user.email "gitnexus@example.com" \
     && git config --global user.name "GitNexus Builder" \

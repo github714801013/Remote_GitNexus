@@ -109,6 +109,7 @@ import { generateAIContextFiles } from '../cli/ai-context.js';
 import { sanitizeDetectedBranch } from '../cli/analyze-config.js';
 import { EMBEDDING_TABLE_NAME } from './lbug/schema.js';
 import { STALE_HASH_SENTINEL } from './lbug/schema.js';
+import { isNeo4jBackendEnabled } from './neo4j/config.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -397,6 +398,33 @@ export const collectBranchCacheKeys = async (
   return { keys, complete };
 };
 
+const persistParseCaches = async (
+  storagePath: string,
+  metaDir: string,
+  parseCache: Awaited<ReturnType<typeof loadParseCache>>,
+  log: (message: string) => void,
+): Promise<void> => {
+  try {
+    const { keys: siblingKeys, complete } = await collectBranchCacheKeys(storagePath, metaDir);
+    if (complete) {
+      for (const key of siblingKeys) parseCache.usedKeys.add(key);
+    } else {
+      log('Parse cache: a branch meta was unreadable — retaining all cached chunks (#2106).');
+      for (const key of parseCache.entries.keys()) parseCache.usedKeys.add(key);
+    }
+    const pruned = pruneCache(parseCache, parseCache.usedKeys);
+    if (pruned > 0) log(`Parse cache: pruned ${pruned} stale chunk entries`);
+    const savedKeys = await saveParseCache(storagePath, parseCache);
+    await pruneAndSaveDurableParsedFileStore(
+      getDurableParsedFileDir(storagePath),
+      PARSE_CACHE_VERSION,
+      new Set(savedKeys),
+    );
+  } catch (err) {
+    log(`Warning: could not save parse cache (${(err as Error).message}); continuing.`);
+  }
+};
+
 /**
  * Resolve the requested `--pdg` configuration to the shape recorded in
  * `RepoMeta.pdg`, or `undefined` for a pdg-off run. Caps resolve to their
@@ -630,9 +658,29 @@ export async function runFullAnalysis(
   }
 
   const existingMeta = await loadMeta(metaDir);
+  const neo4jBackendEnabled = isNeo4jBackendEnabled();
+  const projectNameInitial =
+    options.registryName ??
+    getInferredRepoName(repoPath) ??
+    path.basename(resolveRepoIdentityRoot(repoPath));
+
+  let canReturnAlreadyUpToDate = true;
+  if (neo4jBackendEnabled) {
+    try {
+      const { countRepoGraphNodes } = await import('./neo4j/graph-loader.js');
+      canReturnAlreadyUpToDate = (await countRepoGraphNodes(projectNameInitial)) > 0;
+    } catch {
+      canReturnAlreadyUpToDate = false;
+    }
+  }
 
   // ── FTS-only repair path ────────────────────────────────────────────
   if (options.repairFts) {
+    if (neo4jBackendEnabled) {
+      throw new Error(
+        'Neo4j backend does not use LadybugDB FTS repair. Neo4j full-text indexes are managed during analysis.',
+      );
+    }
     if (!existingMeta) {
       throw new Error(
         'Cannot repair FTS indexes because this repository has not been analyzed yet. ' +
@@ -797,7 +845,12 @@ export async function runFullAnalysis(
   }
 
   // ── Early-return: already up to date ──────────────────────────────
-  if (existingMeta && !options.force && existingMeta.lastCommit === currentCommit) {
+  if (
+    canReturnAlreadyUpToDate &&
+    existingMeta &&
+    !options.force &&
+    existingMeta.lastCommit === currentCommit
+  ) {
     // Non-git folders have currentCommit = '' — always rebuild since we can't detect changes
     if (currentCommit !== '') {
       // For git repos, even if HEAD matches lastCommit, the working tree
@@ -961,7 +1014,7 @@ export async function runFullAnalysis(
   // silently dropping embeddings on a mispredicted run. The re-insert
   // step gates itself on the actual `isIncremental` value to avoid
   // PK-conflicts when the incremental writeback path keeps the rows.
-  if (shouldLoadCache && existingMeta) {
+  if (!neo4jBackendEnabled && shouldLoadCache && existingMeta) {
     try {
       progress('embeddings', 0, 'Caching embeddings...');
       await initLbug(lbugPath);
@@ -1029,6 +1082,159 @@ export async function runFullAnalysis(
       fetchWrappers: options.fetchWrappers,
     },
   );
+
+  if (neo4jBackendEnabled) {
+    const { runNeo4jEmbeddingRepair } = await import('../server/search.js');
+    const { countEmbeddings } = await import('./neo4j/embedding-adapter.js');
+    const { loadGraphToNeo4j } = await import('./neo4j/graph-loader.js');
+    const existingNeo4jEmbeddingCount = await countEmbeddings(projectNameInitial).catch(() => 0);
+
+    progress('lbug', 60, 'Loading into Neo4j...');
+    const graphStats = await loadGraphToNeo4j(projectNameInitial, pipelineResult.graph, {
+      preserveEmbeddings: !options.dropEmbeddings,
+    });
+
+    const { skipForCap, nodeLimit } = deriveEmbeddingCap(
+      graphStats.nodes,
+      options.embeddingsNodeLimit,
+    );
+    const shouldRepairEmbeddings =
+      !options.dropEmbeddings &&
+      (shouldGenerateEmbeddings ||
+        existingNeo4jEmbeddingCount > 0 ||
+        (existingMeta?.stats?.embeddings ?? 0) > 0);
+    let embeddingCount = await countEmbeddings(projectNameInitial);
+
+    if (shouldRepairEmbeddings && !skipForCap) {
+      progress('embeddings', 90, 'Connecting to embedding endpoint...');
+      await runNeo4jEmbeddingRepair(
+        projectNameInitial,
+        (embeddingProgress) => {
+          const scaled = 90 + Math.round((embeddingProgress.percent / 100) * 8);
+          const detail =
+            embeddingProgress.nodesProcessed !== undefined
+              ? `Embedding ${embeddingProgress.nodesProcessed}/${embeddingProgress.totalNodes ?? '?'}`
+              : embeddingProgress.phase;
+          progress('embeddings', scaled, detail);
+        },
+        repoPath,
+      );
+      embeddingCount = await countEmbeddings(projectNameInitial);
+    } else if (shouldRepairEmbeddings && skipForCap) {
+      log(
+        `Embeddings skipped: ${graphStats.nodes.toLocaleString()} nodes exceeds the ${nodeLimit.toLocaleString()}-node safety cap.`,
+      );
+    }
+
+    const allFilePaths: string[] = [];
+    pipelineResult.graph.forEachNode((node) => {
+      if (node.label === 'File') {
+        const filePath = node.properties?.filePath as string | undefined;
+        if (filePath) allFilePaths.push(filePath);
+      }
+    });
+    const newFileHashes = await computeFileHashes(repoPath, allFilePaths);
+    const newFileHashesRecord: Record<string, string> = {};
+    for (const [key, value] of newFileHashes) newFileHashesRecord[key] = value;
+    const runtimeCapabilities = await import('./platform/capabilities.js').then((m) =>
+      m.getRuntimeCapabilities(),
+    );
+    const meta = {
+      repoPath,
+      lastCommit: currentCommit,
+      indexedAt: new Date().toISOString(),
+      branch: branchLabel ?? existingMeta?.branch,
+      remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+      stats: {
+        files: pipelineResult.totalFileCount,
+        nodes: graphStats.nodes,
+        edges: graphStats.edges,
+        communities: pipelineResult.communityResult?.stats.totalCommunities,
+        processes: pipelineResult.processResult?.stats.totalProcesses,
+        embeddings: embeddingCount,
+      },
+      capabilities: {
+        graph: { provider: 'neo4j', status: 'available' },
+        fts: { provider: 'neo4j-fulltext', status: 'available' },
+        vectorSearch: {
+          provider: 'neo4j-vector',
+          status: embeddingCount > 0 ? 'vector-index' : 'unavailable',
+          exactScanLimit: runtimeCapabilities.exactScanLimit,
+        },
+      },
+      schemaVersion: hasGitDir(repoPath) ? INCREMENTAL_SCHEMA_VERSION : undefined,
+      cjkSegmentation: getSearchFTSCjkSegmentation(),
+      fileHashes: hasGitDir(repoPath) ? newFileHashesRecord : undefined,
+      cacheKeys: [...parseCache.usedKeys],
+      incrementalInProgress: undefined as { startedAt: number; toWriteCount: number } | undefined,
+      pdg: resolvePdgConfig(options),
+    };
+
+    progress('done', 98, 'Saving metadata...');
+    await saveMeta(metaDir, meta);
+    await persistParseCaches(storagePath, metaDir, parseCache, log);
+    const projectName = await registerRepo(repoPath, meta, {
+      name: options.registryName,
+      allowDuplicateName: options.allowDuplicateName,
+      branch: placement.branch,
+    });
+    if (!placement.branch && branchLabel) {
+      try {
+        await adoptFlatBranchLabel(repoPath, branchLabel);
+      } catch (err) {
+        log(
+          `Warning: could not sync the workspace branch label (${(err as Error).message}); continuing.`,
+        );
+      }
+    }
+    await ensureGitNexusIgnored(repoPath);
+
+    let aggregatedClusterCount = 0;
+    if (pipelineResult.communityResult?.communities) {
+      const groups = new Map<string, number>();
+      for (const community of pipelineResult.communityResult.communities) {
+        const label = community.heuristicLabel || community.label || 'Unknown';
+        groups.set(label, (groups.get(label) || 0) + community.symbolCount);
+      }
+      aggregatedClusterCount = Array.from(groups.values()).filter((count) => count >= 5).length;
+    }
+    if (!placement.branch) {
+      try {
+        await generateAIContextFiles(
+          repoPath,
+          storagePath,
+          projectName,
+          {
+            files: pipelineResult.totalFileCount,
+            nodes: graphStats.nodes,
+            edges: graphStats.edges,
+            communities: pipelineResult.communityResult?.stats.totalCommunities,
+            clusters: aggregatedClusterCount,
+            processes: pipelineResult.processResult?.stats.totalProcesses,
+          },
+          undefined,
+          {
+            skipAgentsMd: options.skipAgentsMd,
+            skipSkills: options.skipSkills,
+            noStats: options.noStats,
+            defaultBranch: options.defaultBranch,
+            hasPdg: options.pdg === true,
+          },
+        );
+      } catch {
+        // AI context files are best-effort and must not invalidate the Neo4j index.
+      }
+    }
+
+    progress('done', 100, 'Done');
+    return {
+      repoName: projectName,
+      repoPath,
+      stats: meta.stats,
+      pipelineResult,
+      isPrimaryBranch: !placement.branch,
+    };
+  }
 
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────
   progress('lbug', 60, 'Loading into LadybugDB...');

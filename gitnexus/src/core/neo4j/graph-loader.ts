@@ -39,12 +39,32 @@ export const countRepoGraphNodes = async (repoId: string): Promise<number> => {
   });
 };
 
+const relinkPreservedEmbeddings = async (repoId: string): Promise<void> => {
+  await withNeo4jSession(async (session) => {
+    await session.executeWrite(async (tx) => {
+      await tx.run(
+        `MATCH (e:CodeEmbedding {repoId: $repoId}) MATCH (n:CodeNode {repoId: $repoId, id: e.nodeId}) MERGE (e)-[:EMBEDS]->(n)`,
+        { repoId },
+      );
+      await tx.run(
+        `MATCH (e:CodeEmbedding {repoId: $repoId}) WHERE NOT (e)-[:EMBEDS]->() DETACH DELETE e`,
+        { repoId },
+      );
+    });
+  });
+};
+
 export const loadGraphToNeo4j = async (
   repoId: string,
   graph: KnowledgeGraph,
+  options: { preserveEmbeddings?: boolean } = {},
 ): Promise<Neo4jGraphLoadStats> => {
   await applyNeo4jSchema();
-  await clearRepoIndex(repoId);
+  if (options.preserveEmbeddings) {
+    await clearRepoIndex(repoId, options);
+  } else {
+    await clearRepoIndex(repoId);
+  }
 
   const nodes = Array.from(graph.iterNodes()).map((node) => ({
     label: node.label,
@@ -64,6 +84,7 @@ export const loadGraphToNeo4j = async (
 
   await upsertNodes(repoId, nodes);
   await upsertRelations(repoId, relationships);
+  if (options.preserveEmbeddings) await relinkPreservedEmbeddings(repoId);
 
   return {
     nodes: nodes.length,
