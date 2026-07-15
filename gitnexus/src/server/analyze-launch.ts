@@ -18,6 +18,7 @@ import { getStoragePath } from '../storage/repo-manager.js';
 import { logger } from '../core/logger.js';
 import type { JobManager } from './analyze-job.js';
 import type { WorkerMessage } from './analyze-worker.js';
+import { buildAnalyzeWorkerExecArgv } from './analyze-worker-options.js';
 
 const _require = createRequire(import.meta.url);
 
@@ -74,7 +75,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
       if (!currentJob || currentJob.status === 'complete' || currentJob.status === 'failed') return;
 
       const child = fork(workerPath, [], {
-        execArgv: [...tsxHookArgs, '--max-old-space-size=8192'],
+        execArgv: buildAnalyzeWorkerExecArgv(tsxHookArgs),
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       });
 

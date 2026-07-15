@@ -51,6 +51,7 @@ import {
   queryNeo4jProcesses,
   runNeo4jEmbeddingRepair,
   searchNeo4jBackend,
+  isNeo4jEmbeddingRepairCooldownError,
 } from './search.js';
 import { fileURLToPath } from 'url';
 import { JobManager } from './analyze-job.js';
@@ -1455,6 +1456,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           const queued = startEmbeddingRepairForEntry(entry, { source, registryBranch });
           queued.done.catch((err) => {
             if (isAnalysisAlreadyInProgressError(err)) return;
+            if (isNeo4jEmbeddingRepairCooldownError(err)) {
+              const log =
+                err.name === 'Neo4jEmbeddingRepairDeferredError' ? logger.warn : logger.debug;
+              log(
+                { repo: entry.name, retryAfterMs: err.retryAfterMs },
+                err.name === 'Neo4jEmbeddingRepairDeferredError'
+                  ? 'embedding repair deferred: embedding endpoint failures cooling repo down'
+                  : 'embedding repair skipped: repo cooling down',
+              );
+              return;
+            }
             logger.error({ err, repo: entry.name }, 'embedding repair failed');
           });
         }

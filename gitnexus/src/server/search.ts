@@ -1,5 +1,7 @@
 import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
 import neo4j from 'neo4j-driver';
+import { logger } from '../core/logger.js';
+import type { EmbeddableNode } from '../core/embeddings/types.js';
 
 export type HttpSearchMode = 'hybrid' | 'semantic' | 'bm25' | string;
 
@@ -272,11 +274,74 @@ RETURN a.id AS sourceId,
 
 export type EmbeddingProgressCallback = (progress: any) => void;
 
+const NEO4J_EMBEDDING_REPAIR_BATCH_SIZE = 16;
+const DEFAULT_EMBEDDING_REPAIR_REPO_COOLDOWN_MS = 5 * 60_000;
+const embeddingRepairCooldownByRepo = new Map<string, number>();
+
+export class Neo4jEmbeddingRepairCooldownError extends Error {
+  constructor(
+    readonly repoName: string,
+    readonly retryAfterMs: number,
+  ) {
+    super(
+      `Neo4j embedding repair for repo "${repoName}" is cooling down; retry after ${Math.ceil(
+        retryAfterMs / 1000,
+      )}s`,
+    );
+    this.name = 'Neo4jEmbeddingRepairCooldownError';
+  }
+}
+
+export class Neo4jEmbeddingRepairDeferredError extends Error {
+  constructor(
+    readonly repoName: string,
+    readonly skippedNodes: number,
+    readonly retryAfterMs: number,
+  ) {
+    super(
+      `Neo4j embedding repair failed for all ${skippedNodes} nodes in repo "${repoName}"; repo is cooling down before retry`,
+    );
+    this.name = 'Neo4jEmbeddingRepairDeferredError';
+  }
+}
+
+export const isNeo4jEmbeddingRepairCooldownError = (
+  err: unknown,
+): err is Neo4jEmbeddingRepairCooldownError | Neo4jEmbeddingRepairDeferredError =>
+  err instanceof Neo4jEmbeddingRepairCooldownError ||
+  err instanceof Neo4jEmbeddingRepairDeferredError;
+
+const readPositiveInt = (value: string | undefined, fallback: number): number => {
+  if (value === undefined) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const readEmbeddingRepairRepoCooldownMs = (): number =>
+  readPositiveInt(
+    process.env.GITNEXUS_EMBEDDING_REPAIR_REPO_COOLDOWN_MS,
+    DEFAULT_EMBEDDING_REPAIR_REPO_COOLDOWN_MS,
+  );
+
+const assertEmbeddingRepairNotCoolingDown = (repoName: string): void => {
+  const disabledUntil = embeddingRepairCooldownByRepo.get(repoName) ?? 0;
+  const retryAfterMs = disabledUntil - Date.now();
+  if (retryAfterMs > 0) {
+    throw new Neo4jEmbeddingRepairCooldownError(repoName, retryAfterMs);
+  }
+  embeddingRepairCooldownByRepo.delete(repoName);
+};
+
+const coolDownEmbeddingRepairRepo = (repoName: string): void => {
+  embeddingRepairCooldownByRepo.set(repoName, Date.now() + readEmbeddingRepairRepoCooldownMs());
+};
+
 export const runNeo4jEmbeddingRepair = async (
   repoName: string,
   onProgress: EmbeddingProgressCallback,
   repoPath?: string,
 ): Promise<number> => {
+  assertEmbeddingRepairNotCoolingDown(repoName);
   const { contentHashForNode } = await import('../core/embeddings/embedding-pipeline.js');
   const { shouldSummarizeNode } = await import('../core/embeddings/keyword-summary.js');
   const { embedBatch, embeddingToArray } = await import('../core/embeddings/embedder.js');
@@ -286,7 +351,8 @@ export const runNeo4jEmbeddingRepair = async (
     deleteEmbeddingsForNodes,
     ensureNeo4jEmbeddingIndex,
     fetchExistingEmbeddingHashes,
-    loadEmbeddableNodes,
+    countEmbeddableNodes,
+    loadEmbeddableNodeBatches,
     updateNodeDescriptions,
     upsertEmbeddings,
   } = await import('../core/neo4j/embedding-adapter.js');
@@ -304,41 +370,56 @@ export const runNeo4jEmbeddingRepair = async (
 
   onProgress({ phase: 'loading-model', percent: 0 });
   await ensureNeo4jEmbeddingIndex();
-  const nodes = await loadEmbeddableNodes(repoName, resolvedRepoPath);
+  const totalNodes = await countEmbeddableNodes(repoName);
   const existingEmbeddings = await fetchExistingEmbeddingHashes(repoName);
-  const staleNodeIds: string[] = [];
-  const nodesToEmbed = nodes.filter((node) => {
-    const currentHash = contentHashForNode(node);
-    const existing = existingEmbeddings.get(node.id);
-    if (existing === undefined) return true;
-    if (existing.contentHash !== currentHash) {
-      staleNodeIds.push(node.id);
-      return true;
-    }
-    if (shouldSummarizeNode(node) && !existing.hasSummaryText) {
-      staleNodeIds.push(node.id);
-      return true;
-    }
-    return false;
-  });
 
-  if (staleNodeIds.length > 0) {
-    await deleteEmbeddingsForNodes(repoName, staleNodeIds);
-  }
-
-  const BATCH_SIZE = 16;
   let processed = 0;
-  for (let i = 0; i < nodesToEmbed.length; i += BATCH_SIZE) {
-    const batch = nodesToEmbed.slice(i, i + BATCH_SIZE);
-    const embeddingInputs = await Promise.all(
-      batch.map(async (node) => {
-        const contentHash = contentHashForNode(node);
-        const { embeddingText, summaryText } = await buildNeo4jEmbeddingText(node, contentHash);
-        return { node, contentHash, embeddingText, summaryText };
-      }),
-    );
+  let embedded = 0;
+  let skipped = 0;
+  let nodesToEmbedCount = 0;
+
+  const persistEmbeddingInputs = async (
+    embeddingInputs: Array<{
+      node: EmbeddableNode;
+      contentHash: string;
+      embeddingText: string;
+      summaryText?: string;
+    }>,
+  ): Promise<number> => {
+    if (embeddingInputs.length === 0) return 0;
     const texts = embeddingInputs.map((input) => input.embeddingText);
-    const vectors = await embedBatch(texts);
+    let vectors: Float32Array[];
+    try {
+      vectors = await embedBatch(texts);
+    } catch (err) {
+      if (embeddingInputs.length > 1) {
+        logger.warn(
+          {
+            err,
+            repo: repoName,
+            batchSize: embeddingInputs.length,
+            nextBatchSize: Math.ceil(embeddingInputs.length / 2),
+          },
+          'Neo4j embedding repair batch failed; splitting batch',
+        );
+        const midpoint = Math.ceil(embeddingInputs.length / 2);
+        const left = await persistEmbeddingInputs(embeddingInputs.slice(0, midpoint));
+        const right = await persistEmbeddingInputs(embeddingInputs.slice(midpoint));
+        return left + right;
+      }
+
+      const failed = embeddingInputs[0];
+      logger.warn(
+        {
+          err,
+          repo: repoName,
+          nodeId: failed.node.id,
+        },
+        'Neo4j embedding repair skipped node after repeated embedding failures',
+      );
+      return 0;
+    }
+
     await upsertEmbeddings(
       repoName,
       embeddingInputs.map(({ node, contentHash, summaryText }, index) => ({
@@ -360,14 +441,59 @@ export const runNeo4jEmbeddingRepair = async (
         description: summaryText!,
       }));
     await updateNodeDescriptions(repoName, descriptionUpdates);
+    return embeddingInputs.length;
+  };
 
-    processed += batch.length;
-    onProgress({
-      phase: 'embedding',
-      percent: nodesToEmbed.length === 0 ? 100 : Math.round((processed / nodesToEmbed.length) * 90),
-      nodesProcessed: processed,
-      totalNodes: nodesToEmbed.length,
+  for await (const nodePage of loadEmbeddableNodeBatches(repoName, resolvedRepoPath)) {
+    const nodesToEmbed = nodePage.filter((node) => {
+      const currentHash = contentHashForNode(node);
+      const existing = existingEmbeddings.get(node.id);
+      return (
+        existing === undefined ||
+        existing.contentHash !== currentHash ||
+        (shouldSummarizeNode(node) && !existing.hasSummaryText)
+      );
     });
+    const staleNodeIds = nodesToEmbed
+      .filter((node) => {
+        const existing = existingEmbeddings.get(node.id);
+        return existing !== undefined && existing.contentHash !== contentHashForNode(node);
+      })
+      .map((node) => node.id);
+    if (staleNodeIds.length > 0) {
+      await deleteEmbeddingsForNodes(repoName, staleNodeIds);
+    }
+
+    nodesToEmbedCount += nodesToEmbed.length;
+    for (let i = 0; i < nodesToEmbed.length; i += NEO4J_EMBEDDING_REPAIR_BATCH_SIZE) {
+      const batch = nodesToEmbed.slice(i, i + NEO4J_EMBEDDING_REPAIR_BATCH_SIZE);
+      const embeddingInputs = await Promise.all(
+        batch.map(async (node) => {
+          const contentHash = contentHashForNode(node);
+          const { embeddingText, summaryText } = await buildNeo4jEmbeddingText(node, contentHash);
+          return { node, contentHash, embeddingText, summaryText };
+        }),
+      );
+      const embeddedInBatch = await persistEmbeddingInputs(embeddingInputs);
+      embedded += embeddedInBatch;
+      skipped += batch.length - embeddedInBatch;
+
+      processed += batch.length;
+      onProgress({
+        phase: 'embedding',
+        percent: totalNodes === 0 ? 100 : Math.min(90, Math.round((processed / totalNodes) * 90)),
+        nodesProcessed: processed,
+        totalNodes,
+        nodesEmbedded: embedded,
+        nodesSkipped: skipped,
+      });
+    }
+  }
+
+  if (nodesToEmbedCount > 0 && embedded === 0 && skipped > 0) {
+    const cooldownMs = readEmbeddingRepairRepoCooldownMs();
+    coolDownEmbeddingRepairRepo(repoName);
+    throw new Neo4jEmbeddingRepairDeferredError(repoName, skipped, cooldownMs);
   }
 
   onProgress({ phase: 'indexing', percent: 95 });

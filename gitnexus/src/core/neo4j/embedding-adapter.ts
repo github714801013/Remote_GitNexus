@@ -57,6 +57,7 @@ const toNumber = (value: any, fallback = 0): number => {
 
 const EMBEDDABLE_LABEL_EXPRESSION = EMBEDDABLE_LABELS.map((label) => `\`${label}\``).join('|');
 export const DELETE_EMBEDDINGS_NODE_ID_BATCH_SIZE = 500;
+export const EMBEDDABLE_NODE_PAGE_SIZE = 500;
 const SOURCE_SNIPPET_CONTEXT_LINES = 2;
 const MAX_SOURCE_SNIPPET_CHARS = 5000;
 
@@ -182,6 +183,104 @@ RETURN n.id AS id,
       if (node.content.trim()) return node;
       const content = await loadSourceSnippet(repoPath, node, fileCache);
       return content ? { ...node, content } : node;
+    }),
+  );
+};
+
+const loadEmbeddableNodePage = async (
+  repoId: string,
+  label: string,
+  offset: number,
+  pageSize: number,
+  repoPath?: string,
+): Promise<EmbeddableNode[]> => {
+  const hasExportedColumn = label === LABEL_METHOD || LABELS_WITH_EXPORTED.has(label);
+  const methodFields =
+    label === LABEL_METHOD
+      ? ', n.parameterCount AS parameterCount, n.returnType AS returnType'
+      : '';
+  const nodes = await withNeo4jSession(async (session) =>
+    session.executeRead(async (tx) => {
+      const result = await tx.run(
+        `
+ MATCH (n:\`${label}\` {repoId: $repoId})
+ RETURN n.id AS id,
+        n.name AS name,
+        '${label}' AS label,
+        n.filePath AS filePath,
+        n.content AS content,
+        n.startLine AS startLine,
+        n.endLine AS endLine,
+        n.isExported AS isExported,
+        n.description AS description
+        ${methodFields}
+ ORDER BY n.id
+ SKIP $offset
+ LIMIT $pageSize
+        `.trim(),
+        { repoId, offset: neo4j.int(offset), pageSize: neo4j.int(pageSize) },
+      );
+
+      return (result.records ?? []).map((record) => ({
+        id: String(recordGet(record, 'id') ?? ''),
+        name: String(recordGet(record, 'name') ?? ''),
+        label,
+        filePath: String(recordGet(record, 'filePath') ?? ''),
+        content: String(recordGet(record, 'content') ?? ''),
+        startLine: toNumber(recordGet(record, 'startLine')),
+        endLine: toNumber(recordGet(record, 'endLine')),
+        isExported: hasExportedColumn ? Boolean(recordGet(record, 'isExported')) : undefined,
+        description: recordGet(record, 'description') ?? undefined,
+        ...(label === LABEL_METHOD
+          ? {
+              parameterCount: toNumber(recordGet(record, 'parameterCount')),
+              returnType: recordGet(record, 'returnType') ?? undefined,
+            }
+          : {}),
+      }));
+    }),
+  );
+
+  const embeddableNodes = nodes.filter((node) => node.id);
+  if (!repoPath) return embeddableNodes;
+
+  const fileCache = new Map<string, string | null>();
+  return await Promise.all(
+    embeddableNodes.map(async (node) => {
+      if (node.content.trim()) return node;
+      const content = await loadSourceSnippet(repoPath, node, fileCache);
+      return content ? { ...node, content } : node;
+    }),
+  );
+};
+
+export async function* loadEmbeddableNodeBatches(
+  repoId: string,
+  repoPath?: string,
+  pageSize = EMBEDDABLE_NODE_PAGE_SIZE,
+): AsyncGenerator<EmbeddableNode[]> {
+  for (const label of EMBEDDABLE_LABELS) {
+    let offset = 0;
+    while (true) {
+      const page = await loadEmbeddableNodePage(repoId, label, offset, pageSize, repoPath);
+      if (page.length === 0) break;
+      yield page;
+      offset += page.length;
+      if (page.length < pageSize) break;
+    }
+  }
+}
+
+export const countEmbeddableNodes = async (repoId: string): Promise<number> => {
+  return await withNeo4jSession(async (session) =>
+    session.executeRead(async (tx) => {
+      const result = await tx.run(
+        `MATCH (n {repoId: $repoId})
+         WHERE any(label IN labels(n) WHERE label IN $labels)
+         RETURN count(n) AS count`,
+        { repoId, labels: [...EMBEDDABLE_LABELS] },
+      );
+      return toNumber(result.records?.[0] ? recordGet(result.records[0], 'count') : 0);
     }),
   );
 };
