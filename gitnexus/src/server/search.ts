@@ -2,6 +2,7 @@ import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-sh
 import neo4j from 'neo4j-driver';
 import { logger } from '../core/logger.js';
 import type { EmbeddableNode } from '../core/embeddings/types.js';
+import { FTS_INDEXES } from '../core/search/fts-schema.js';
 
 export type HttpSearchMode = 'hybrid' | 'semantic' | 'bm25' | string;
 
@@ -14,6 +15,66 @@ export interface Neo4jHttpSearchParams {
 
 const toNeo4jLimit = (limit: number): neo4j.Integer => neo4j.int(Math.max(0, Math.trunc(limit)));
 
+const searchNeo4jFulltext = async (
+  repoName: string,
+  query: string,
+  limit: number,
+): Promise<any[]> => {
+  const { executeReadCypher } = await import('../core/neo4j/read-adapter.js');
+  const { escapeNeo4jFulltextQuery } = await import('../core/neo4j/fulltext-query.js');
+  const fulltextQuery = escapeNeo4jFulltextQuery(query);
+  const merged = new Map<string, any>();
+
+  for (const { indexName } of FTS_INDEXES) {
+    try {
+      const rows = await executeReadCypher(
+        `
+        CALL db.index.fulltext.queryNodes('${indexName}', $query, {limit: $limit})
+        YIELD node, score
+        WHERE node.repoId = $repoId
+        RETURN node.id AS nodeId,
+               node.name AS name,
+               labels(node)[0] AS type,
+               node.filePath AS filePath,
+               node.startLine AS startLine,
+               node.endLine AS endLine,
+               score AS score
+      `,
+        { repoId: repoName, query: fulltextQuery, limit },
+      );
+
+      for (const row of rows) {
+        const key = row.nodeId || row.filePath;
+        if (!key) continue;
+        const existing = merged.get(key);
+        if (!existing || (row.score ?? 0) > (existing.score ?? 0)) {
+          merged.set(key, {
+            nodeId: row.nodeId,
+            name: row.name,
+            type: row.type,
+            label: row.type,
+            filePath: row.filePath,
+            startLine: row.startLine,
+            endLine: row.endLine,
+            score: row.score ?? 0,
+            sources: ['bm25'],
+          });
+        }
+      }
+    } catch (err) {
+      logger.debug(
+        { err: err instanceof Error ? err.message : String(err), repo: repoName, indexName },
+        'Neo4j HTTP search fulltext index unavailable; continuing with remaining indexes',
+      );
+    }
+  }
+
+  return Array.from(merged.values())
+    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+    .slice(0, limit)
+    .map((result, index) => ({ ...result, rank: index + 1 }));
+};
+
 export const searchNeo4jBackend = async ({
   repoName,
   query,
@@ -21,21 +82,29 @@ export const searchNeo4jBackend = async ({
   limit,
 }: Neo4jHttpSearchParams): Promise<any[]> => {
   if (mode === 'bm25') {
-    return [];
+    return searchNeo4jFulltext(repoName, query, limit);
   }
 
-  const { embedQuery } = await import('../mcp/core/embedder.js');
-  const queryVector = await embedQuery(query);
-  const { semanticSearch } = await import('../core/neo4j/embedding-adapter.js');
-  const results = await semanticSearch(repoName, queryVector, limit);
+  try {
+    const { embedQuery } = await import('../mcp/core/embedder.js');
+    const queryVector = await embedQuery(query);
+    const { semanticSearch } = await import('../core/neo4j/embedding-adapter.js');
+    const results = await semanticSearch(repoName, queryVector, limit);
 
-  return results.map((result, index) => ({
-    ...result,
-    label: result.type,
-    score: result.score ?? 1 - (result.distance ?? 0),
-    rank: index + 1,
-    sources: ['semantic'],
-  }));
+    return results.map((result, index) => ({
+      ...result,
+      label: result.type,
+      score: result.score ?? 1 - (result.distance ?? 0),
+      rank: index + 1,
+      sources: ['semantic'],
+    }));
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err), repo: repoName, mode },
+      'Neo4j HTTP semantic search degraded; falling back to fulltext search',
+    );
+    return searchNeo4jFulltext(repoName, query, limit);
+  }
 };
 
 export const queryNeo4jBackend = async (
