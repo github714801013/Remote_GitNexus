@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { execSync } from 'child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import os from 'os';
+import path from 'path';
 import { LocalBackend } from '../../src/mcp/local/local-backend.js';
 import {
   executeReadCypher,
@@ -111,6 +115,88 @@ describe('LocalBackend context and impact with Neo4j backend', () => {
         ],
       },
     });
+  });
+
+  it('maps detect_changes hunks through Neo4j without initializing LadybugDB', async () => {
+    const repoDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-detect-neo4j-'));
+    try {
+      execSync('git init -q', { cwd: repoDir, stdio: 'ignore' });
+      execSync('git config user.email "test@example.com"', { cwd: repoDir, stdio: 'ignore' });
+      execSync('git config user.name "Test"', { cwd: repoDir, stdio: 'ignore' });
+      mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+      writeFileSync(
+        path.join(repoDir, 'src/handler.ts'),
+        'export function handler() {\n  return 1;\n}\n',
+      );
+      execSync('git add src/handler.ts', { cwd: repoDir, stdio: 'ignore' });
+      execSync('git commit -q -m "initial"', { cwd: repoDir, stdio: 'ignore' });
+      writeFileSync(
+        path.join(repoDir, 'src/handler.ts'),
+        'export function handler() {\n  return 2;\n}\n',
+      );
+
+      vi.mocked(executeReadCypher)
+        .mockResolvedValueOnce([
+          {
+            id: 'Function:handler',
+            name: 'handler',
+            type: 'Function',
+            filePath: 'src/handler.ts',
+            startLine: 1,
+            endLine: 3,
+          },
+        ])
+        .mockResolvedValueOnce([
+          {
+            nodeId: 'Function:handler',
+            pid: 'Process:handler-flow',
+            label: 'HandlerFlow',
+            processType: 'flow',
+            stepCount: 1,
+            step: 1,
+          },
+        ]);
+
+      const backend = new LocalBackend();
+
+      const result = await (backend as any).detectChanges(
+        {
+          ...repo,
+          repoPath: repoDir,
+          storagePath: path.join(repoDir, '.gitnexus'),
+          lbugPath: path.join(repoDir, '.gitnexus/lbug'),
+        },
+        { scope: 'unstaged' },
+      );
+
+      expect(initLbug).not.toHaveBeenCalled();
+      expect(executeParameterized).not.toHaveBeenCalled();
+      expect(executeReadCypher).toHaveBeenCalledTimes(2);
+      expect(executeReadCypher).toHaveBeenNthCalledWith(
+        1,
+        expect.stringContaining('MATCH (n {repoId: $repoId})'),
+        expect.objectContaining({ repoId: 'Repo A', filePath: 'src/handler.ts' }),
+      );
+      expect(result.partial).toBeUndefined();
+      expect(result.summary).toMatchObject({
+        changed_count: 1,
+        affected_count: 1,
+        changed_files: 1,
+        risk_level: 'medium',
+      });
+      expect(result.changed_symbols[0]).toMatchObject({
+        id: 'Function:handler',
+        name: 'handler',
+        filePath: 'src/handler.ts',
+      });
+      expect(result.affected_processes[0]).toMatchObject({
+        id: 'Process:handler-flow',
+        name: 'HandlerFlow',
+        changed_steps: [{ symbol: 'handler', step: 1 }],
+      });
+    } finally {
+      rmSync(repoDir, { recursive: true, force: true });
+    }
   });
 
   it('passes file_path and kind hints to Neo4j context lookup', async () => {

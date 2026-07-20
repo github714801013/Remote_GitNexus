@@ -4387,6 +4387,8 @@ export class LocalBackend {
     },
   ): Promise<any> {
     await this.ensureInitialized(repo);
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const neo4jBackendEnabled = isNeo4jBackendEnabled();
 
     const scope = params.scope || 'unstaged';
     const { execFileSync } = await import('child_process');
@@ -4510,7 +4512,16 @@ export class LocalBackend {
       // enrichCandidateLabels) AND beats `n.name IS NOT NULL` (which would
       // also drop legitimate symbols whose name loaded as NULL, e.g.
       // quoted-empty CSV fields for anonymous constructs).
-      const symbolQuery = `
+      const symbolQuery = neo4jBackendEnabled
+        ? `
+        MATCH (n {repoId: $repoId}) WHERE n.filePath ENDS WITH $filePath
+          AND NOT coalesce(n.id, '') STARTS WITH 'BasicBlock:'
+          AND n.startLine IS NOT NULL AND n.endLine IS NOT NULL
+          AND (${overlapConditions})
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type,
+               n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+      `
+        : `
         MATCH (n) WHERE n.filePath ENDS WITH $filePath
           AND NOT n.id STARTS WITH 'BasicBlock:'
           AND n.startLine IS NOT NULL AND n.endLine IS NOT NULL
@@ -4520,7 +4531,14 @@ export class LocalBackend {
       `;
 
       try {
-        const rows = await executeParameterized(repo.lbugPath, symbolQuery, queryParams);
+        const rows = neo4jBackendEnabled
+          ? await (
+              await import('../../core/neo4j/read-adapter.js')
+            ).executeReadCypher(symbolQuery, {
+              ...queryParams,
+              repoId: repo.name,
+            })
+          : await executeParameterized(repo.lbugPath, symbolQuery, queryParams);
         for (const sym of rows) {
           changedSymbols.push({
             id: sym.id || sym[0],
@@ -4547,16 +4565,28 @@ export class LocalBackend {
       const symIds = changedSymbols.map((s) => s.id);
       const symNameById = new Map(changedSymbols.map((s) => [s.id, s.name]));
       try {
-        const procs = await executeParameterized(
-          repo.lbugPath,
-          `
+        const procs = neo4jBackendEnabled
+          ? await (
+              await import('../../core/neo4j/read-adapter.js')
+            ).executeReadCypher(
+              `
+          MATCH (n {repoId: $repoId})-[r:STEP_IN_PROCESS]->(p:Process {repoId: $repoId})
+          WHERE n.id IN $ids
+          RETURN n.id AS nodeId, p.id AS pid, p.heuristicLabel AS label,
+                 p.processType AS processType, p.stepCount AS stepCount, r.step AS step
+        `,
+              { repoId: repo.name, ids: symIds },
+            )
+          : await executeParameterized(
+              repo.lbugPath,
+              `
           MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
           WHERE n.id IN $ids
           RETURN n.id AS nodeId, p.id AS pid, p.heuristicLabel AS label,
                  p.processType AS processType, p.stepCount AS stepCount, r.step AS step
         `,
-          { ids: symIds },
-        );
+              { ids: symIds },
+            );
         for (const proc of procs) {
           const nodeId = proc.nodeId || proc[0];
           const pid = proc.pid || proc[1];
