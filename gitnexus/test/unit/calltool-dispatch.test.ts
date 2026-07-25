@@ -17,13 +17,17 @@ import path from 'path';
 // local-backend.ts imports from core/lbug/pool-adapter.js; the mcp/core/lbug-adapter.js
 // re-exports from the same module, so we mock the canonical source.
 // vi.hoisted runs before vi.mock hoisting, making the fns available to both factories.
-const { lbugMocks, platformMocks } = vi.hoisted(() => ({
+const { lbugMocks, neo4jMocks, platformMocks } = vi.hoisted(() => ({
   lbugMocks: {
     initLbug: vi.fn().mockResolvedValue(undefined),
     executeQuery: vi.fn().mockResolvedValue([]),
     executeParameterized: vi.fn().mockResolvedValue([]),
     closeLbug: vi.fn().mockResolvedValue(undefined),
     isLbugReady: vi.fn().mockReturnValue(true),
+  },
+  neo4jMocks: {
+    isNeo4jBackendEnabled: vi.fn().mockReturnValue(false),
+    executeReadCypher: vi.fn().mockResolvedValue([]),
   },
   platformMocks: {
     isVectorExtensionSupportedByPlatform: vi.fn().mockReturnValue(true),
@@ -39,6 +43,16 @@ vi.mock('../../src/core/lbug/pool-adapter.js', async (importOriginal) => {
 vi.mock('../../src/mcp/core/lbug-adapter.js', async (importOriginal) => {
   const actual = await importOriginal();
   return { ...actual, ...lbugMocks };
+});
+
+vi.mock('../../src/core/neo4j/config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/core/neo4j/config.js')>();
+  return { ...actual, isNeo4jBackendEnabled: neo4jMocks.isNeo4jBackendEnabled };
+});
+
+vi.mock('../../src/core/neo4j/read-adapter.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/core/neo4j/read-adapter.js')>();
+  return { ...actual, executeReadCypher: neo4jMocks.executeReadCypher };
 });
 
 vi.mock('../../src/storage/repo-manager.js', async (importOriginal) => {
@@ -127,6 +141,7 @@ import {
   isLbugReady,
   closeLbug,
 } from '../../src/mcp/core/lbug-adapter.js';
+import { executeReadCypher } from '../../src/core/neo4j/read-adapter.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -300,6 +315,7 @@ describe('LocalBackend.callTool', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    neo4jMocks.isNeo4jBackendEnabled.mockReturnValue(false);
     platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
     backend = new LocalBackend();
     setupSingleRepo();
@@ -332,6 +348,78 @@ describe('LocalBackend.callTool', () => {
     const result = await backend.callTool('query', { query: 'auth' });
     expect(result).toHaveProperty('processes');
     expect(result).toHaveProperty('definitions');
+  });
+
+  it('routes route_map through Neo4j when the Neo4j backend is enabled', async () => {
+    neo4jMocks.isNeo4jBackendEnabled.mockReturnValue(true);
+    neo4jMocks.executeReadCypher.mockImplementation(async (cypher: string) => {
+      if (cypher.includes('FETCHES')) {
+        return [
+          {
+            routeId: 'Route:GET /users',
+            routeName: '/users',
+            handlerFile: 'src/users.ts',
+            responseKeys: ['id'],
+            errorKeys: [],
+            middleware: [],
+            consumerName: 'loadUsers',
+            consumerFile: 'src/client.ts',
+            fetchReason: 'fetch-url-match|keys:id',
+            method: 'GET',
+          },
+        ];
+      }
+      return [{ sourceId: 'Route:GET /users', name: 'Users flow' }];
+    });
+
+    const result = await backend.callTool('route_map', { route: '/users' });
+
+    expect(result.routes).toEqual([
+      expect.objectContaining({
+        route: '/users',
+        method: 'GET',
+        handler: 'src/users.ts',
+      }),
+    ]);
+    expect(executeReadCypher).toHaveBeenCalled();
+    expect(executeParameterized).not.toHaveBeenCalled();
+    expect(neo4jMocks.executeReadCypher).toHaveBeenCalledWith(
+      expect.stringContaining('{repoId: $repoId}'),
+      expect.objectContaining({ repoId: 'test-project', route: '/users' }),
+    );
+  });
+
+  it('routes api_impact through Neo4j when the Neo4j backend is enabled', async () => {
+    neo4jMocks.isNeo4jBackendEnabled.mockReturnValue(true);
+    neo4jMocks.executeReadCypher.mockImplementation(async (cypher: string) => {
+      if (cypher.includes('FETCHES')) {
+        return [
+          {
+            routeId: 'Route:GET /users',
+            routeName: '/users',
+            handlerFile: 'src/users.ts',
+            responseKeys: ['id'],
+            errorKeys: [],
+            middleware: [],
+            consumerName: 'loadUsers',
+            consumerFile: 'src/client.ts',
+            fetchReason: 'fetch-url-match|keys:id',
+            method: 'GET',
+          },
+        ];
+      }
+      return [{ sourceId: 'Route:GET /users', name: 'Users flow' }];
+    });
+
+    const result = await backend.callTool('api_impact', { route: '/users', method: 'GET' });
+
+    expect(result).toMatchObject({
+      route: '/users',
+      method: 'GET',
+      handler: 'src/users.ts',
+    });
+    expect(executeReadCypher).toHaveBeenCalled();
+    expect(executeParameterized).not.toHaveBeenCalled();
   });
 
   it('checks cycles using only non-synthetic import edges', async () => {

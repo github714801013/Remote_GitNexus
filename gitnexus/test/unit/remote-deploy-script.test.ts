@@ -7,6 +7,7 @@ const repoRoot = resolve(__dirname, '../../..');
 describe('remote_deploy.sh', () => {
   const script = readFileSync(resolve(repoRoot, 'mcp_proxy_docker/remote_deploy.sh'), 'utf8');
   const dockerignore = readFileSync(resolve(repoRoot, '.dockerignore'), 'utf8');
+  const compose = readFileSync(resolve(repoRoot, 'mcp_proxy_docker/docker-compose.yml'), 'utf8');
 
   it('requires a remote keyword summary URL by default', () => {
     expect(script).toContain(
@@ -30,5 +31,14 @@ describe('remote_deploy.sh', () => {
     expect(dockerignore).toContain('mcp_proxy_docker/models');
     expect(dockerignore).toContain('.download-cache');
     expect(dockerignore).toContain('.docker_temp_*');
+  });
+
+  it('passes local diagnostics enablement through to the recreated container', () => {
+    expect(script).toContain(
+      'GITNEXUS_LOCAL_DIAGNOSTICS_ENABLED=${GITNEXUS_LOCAL_DIAGNOSTICS_ENABLED:-false}',
+    );
+    expect(compose).toContain(
+      'GITNEXUS_LOCAL_DIAGNOSTICS_ENABLED=${GITNEXUS_LOCAL_DIAGNOSTICS_ENABLED:-false}',
+    );
   });
 });

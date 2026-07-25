@@ -54,7 +54,7 @@ import {
   isNeo4jEmbeddingRepairCooldownError,
 } from './search.js';
 import { fileURLToPath } from 'url';
-import { JobManager } from './analyze-job.js';
+import { JobManager, type AnalyzeJob } from './analyze-job.js';
 import { assertString, escapeRegExp, BadRequestError, createRouteLimiter } from './validation.js';
 import {
   extractRepoName,
@@ -97,7 +97,11 @@ import {
   type WebhookRepoConfigEntry,
 } from './webhook-worktree.js';
 import { createAnalyzeUploadHandler } from './analyze-upload.js';
-import { createLocalhostOriginGuard, normalizeBoundHost } from './middleware.js';
+import {
+  createLocalhostOriginGuard,
+  normalizeBoundHost,
+  requireLoopbackPeer,
+} from './middleware.js';
 import { createLaunchAnalysisWorker } from './analyze-launch.js';
 import { ensureCocoaPodsDependencies } from './cocoapods.js';
 import { UPLOAD_ROOT } from './upload-paths.js';
@@ -122,6 +126,29 @@ const envFlagEnabled = (value: string | undefined, defaultValue: boolean): boole
   if (value === undefined) return defaultValue;
   return !['0', 'false', 'no', 'off'].includes(value.trim().toLowerCase());
 };
+
+const LOCAL_DIAGNOSTICS_ENABLED_ENV = 'GITNEXUS_LOCAL_DIAGNOSTICS_ENABLED';
+
+/** 仅在显式开启时挂载容器内锁诊断数据。 */
+export const isLocalDiagnosticsEnabled = (): boolean =>
+  envFlagEnabled(process.env[LOCAL_DIAGNOSTICS_ENABLED_ENV], false);
+
+export interface LocalDiagnosticJob {
+  id: string;
+  status: AnalyzeJob['status'];
+  repoName?: string;
+  progress: Pick<AnalyzeJob['progress'], 'phase' | 'percent'>;
+  startedAt: number;
+}
+
+/** 将运行时任务转换为不含路径、URL、异常文本的诊断视图。 */
+export const toLocalDiagnosticJob = (job: AnalyzeJob): LocalDiagnosticJob => ({
+  id: job.id,
+  status: job.status,
+  ...(job.repoName ? { repoName: job.repoName } : {}),
+  progress: { phase: job.progress.phase, percent: job.progress.percent },
+  startedAt: job.startedAt,
+});
 
 export const isRepairableIndexError = (err: unknown): boolean => {
   const msg = String(err instanceof Error ? err.message : err).toLowerCase();
@@ -1311,6 +1338,39 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       done: queued.done,
     };
   };
+
+  app.get('/api/internal/repo-locks/:repoName', requireLoopbackPeer, async (req, res) => {
+    if (!isLocalDiagnosticsEnabled()) {
+      res.status(404).end();
+      return;
+    }
+
+    const requestedName = req.params.repoName;
+    try {
+      const entry = (await listRegisteredRepos()).find((repo) => repo.name === requestedName);
+      if (!entry) {
+        res.status(404).json({ error: 'Repository not found' });
+        return;
+      }
+
+      const isActive = (job: AnalyzeJob): boolean =>
+        job.status !== 'complete' && job.status !== 'failed';
+      const belongsToRepo = (job: AnalyzeJob): boolean =>
+        job.repoName === entry.name || job.repoPath === entry.path || job.repoPath === entry.storagePath;
+      const jobs = [...jobManager.listJobs(), ...embedJobManager.listJobs()]
+        .filter(isActive)
+        .filter(belongsToRepo)
+        .map(toLocalDiagnosticJob);
+
+      res.json({
+        repoName: entry.name,
+        lockHeld: activeRepoPaths.has(entry.storagePath),
+        jobs,
+      });
+    } catch {
+      res.status(500).json({ error: 'Unable to inspect repository lock' });
+    }
+  });
 
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', projectsRoot: getProjectsRoot() });

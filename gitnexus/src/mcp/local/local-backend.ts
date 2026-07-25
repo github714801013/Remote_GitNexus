@@ -6891,8 +6891,22 @@ export class LocalBackend {
    * Fetch Route nodes with their consumers in a single query.
    * Shared by routeMap and shapeCheck to avoid N+1 query patterns.
    */
+  private async fetchRouteQuery(
+    repo: RepoHandle,
+    ladybugQuery: string,
+    neo4jQuery: string,
+    params: Record<string, unknown>,
+  ): Promise<any[]> {
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+      return executeReadCypher(neo4jQuery, { ...params, repoId: repo.name });
+    }
+    return executeParameterized(repo.lbugPath, ladybugQuery, params);
+  }
+
   private async fetchRoutesWithConsumers(
-    repoId: string,
+    repo: RepoHandle,
     routeFilter: string,
     params: Record<string, string>,
   ): Promise<
@@ -6912,13 +6926,22 @@ export class LocalBackend {
       }>;
     }>
   > {
-    const rows = await executeParameterized(
-      repoId,
+    const rows = await this.fetchRouteQuery(
+      repo,
       `
       MATCH (n:Route)
       WHERE n.id STARTS WITH 'Route:' ${routeFilter}
       OPTIONAL MATCH (consumer)-[r:CodeRelation]->(n)
       WHERE r.type = 'FETCHES'
+      RETURN n.id AS routeId, n.name AS routeName, n.filePath AS handlerFile,
+             n.responseKeys AS responseKeys, n.errorKeys AS errorKeys, n.middleware AS middleware,
+             consumer.name AS consumerName, consumer.filePath AS consumerFile,
+             r.reason AS fetchReason, n.method AS method
+    `,
+      `
+      MATCH (n:Route {repoId: $repoId})
+      WHERE n.id STARTS WITH 'Route:' ${routeFilter}
+      OPTIONAL MATCH (consumer {repoId: $repoId})-[r:FETCHES]->(n)
       RETURN n.id AS routeId, n.name AS routeName, n.filePath AS handlerFile,
              n.responseKeys AS responseKeys, n.errorKeys AS errorKeys, n.middleware AS middleware,
              consumer.name AS consumerName, consumer.filePath AS consumerFile,
@@ -7009,19 +7032,24 @@ export class LocalBackend {
    * Single query instead of N+1.
    */
   private async fetchLinkedFlowsBatch(
-    repoId: string,
+    repo: RepoHandle,
     nodeIds: string[],
   ): Promise<Map<string, string[]>> {
     const result = new Map<string, string[]>();
     if (nodeIds.length === 0) return result;
     try {
       // Use list_contains to filter at DB level instead of fetching all and filtering in memory
-      const rows = await executeParameterized(
-        repoId,
+      const rows = await this.fetchRouteQuery(
+        repo,
         `
         MATCH (source)-[r:CodeRelation]->(proc:Process)
         WHERE r.type = 'ENTRY_POINT_OF'
           AND list_contains($nodeIds, source.id)
+        RETURN source.id AS sourceId, proc.label AS name
+      `,
+        `
+        MATCH (source {repoId: $repoId})-[:ENTRY_POINT_OF]->(proc:Process {repoId: $repoId})
+        WHERE source.id IN $nodeIds
         RETURN source.id AS sourceId, proc.label AS name
       `,
         { nodeIds },
@@ -7048,7 +7076,7 @@ export class LocalBackend {
 
     const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
     const queryParams = params.route ? { route: params.route } : {};
-    const routes = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
+    const routes = await this.fetchRoutesWithConsumers(repo, routeFilter, queryParams);
 
     if (routes.length === 0) {
       return {
@@ -7061,7 +7089,7 @@ export class LocalBackend {
     }
 
     const flowMap = await this.fetchLinkedFlowsBatch(
-      repo.lbugPath,
+      repo,
       routes.map((r) => r.id),
     );
 
@@ -7083,7 +7111,7 @@ export class LocalBackend {
 
     const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
     const queryParams = params.route ? { route: params.route } : {};
-    const allRoutes = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
+    const allRoutes = await this.fetchRoutesWithConsumers(repo, routeFilter, queryParams);
 
     const results = allRoutes
       .filter(
@@ -7186,7 +7214,7 @@ export class LocalBackend {
     }
 
     const toolIds = rows.map((r: any) => r.id ?? r[0]);
-    const flowMap = await this.fetchLinkedFlowsBatch(repo.lbugPath, toolIds);
+    const flowMap = await this.fetchLinkedFlowsBatch(repo, toolIds);
 
     return {
       tools: rows.map((r: any) => {
@@ -7237,7 +7265,7 @@ export class LocalBackend {
     }
     const wantedMethod =
       typeof rawMethod === 'string' ? rawMethod.trim().toUpperCase() || undefined : undefined;
-    const matched = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
+    const matched = await this.fetchRoutesWithConsumers(repo, routeFilter, queryParams);
     const routes = matched.filter(
       (r) => !wantedMethod || r.method === '*' || r.method?.toUpperCase() === wantedMethod,
     );
@@ -7251,7 +7279,7 @@ export class LocalBackend {
     }
 
     const flowMap = await this.fetchLinkedFlowsBatch(
-      repo.lbugPath,
+      repo,
       routes.map((r) => r.id),
     );
 
