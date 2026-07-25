@@ -19,3 +19,7 @@ coverage
 .gitnexus
 gitnexus-web/playwright-report
 gitnexus-web/test-results
+
+mcp_proxy_docker/models
+.download-cache
+.docker_temp_*

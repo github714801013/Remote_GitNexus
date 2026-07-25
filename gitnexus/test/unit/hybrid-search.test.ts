@@ -184,6 +184,22 @@ describe('hybridSearch — FTS failure fallback (#1489)', () => {
     expect(results).toHaveLength(0);
   });
 
+  it('falls back to BM25-only when semantic search throws', async () => {
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({
+      results: [{ filePath: 'src/bm25-hit.ts', score: 5, rank: 1 }],
+      ftsAvailable: true,
+    });
+
+    const mockExecuteQuery = vi.fn().mockResolvedValue([]);
+    const mockSemanticSearch = vi.fn().mockRejectedValueOnce(new Error('embedding unavailable'));
+
+    const results = await hybridSearch('test query', 10, mockExecuteQuery, mockSemanticSearch);
+    expect(results).toHaveLength(1);
+    expect(results[0].filePath).toBe('src/bm25-hit.ts');
+    expect(results[0].sources).toEqual(['bm25']);
+  });
+
   it('works normally when FTS succeeds', async () => {
     const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
     vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({

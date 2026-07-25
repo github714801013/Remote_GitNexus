@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { EventEmitter } from 'events';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { JobManager } from '../../src/server/analyze-job.js';
 
 describe('JobManager', () => {
@@ -128,6 +129,28 @@ describe('JobManager', () => {
     manager.cancelJob(job.id, 'Cancelled by user');
 
     expect(controller.signal.aborted).toBe(true);
+  });
+
+  it('does not auto-cancel a registered child after the old 30-minute limit', () => {
+    vi.useFakeTimers();
+    manager.dispose();
+    manager = new JobManager();
+
+    try {
+      const job = manager.createJob({ repoUrl: 'https://github.com/user/repo' });
+      manager.updateJob(job.id, { status: 'analyzing' });
+      const child = new EventEmitter() as any;
+      child.kill = vi.fn();
+
+      manager.registerChild(job.id, child);
+      vi.advanceTimersByTime(31 * 60 * 1000);
+
+      expect(manager.getJob(job.id)!.status).toBe('analyzing');
+      expect(manager.getJob(job.id)!.error).toBeUndefined();
+      expect(child.kill).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('cancelJob returns false for terminal jobs', () => {

@@ -13,7 +13,7 @@
 
 import { CircuitOpenError, ResilientFetchExhaustedError, resilientFetch } from 'gitnexus-shared';
 
-const HTTP_TIMEOUT_MS = 30_000;
+const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 const HTTP_MAX_RETRIES = 2;
 const HTTP_RETRY_BACKOFF_MS = 1_000;
 const HTTP_RETRY_CAP_MS = 5_000;
@@ -191,6 +191,14 @@ const readConfig = (): HttpConfig | null => {
   };
 };
 
+const readHttpTimeoutMs = (): number => {
+  const raw =
+    process.env.GITNEXUS_EMBEDDING_REQUEST_TIMEOUT_MS ?? process.env.GITNEXUS_EMBEDDING_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_HTTP_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_HTTP_TIMEOUT_MS;
+};
+
 /**
  * Whether HTTP embedding mode is active — i.e. both `GITNEXUS_EMBEDDING_URL` and
  * `GITNEXUS_EMBEDDING_MODEL` are set. A pure presence probe: it deliberately does
@@ -333,6 +341,7 @@ const httpEmbedBatch = async (
   }
 
   let resp: Response;
+  const timeoutMs = readHttpTimeoutMs();
   try {
     throwIfAborted(requestOptions.signal);
     resp = await resilientFetch(
@@ -349,7 +358,7 @@ const httpEmbedBatch = async (
         fetchImpl: async (input, init) => {
           await paceHttpRequest(minIntervalMs, requestOptions.signal);
           throwIfAborted(requestOptions.signal);
-          const timeoutSignal = AbortSignal.timeout(HTTP_TIMEOUT_MS);
+          const timeoutSignal = AbortSignal.timeout(timeoutMs);
           const signal = requestOptions.signal
             ? AbortSignal.any([requestOptions.signal, timeoutSignal])
             : timeoutSignal;
@@ -360,7 +369,6 @@ const httpEmbedBatch = async (
           maxAttempts,
           baseDelayMs: HTTP_RETRY_BACKOFF_MS,
           capDelayMs: retryCapMs,
-          retryAfterCapMs: retryCapMs,
           sleep: (ms) => abortableSleep(ms, requestOptions.signal),
         },
       },
@@ -383,7 +391,7 @@ const httpEmbedBatch = async (
     }
     if (err instanceof DOMException && err.name === 'TimeoutError') {
       throw new HttpEmbeddingError(
-        `Embedding request timed out after ${HTTP_TIMEOUT_MS}ms (${safeUrl(url)}, batch ${batchIndex})`,
+        `Embedding request timed out after ${timeoutMs}ms (${safeUrl(url)}, batch ${batchIndex})`,
         { cause: err },
       );
     }

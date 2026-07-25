@@ -45,6 +45,16 @@ export interface LLMResponse {
   completionTokens?: number;
 }
 
+const isLLMProvider = (value: string | undefined): value is LLMProvider =>
+  value === 'openai' ||
+  value === 'openrouter' ||
+  value === 'azure' ||
+  value === 'custom' ||
+  value === 'cursor' ||
+  value === 'claude' ||
+  value === 'codex' ||
+  value === 'opencode';
+
 /**
  * Resolve LLM configuration from env vars, saved config, and optional overrides.
  * Priority: overrides (CLI flags) > env vars > ~/.gitnexus/config.json > error
@@ -54,7 +64,11 @@ export interface LLMResponse {
 export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<LLMConfig> {
   const { loadCLIConfig } = await import('../../storage/repo-manager.js');
   const savedConfig = await loadCLIConfig();
-  const savedProvider = overrides?.provider ?? savedConfig.provider;
+  const envProvider = process.env.GITNEXUS_WIKI_LLM_PROVIDER;
+  const savedProvider =
+    overrides?.provider ??
+    (isLLMProvider(envProvider) ? envProvider : undefined) ??
+    savedConfig.provider;
   const savedLocalModel =
     savedProvider === 'cursor'
       ? savedConfig.cursorModel
@@ -73,6 +87,7 @@ export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<
 
   const apiKey =
     overrides?.apiKey ||
+    process.env.GITNEXUS_WIKI_LLM_API_KEY ||
     process.env.GITNEXUS_API_KEY ||
     process.env.OPENAI_API_KEY ||
     savedConfig.apiKey ||
@@ -82,11 +97,13 @@ export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<
     apiKey,
     baseUrl:
       overrides?.baseUrl ||
+      process.env.GITNEXUS_WIKI_LLM_URL ||
       process.env.GITNEXUS_LLM_BASE_URL ||
       savedConfig.baseUrl ||
       'https://openrouter.ai/api/v1',
     model:
       overrides?.model ||
+      (localProvider ? undefined : process.env.GITNEXUS_WIKI_LLM_MODEL) ||
       (localProvider ? undefined : process.env.GITNEXUS_MODEL) ||
       savedLocalModel ||
       (localProvider ? '' : savedConfig.model || 'minimax/minimax-m2.5'),

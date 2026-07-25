@@ -73,6 +73,7 @@
     "js-yaml": "^5.0.0",
     "jsonc-parser": "^3.3.1",
     "mnemonist": "^0.40.3",
+    "neo4j-driver": "^6.0.1",
     "node-addon-api": "^8.0.0",
     "node-gyp-build": "^4.8.0",
     "onnxruntime-common": "^1.26.0",

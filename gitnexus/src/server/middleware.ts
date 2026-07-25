@@ -93,3 +93,23 @@ export function createLocalhostOriginGuard(boundHost?: string) {
  * the bound host is not available.
  */
 export const requireLocalhostOrigin = createLocalhostOriginGuard();
+
+/**
+ * 仅接受来自本机回环地址的直接 TCP 连接。
+ *
+ * 不能使用 req.ip：服务启用了 trust proxy，外部请求可通过转发头影响它。
+ */
+export const isLoopbackPeerAddress = (address: string | undefined): boolean =>
+  address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+
+/**
+ * 仅供容器内运维诊断接口使用的对端地址限制。
+ * 以 404 响应拒绝非回环请求，避免暴露接口存在性。
+ */
+export function requireLoopbackPeer(req: Request, res: Response, next: () => void): void {
+  if (isLoopbackPeerAddress(req.socket.remoteAddress)) {
+    next();
+    return;
+  }
+  res.status(404).end();
+}

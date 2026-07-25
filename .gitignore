@@ -24,10 +24,19 @@ Thumbs.db
 .env.local
 .env.*.local
 docker/.env
+mcp_proxy_docker/.env
+mcp_proxy_docker/.env.local
+mcp_proxy_docker/.env.*.local
 
 # Logs
 *.log
 npm-debug.log*
+bash.exe.stackdump
+
+# Local archives and deployment bundles
+*.tar
+*.tar.gz
+*.tgz
 
 # Testing
 coverage/

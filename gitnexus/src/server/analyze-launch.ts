@@ -26,6 +26,7 @@ import { logger } from '../core/logger.js';
 import { autoHeapCapMb } from '../core/ingestion/utils/effective-ram.js';
 import type { JobManager } from './analyze-job.js';
 import type { WorkerMessage } from './analyze-worker.js';
+import { buildAnalyzeWorkerExecArgv } from './analyze-worker-options.js';
 
 const _require = createRequire(import.meta.url);
 
@@ -47,6 +48,9 @@ export interface LaunchOptions {
   embeddings?: boolean;
   dropEmbeddings?: boolean;
   registryName?: string;
+  registryBranch?: string;
+  allowDuplicateName?: boolean;
+  lockAlreadyHeld?: boolean;
 }
 
 const MAX_WORKER_RETRIES = 2;
@@ -135,10 +139,12 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
     const jobStartMs = Date.now();
     // Acquire shared repo lock (keyed on storagePath to match embed handler)
     const analyzeLockKey = getStoragePath(targetPath);
-    const lockErr = acquireRepoLock(analyzeLockKey);
-    if (lockErr) {
-      jobManager.updateJob(job.id, { status: 'failed', error: lockErr });
-      return;
+    if (!opts.lockAlreadyHeld) {
+      const lockErr = acquireRepoLock(analyzeLockKey);
+      if (lockErr) {
+        jobManager.updateJob(job.id, { status: 'failed', error: lockErr });
+        return;
+      }
     }
 
     jobManager.updateJob(job.id, { repoPath: targetPath, status: 'analyzing' });
@@ -165,7 +171,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
       if (!currentJob || currentJob.status === 'complete' || currentJob.status === 'failed') return;
 
       const child = fork(workerPath, [], {
-        execArgv: [...tsxHookArgs, `--max-old-space-size=${workerHeapMb}`],
+        execArgv: buildAnalyzeWorkerExecArgv(tsxHookArgs, String(workerHeapMb)),
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       });
 
@@ -231,6 +237,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
       child.on('exit', (code) => {
         const j = jobManager.getJob(job.id);
         if (!j || j.status === 'complete' || j.status === 'failed') return;
+        if (code === 0) return;
 
         // Worker crashed — attempt retry if under the limit
         if (j.retryCount < MAX_WORKER_RETRIES) {
@@ -273,6 +280,10 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           embeddings: !!opts.embeddings,
           dropEmbeddings: !!opts.dropEmbeddings,
           ...(opts.registryName ? { registryName: opts.registryName } : {}),
+          ...(opts.registryBranch ? { registryBranch: opts.registryBranch } : {}),
+          ...(opts.allowDuplicateName !== undefined
+            ? { allowDuplicateName: opts.allowDuplicateName }
+            : {}),
         },
       });
     };

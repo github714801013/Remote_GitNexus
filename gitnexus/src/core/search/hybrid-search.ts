@@ -158,6 +158,8 @@ export const formatHybridResults = (results: HybridSearchResult[]): string => {
  *
  * When FTS is unavailable (e.g. read-only MCP connection, missing indexes),
  * falls back to semantic-only results instead of crashing (#1489).
+ * When semantic search is unavailable (e.g. embedding service outage),
+ * falls back to BM25-only results instead of failing the query.
  */
 export const hybridSearch = async (
   query: string,
@@ -179,6 +181,11 @@ export const hybridSearch = async (
   } catch {
     // FTS unavailable — continue with semantic-only search
   }
-  const semanticResults = await semanticSearch(executeQuery, query, limit);
+  let semanticResults: SemanticSearchResult[] = [];
+  try {
+    semanticResults = await semanticSearch(executeQuery, query, limit);
+  } catch {
+    // Embedding service unavailable — continue with BM25-only search.
+  }
   return mergeWithRRF(bm25Results, semanticResults, limit);
 };
