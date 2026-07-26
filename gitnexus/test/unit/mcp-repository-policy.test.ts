@@ -60,6 +60,82 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
+describe('MCP request repository scope', () => {
+  const MAPPED_REPOS: RepoListing[] = [
+    { name: 'dev-oanew', path: '/repos/dev-oanew', indexedAt: '2026-01-01', lastCommit: '1'.repeat(40) },
+    { name: 'dev-oa-stock', path: '/repos/dev-oa-stock', indexedAt: '2026-01-02', lastCommit: '2'.repeat(40) },
+    { name: 'oanew', path: '/repos/oanew', indexedAt: '2026-01-03', lastCommit: '3'.repeat(40) },
+    { name: 'oa-stock', path: '/repos/oa-stock', indexedAt: '2026-01-04', lastCommit: '4'.repeat(40) },
+  ];
+
+  it('maps projects and env headers to the explicit repository matrix', async () => {
+    const policy = await createMcpRepositoryPolicy(createBackend(MAPPED_REPOS), {});
+
+    const scoped = policy.forRequestScope({ projects: ' OANEW, oa-stock ', env: ' DEV ' });
+
+    expect((await scoped.scopeBackend(createBackend(MAPPED_REPOS)).listRepos()).map((repo) => repo.name)).toEqual([
+      'dev-oanew',
+      'dev-oa-stock',
+    ]);
+  });
+
+  it('treats a missing header dimension as a wildcard and rejects invalid values', async () => {
+    const backend = createBackend(MAPPED_REPOS);
+    const policy = await createMcpRepositoryPolicy(backend, {});
+
+    expect(
+      (await policy.forRequestScope({ env: 'pro' }).scopeBackend(backend).listRepos()).map(
+        (repo) => repo.name,
+      ),
+    ).toEqual(['oanew', 'oa-stock']);
+    expect(
+      (await policy.forRequestScope({ projects: 'oa-stock' }).scopeBackend(backend).listRepos()).map(
+        (repo) => repo.name,
+      ),
+    ).toEqual(['dev-oa-stock', 'oa-stock']);
+
+    expect(() => policy.forRequestScope({ projects: 'unknown' })).toThrow(/unknown project/i);
+    expect(() => policy.forRequestScope({ env: 'staging' })).toThrow(/unknown environment/i);
+    expect(() => policy.forRequestScope({ projects: 'oanew,,oa-stock' })).toThrow(/empty/i);
+    expect(() => policy.forRequestScope({ projects: '*' })).toThrow(/invalid/i);
+  });
+
+  it('intersects request scope with the global allowlist and fails on an empty intersection', async () => {
+    const backend = createBackend(MAPPED_REPOS);
+    const policy = await createMcpRepositoryPolicy(backend, {
+      GITNEXUS_MCP_ALLOWED_REPOS: 'dev-oanew,oa-stock',
+    });
+
+    const scoped = policy.forRequestScope({ projects: 'oanew,oa-stock', env: 'pro' });
+    expect((await scoped.scopeBackend(backend).listRepos()).map((repo) => repo.name)).toEqual([
+      'oa-stock',
+    ]);
+
+    expect(() =>
+      policy.forRequestScope({ projects: 'oanew', env: 'pro' }),
+    ).toThrow(/no repositories match/i);
+  });
+
+  it('lets list_repos(isAll=true) inspect all index entries without widening tool scope', async () => {
+    const backend = createBackend(MAPPED_REPOS);
+    const policy = await createMcpRepositoryPolicy(backend, {});
+    const scoped = policy.forRequestScope({ env: 'pro' }).scopeBackend(backend);
+
+    const all = (await scoped.callTool('list_repos', { isAll: true })) as {
+      repositories: RepoListing[];
+    };
+    expect(all.repositories.map((repo) => repo.name)).toEqual([
+      'dev-oa-stock',
+      'dev-oanew',
+      'oa-stock',
+      'oanew',
+    ]);
+    await expect(scoped.callTool('query', { search_query: 'auth', repo: 'dev-oanew' })).rejects.toThrow(
+      /not available/i,
+    );
+  });
+});
+
 describe('MCP repository policy', () => {
   it('trims, resolves, and deduplicates configured repository specifiers', async () => {
     const backend = createBackend();

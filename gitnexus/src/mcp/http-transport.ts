@@ -225,7 +225,7 @@ export function startIdleSweep<T extends { server: Server; lastActivity: number 
 export function createStreamableHttpHandler(
   backend: LocalBackend,
   opts: {
-    createServer?: () => Server;
+    createServer?: (repositoryPolicy: McpRepositoryPolicy) => Server;
     host?: string;
     port?: number;
     repositoryPolicy?: McpRepositoryPolicy;
@@ -295,13 +295,20 @@ export function createStreamableHttpHandler(
         return;
       }
 
+      // Resolve and bind the request scope before allocating the transport or Server.
+      // A malformed or empty request scope must fail initialization without leaving
+      // an orphaned session object behind.
+      const sessionPolicy = (await getRepositoryPolicy()).forRequestScope({
+        projects: req.headers.projects,
+        env: req.headers.env,
+      });
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         ...dnsRebinding,
       });
       const server = opts.createServer
-        ? opts.createServer()
-        : createMCPServer(backend, { repositoryPolicy: await getRepositoryPolicy() });
+        ? opts.createServer(sessionPolicy)
+        : createMCPServer(backend, { repositoryPolicy: sessionPolicy });
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
 
@@ -394,8 +401,12 @@ export function createSseHandlers(
     }
 
     // SSEServerTransport(endpoint, res, options): endpoint is the path clients POST to.
+    const sessionPolicy = (await getRepositoryPolicy()).forRequestScope({
+      projects: req.headers.projects,
+      env: req.headers.env,
+    });
     const transport = new SSEServerTransport(messagesPath, res, dnsRebinding);
-    const server = createMCPServer(backend, { repositoryPolicy: await getRepositoryPolicy() });
+    const server = createMCPServer(backend, { repositoryPolicy: sessionPolicy });
 
     sseSessions.set(transport.sessionId, { server, transport, lastActivity: Date.now() });
 

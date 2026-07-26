@@ -91,6 +91,8 @@ Returns a page of repositories — each with name, path, indexed date, last comm
 
 PAGINATION: Results are paginated so a large registry is not truncated by MCP/LLM token limits. "limit" sets the page size (default ${LIST_REPOS_DEFAULT_LIMIT}, max ${LIST_REPOS_MAX_LIMIT}; values above the max are rejected, not capped). "offset" selects the start. To enumerate EVERY repository: when pagination.hasMore is true, call list_repos again with offset set to pagination.nextOffset, and repeat until hasMore is false. Repositories are returned in a stable order, so paging never skips or duplicates an entry while the registry is unchanged.
 
+Set \"isAll\" to true to inspect index status for every indexed repository. This does not grant access to code tools or repository resources outside the current session scope.
+
 WHEN TO USE: First step when multiple repos are indexed, or to discover available repos.
 AFTER THIS: READ gitnexus://repo/{name}/context for the repo you want to work with.
 
@@ -113,6 +115,12 @@ on other tools (query, context, impact, etc.) to target the correct one.`,
             'Number of repositories to skip before this page (default: 0). Pass pagination.nextOffset from the previous response to fetch the next page.',
           default: 0,
           minimum: 0,
+        },
+        isAll: {
+          type: 'boolean',
+          description:
+            'When true, inspect index status for all repositories without widening other MCP permissions.',
+          default: false,
         },
       },
       required: [],

@@ -35,6 +35,7 @@ import {
   SHUTDOWN_EXIT_CODES,
 } from '../../src/mcp/server.js';
 import { mountMCPEndpoints } from '../../src/server/mcp-http.js';
+import type { McpRepositoryPolicy } from '../../src/mcp/repository-policy.js';
 
 // ─── Live-HTTP helpers (real req/res for SDK-touching paths) ───────────
 
@@ -379,6 +380,68 @@ describe('startMcpHttpServer', () => {
 });
 
 // ─── createStreamableHttpHandler ──────────────────────────────────────
+
+describe('MCP request scope session binding', () => {
+  it('binds projects/env at initialize and ignores changed headers on the same session', async () => {
+    const backend = createMockBackend({
+      listRepos: vi.fn().mockResolvedValue([
+        { name: 'dev-oanew', path: '/repos/dev-oanew', indexedAt: '2026-01-01', lastCommit: '1'.repeat(40) },
+        { name: 'oanew', path: '/repos/oanew', indexedAt: '2026-01-02', lastCommit: '2'.repeat(40) },
+        { name: 'dev-oa-stock', path: '/repos/dev-oa-stock', indexedAt: '2026-01-03', lastCommit: '3'.repeat(40) },
+      ]),
+    });
+    const policies: McpRepositoryPolicy[] = [];
+    const { handler, cleanup } = createStreamableHttpHandler(backend as never, {
+      createServer: (policy) => {
+        policies.push(policy);
+        return createMCPServer(backend as never, { repositoryPolicy: policy });
+      },
+    });
+    const app = express();
+    app.use(express.json());
+    app.all('/mcp', (req, res) => void handler(req, res).catch(() => {}));
+    const { port, close } = await listen(app);
+
+    const initialized = await request(
+      port,
+      'POST',
+      '/mcp',
+      {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        projects: 'oanew',
+        env: 'pro',
+      },
+      JSON.stringify(validInitialize()),
+    );
+    const sessionId = initialized.headers['mcp-session-id'];
+    expect(initialized.status).toBe(200);
+    expect(typeof sessionId).toBe('string');
+    expect(policies).toHaveLength(1);
+    expect((await policies[0]!.scopeBackend(backend as never).listRepos()).map((repo) => repo.name)).toEqual([
+      'oanew',
+    ]);
+
+    const followUp = await request(
+      port,
+      'POST',
+      '/mcp',
+      {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'mcp-session-id': String(sessionId),
+        projects: 'oa-stock',
+        env: 'dev',
+      },
+      JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', id: 2, params: {} }),
+    );
+    expect(followUp.status).toBe(200);
+    expect(policies).toHaveLength(1);
+
+    await close();
+    await cleanup();
+  });
+});
 
 describe('createStreamableHttpHandler', () => {
   it('attempts to create a new session for a POST with no session id', async () => {
