@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { LocalBackend } from '../../src/mcp/local/local-backend.js';
 import * as zoektClient from '../../src/core/search/zoekt-client.js';
 import { semanticSearch, semanticSearchMany } from '../../src/core/neo4j/embedding-adapter.js';
@@ -62,6 +62,18 @@ vi.mock('../../src/core/neo4j/read-adapter.js', () => ({
 vi.spyOn(zoektClient, 'loadZoektConfig').mockReturnValue({
   enabled: false,
   endpoints: [],
+});
+
+const originalStorageBackend = process.env.GITNEXUS_STORAGE_BACKEND;
+beforeAll(() => {
+  process.env.GITNEXUS_STORAGE_BACKEND = 'neo4j';
+});
+afterAll(() => {
+  if (originalStorageBackend === undefined) {
+    delete process.env.GITNEXUS_STORAGE_BACKEND;
+  } else {
+    process.env.GITNEXUS_STORAGE_BACKEND = originalStorageBackend;
+  }
 });
 
 describe('Neo4j cross-repo vector discovery', () => {
@@ -558,7 +570,10 @@ describe('Neo4j cross-repo vector discovery', () => {
       { query: 'handler', limit: 1, max_symbols: 2 },
     );
 
-    expect(executeReadCypher).toHaveBeenCalledTimes(3);
+    const enrichmentCalls = vi.mocked(executeReadCypher).mock.calls.filter(([query]) =>
+      query.includes('STEP_IN_PROCESS') || query.includes('MEMBER_OF'),
+    );
+    expect(enrichmentCalls).toHaveLength(2);
     expect(result.processes.map((process: any) => process.id)).toEqual(['Process:A']);
     expect(result.process_symbols.map((symbol: any) => symbol.id)).toContain('Function:a');
   });

@@ -261,7 +261,7 @@ describe('LocalBackend context and impact with Neo4j backend', () => {
     );
     expect(executeReadCypher).toHaveBeenNthCalledWith(
       2,
-      expect.stringContaining('MATCH (source {repoId: $repoId})-[r:ENTRY_POINT_OF]->'),
+      expect.stringContaining('MATCH (source {repoId: $repoId})-[:ENTRY_POINT_OF]->'),
       { repoId: 'Repo A', nodeIds: ['Route:/api/users'] },
     );
     expect(result).toMatchObject({

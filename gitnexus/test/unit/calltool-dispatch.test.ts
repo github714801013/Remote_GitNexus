@@ -2715,12 +2715,12 @@ describe('LocalBackend.resolveRepo', () => {
     );
   });
 
-  it('throws for ambiguous repos without param', async () => {
+  it('queries all authorized repos without a repo param', async () => {
     setupMultipleRepos();
     await backend.init();
-    await expect(backend.callTool('query', { query: 'test' })).rejects.toThrow(
-      'Multiple repositories indexed',
-    );
+    const result = await backend.callTool('query', { query: 'test' });
+    expect(result).toHaveProperty('processes');
+    expect(result).toHaveProperty('definitions');
   });
 
   it('resolves repo by name parameter', async () => {
