@@ -8603,17 +8603,32 @@ export class LocalBackend {
   async queryProcesses(repoName?: string, limit = 50): Promise<{ processes: any[] }> {
     const repo = await this.resolveRepo(repoName);
     await this.ensureInitialized(repo);
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const neo4jBackendEnabled = isNeo4jBackendEnabled();
+    const boundedLimit = Math.max(1, Math.min(1000, Math.trunc(limit)));
 
     try {
-      const processes = await executeQuery(
-        repo.lbugPath,
-        `
-        MATCH (p:Process)
-        RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
-        ORDER BY p.stepCount DESC
-        LIMIT ${limit}
-      `,
-      );
+      const processes = neo4jBackendEnabled
+        ? await (
+            await import('../../core/neo4j/read-adapter.js')
+          ).executeReadCypher(
+            `
+            MATCH (p:Process {repoId: $repoId})
+            RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
+            ORDER BY p.stepCount DESC
+            LIMIT ${boundedLimit}
+          `,
+            { repoId: repo.name },
+          )
+        : await executeQuery(
+            repo.lbugPath,
+            `
+            MATCH (p:Process)
+            RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
+            ORDER BY p.stepCount DESC
+            LIMIT ${boundedLimit}
+          `,
+          );
       return {
         processes: processes.map((p: any) => ({
           id: p.id || p[0],
@@ -8623,7 +8638,8 @@ export class LocalBackend {
           stepCount: p.stepCount || p[4],
         })),
       };
-    } catch {
+    } catch (err) {
+      if (neo4jBackendEnabled) throw err;
       return { processes: [] };
     }
   }
@@ -8698,30 +8714,55 @@ export class LocalBackend {
   async queryProcessDetail(name: string, repoName?: string): Promise<any> {
     const repo = await this.resolveRepo(repoName);
     await this.ensureInitialized(repo);
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const neo4jBackendEnabled = isNeo4jBackendEnabled();
 
-    const processes = await executeParameterized(
-      repo.lbugPath,
-      `
-      MATCH (p:Process)
-      WHERE p.label = $processName OR p.heuristicLabel = $processName
-      RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
-      LIMIT 1
-    `,
-      { processName: name },
-    );
+    const processes = neo4jBackendEnabled
+      ? await (
+          await import('../../core/neo4j/read-adapter.js')
+        ).executeReadCypher(
+          `
+          MATCH (p:Process {repoId: $repoId})
+          WHERE p.label = $processName OR p.heuristicLabel = $processName
+          RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
+          LIMIT 1
+        `,
+          { repoId: repo.name, processName: name },
+        )
+      : await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (p:Process)
+          WHERE p.label = $processName OR p.heuristicLabel = $processName
+          RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
+          LIMIT 1
+        `,
+          { processName: name },
+        );
     if (processes.length === 0) return { error: `Process '${name}' not found` };
 
     const proc = processes[0];
     const procId = proc.id || proc[0];
-    const steps = await executeParameterized(
-      repo.lbugPath,
-      `
-      MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: $procId})
-      RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step
-      ORDER BY r.step
-    `,
-      { procId },
-    );
+    const steps = neo4jBackendEnabled
+      ? await (
+          await import('../../core/neo4j/read-adapter.js')
+        ).executeReadCypher(
+          `
+          MATCH (n:CodeNode {repoId: $repoId})-[r:STEP_IN_PROCESS]->(p:Process {repoId: $repoId, id: $procId})
+          RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step
+          ORDER BY r.step
+        `,
+          { repoId: repo.name, procId },
+        )
+      : await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: $procId})
+          RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step
+          ORDER BY r.step
+        `,
+          { procId },
+        );
 
     return {
       process: {
@@ -8739,7 +8780,6 @@ export class LocalBackend {
       })),
     };
   }
-
   async disconnect(): Promise<void> {
     await closeLbug(); // close all connections
     // Note: we intentionally do NOT call disposeEmbedder() here.
