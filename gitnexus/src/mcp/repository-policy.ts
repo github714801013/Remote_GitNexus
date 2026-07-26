@@ -26,18 +26,18 @@ export interface McpRequestScopeHeaders {
   env?: string | readonly string[];
 }
 
-interface RepositoryMatrixEntry {
-  project: 'oanew' | 'oa-stock';
-  env: 'dev' | 'pro';
-  repository: string;
+type RequestEnvironment = 'dev' | 'pro';
+
+const REQUEST_ENVIRONMENTS: readonly RequestEnvironment[] = ['dev', 'pro'];
+
+function repositoryNameForEnvironment(project: string, environment: RequestEnvironment): string {
+  return environment === 'dev' ? 'dev-' + project : project;
 }
 
-const REPOSITORY_MATRIX: readonly RepositoryMatrixEntry[] = [
-  { project: 'oanew', env: 'dev', repository: 'dev-oanew' },
-  { project: 'oa-stock', env: 'dev', repository: 'dev-oa-stock' },
-  { project: 'oanew', env: 'pro', repository: 'oanew' },
-  { project: 'oa-stock', env: 'pro', repository: 'oa-stock' },
-];
+function repositoryMatchesEnvironment(repositoryName: string, environment: RequestEnvironment): boolean {
+  const normalized = repositoryName.toLowerCase();
+  return environment === 'dev' ? normalized.startsWith('dev-') : !normalized.startsWith('dev-');
+}
 
 function parseRequestHeaderList(
   value: string | readonly string[] | undefined,
@@ -54,30 +54,25 @@ function parseRequestHeaderList(
 
 function validateRequestScope(
   headers: McpRequestScopeHeaders,
-): { projects?: string[]; env?: string[] } | undefined {
+): { projects?: string[]; env?: RequestEnvironment[] } | undefined {
   const projects = parseRequestHeaderList(headers.projects, 'projects');
   const env = parseRequestHeaderList(headers.env, 'env');
   if (projects === undefined && env === undefined) return undefined;
 
-  const supportedProjects = new Set(REPOSITORY_MATRIX.map((entry) => entry.project));
-  const supportedEnvs = new Set(REPOSITORY_MATRIX.map((entry) => entry.env));
   for (const project of projects ?? []) {
     if (project === '*') {
       throw new Error('MCP projects header contains an invalid wildcard value.');
-    }
-    if (!supportedProjects.has(project as 'oanew' | 'oa-stock')) {
-      throw new Error(`MCP projects header contains an unknown project: ${project}.`);
     }
   }
   for (const environment of env ?? []) {
     if (environment === '*') {
       throw new Error('MCP env header contains an invalid wildcard value.');
     }
-    if (!supportedEnvs.has(environment as 'dev' | 'pro')) {
-      throw new Error(`MCP env header contains an unknown environment: ${environment}.`);
+    if (!REQUEST_ENVIRONMENTS.includes(environment as RequestEnvironment)) {
+      throw new Error('MCP env header contains an unknown environment: ' + environment + '.');
     }
   }
-  return { projects, env };
+  return { projects, env: env as RequestEnvironment[] | undefined };
 }
 
 function configuredValue(
@@ -239,15 +234,27 @@ export class McpRepositoryPolicy {
     const scope = validateRequestScope(headers);
     if (!scope) return this;
 
-    const requestedNames = new Set(
-      REPOSITORY_MATRIX
-        .filter(
-          (entry) =>
-            (scope.projects === undefined || scope.projects.includes(entry.project)) &&
-            (scope.env === undefined || scope.env.includes(entry.env)),
-        )
-        .map((entry) => entry.repository.toLowerCase()),
-    );
+    const environments = scope.env ?? REQUEST_ENVIRONMENTS;
+    const requestedNames = new Set<string>();
+    if (scope.projects) {
+      for (const project of scope.projects) {
+        for (const environment of environments) {
+          requestedNames.add(repositoryNameForEnvironment(project, environment));
+        }
+      }
+    } else {
+      for (const repo of this.registry) {
+        if (environments.some((environment) => repositoryMatchesEnvironment(repo.name, environment))) {
+          requestedNames.add(repo.name.toLowerCase());
+        }
+      }
+    }
+
+    const registeredNames = new Set(this.registry.map((repo) => repo.name.toLowerCase()));
+    if (scope.projects && ![...requestedNames].some((name) => registeredNames.has(name))) {
+      throw new Error('MCP projects header contains an unknown project: ' + scope.projects.join(', ') + '.');
+    }
+
     const allowed = this.registry.filter(
       (repo) =>
         requestedNames.has(repo.name.toLowerCase()) && this.allowedPathKeys.has(repo.pathKey),

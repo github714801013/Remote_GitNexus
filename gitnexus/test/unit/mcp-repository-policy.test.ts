@@ -68,6 +68,78 @@ describe('MCP request repository scope', () => {
     { name: 'oa-stock', path: '/repos/oa-stock', indexedAt: '2026-01-04', lastCommit: '4'.repeat(40) },
   ];
 
+  it('resolves dynamic project/environment candidates and tolerates a missing candidate', async () => {
+    const repos: RepoListing[] = [
+      {
+        name: 'jiuji-m',
+        path: '/repos/jiuji-m',
+        indexedAt: '2026-01-01',
+        lastCommit: '5'.repeat(40),
+      },
+      {
+        name: 'dev-oa-stock',
+        path: '/repos/dev-oa-stock',
+        indexedAt: '2026-01-02',
+        lastCommit: '6'.repeat(40),
+      },
+    ];
+    const backend = createBackend(repos);
+    const policy = await createMcpRepositoryPolicy(backend, {});
+
+    const scoped = policy.forRequestScope({ projects: ' JIUJI-M ', env: 'pro, dev' });
+
+    expect((await scoped.scopeBackend(backend).listRepos()).map((repo) => repo.name)).toEqual([
+      'jiuji-m',
+    ]);
+  });
+
+  it('does not require projects when environment is provided', async () => {
+    const repos: RepoListing[] = [
+      {
+        name: 'jiuji-m',
+        path: '/repos/jiuji-m',
+        indexedAt: '2026-01-01',
+        lastCommit: '7'.repeat(40),
+      },
+      {
+        name: 'dev-jiuji-m',
+        path: '/repos/dev-jiuji-m',
+        indexedAt: '2026-01-02',
+        lastCommit: '8'.repeat(40),
+      },
+      {
+        name: 'other',
+        path: '/repos/other',
+        indexedAt: '2026-01-03',
+        lastCommit: '9'.repeat(40),
+      },
+    ];
+    const backend = createBackend(repos);
+    const policy = await createMcpRepositoryPolicy(backend, {});
+
+    expect(
+      (await policy.forRequestScope({ env: 'dev' }).scopeBackend(backend).listRepos()).map(
+        (repo) => repo.name,
+      ),
+    ).toEqual(['dev-jiuji-m']);
+  });
+
+  it('rejects a project when none of its generated candidates are indexed', async () => {
+    const backend = createBackend([
+      {
+        name: 'jiuji-m',
+        path: '/repos/jiuji-m',
+        indexedAt: '2026-01-01',
+        lastCommit: 'a'.repeat(40),
+      },
+    ]);
+    const policy = await createMcpRepositoryPolicy(backend, {});
+
+    expect(() =>
+      policy.forRequestScope({ projects: 'missing-project', env: 'dev,pro' }),
+    ).toThrow(/unknown project|no repositories match/i);
+  });
+
   it('maps projects and env headers to the explicit repository matrix', async () => {
     const policy = await createMcpRepositoryPolicy(createBackend(MAPPED_REPOS), {});
 
