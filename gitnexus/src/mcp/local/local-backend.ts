@@ -63,6 +63,7 @@ import {
 import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME } from '../../core/lbug/schema.js';
 import { getExactScanLimit } from '../../core/platform/capabilities.js';
 import { PhaseTimer } from '../../core/search/phase-timer.js';
+import { loadZoektConfig, ZoektClient } from '../../core/search/zoekt-client.js';
 import { ftsDegradedWarning } from '../../core/search/fts-indexes.js';
 import {
   cjkSegmentationModeMismatch,
@@ -145,6 +146,14 @@ function resolveAliasString(canonical: unknown, legacy: unknown): string | undef
     if (typeof value === 'string' && value.trim()) return value;
   }
   return undefined;
+}
+
+function semanticQueryFromZoekt(query: string): string {
+  return query
+    .replace(/[()\"']/g, ' ')
+    .replace(/\b(?:AND|OR|NOT)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 interface StringAliasDefinition {
@@ -232,6 +241,68 @@ async function withTimeout<T>(
   } finally {
     if (timeout) clearTimeout(timeout);
   }
+}
+
+const RRF_K = 60;
+const SEARCH_SOURCE_WEIGHTS = {
+  bm25: 1,
+  vector: 0.8,
+  zoekt: 1.2,
+} as const;
+const CROSS_REPO_ZOEKT_DISCOVERY_LIMIT = 200;
+const CROSS_REPO_VECTOR_MATCHES_PER_REPO = 5;
+const CROSS_REPO_VECTOR_DISCOVERY_CONCURRENCY = 4;
+const MATCH_SNIPPET_MAX_CHARS = 240;
+
+type QueryMatchSource = 'zoekt' | 'vector';
+
+interface QueryMatchSummary {
+  repo: string;
+  filePath: string;
+  source: QueryMatchSource;
+  id?: string;
+  type?: string;
+  score: number;
+  name?: string;
+  startLine?: number;
+  endLine?: number;
+  snippet?: string;
+}
+
+interface QueryRepoCandidate {
+  repo: RepoHandle;
+  score: number;
+  matches: QueryMatchSummary[];
+}
+
+type QueryDiscoveryInput =
+  | string
+  | {
+      keywordQuery: string;
+      semanticQuery: string;
+    };
+
+function positiveEnvInt(name: string, fallback: number): number {
+  const value = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+async function mapWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) return;
+  const limit = Math.max(1, Math.min(concurrency, items.length));
+  let nextIndex = 0;
+  await Promise.all(
+    Array.from({ length: limit }, async () => {
+      while (nextIndex < items.length) {
+        const item = items[nextIndex++];
+        await worker(item);
+      }
+    }),
+  );
 }
 
 // AI context generation is CLI-only (gitnexus analyze)
@@ -792,6 +863,7 @@ export class LocalBackend {
   private contextCache: Map<string, CodebaseContext> = new Map();
   private initializedRepos: Set<string> = new Set();
   private reinitPromises: Map<string, Promise<void>> = new Map();
+  private crossRepoOperationTails: Map<string, Promise<void>> = new Map();
   private lastStalenessCheck: Map<string, number> = new Map();
   // #2655: commit-behind freshness for the hot read tools. Stores the IN-FLIGHT
   // promise (not just a timestamp) so N concurrent tool calls arriving before
@@ -1874,6 +1946,394 @@ export class LocalBackend {
     return entry.value;
   }
 
+  private compactMatchSnippet(value: unknown): string | undefined {
+    if (typeof value !== 'string') return undefined;
+    const compacted = value.replace(/\s+/g, ' ').trim();
+    if (!compacted) return undefined;
+    return compacted.length > MATCH_SNIPPET_MAX_CHARS
+      ? `${compacted.slice(0, MATCH_SNIPPET_MAX_CHARS)}...`
+      : compacted;
+  }
+
+  private pushQueryCandidateMatch(
+    candidates: Map<string, QueryRepoCandidate>,
+    repo: RepoHandle,
+    match: QueryMatchSummary,
+  ): void {
+    const existing = candidates.get(repo.id);
+    if (existing) {
+      existing.score += match.score;
+      existing.matches.push(match);
+      return;
+    }
+    candidates.set(repo.id, { repo, score: match.score, matches: [match] });
+  }
+
+  private async runCrossRepoOperationForRepo<T>(
+    repoId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.crossRepoOperationTails.get(repoId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.catch(() => {}).then(() => gate);
+    this.crossRepoOperationTails.set(repoId, tail);
+
+    await previous.catch(() => {});
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.crossRepoOperationTails.get(repoId) === tail) {
+        this.crossRepoOperationTails.delete(repoId);
+      }
+    }
+  }
+
+  private async discoverQueryCandidates(
+    input: QueryDiscoveryInput,
+    repos: RepoHandle[],
+  ): Promise<QueryRepoCandidate[]> {
+    const keywordQuery = typeof input === 'string' ? input : input.keywordQuery;
+    const semanticQuery = typeof input === 'string' ? input : input.semanticQuery;
+    const candidates = new Map<string, QueryRepoCandidate>();
+    const scopedRepoIds = new Set(repos.map((repo) => repo.id));
+
+    const zoektTask = (async () => {
+      try {
+        const { ZoektClient, loadZoektConfig } = await import('../../core/search/zoekt-client.js');
+        const config = loadZoektConfig();
+        if (!config.enabled) return;
+
+        const result = await new ZoektClient(config).search(keywordQuery, {
+          maxDocDisplayCount: CROSS_REPO_ZOEKT_DISCOVERY_LIMIT,
+        });
+        result.matches.forEach((match, index) => {
+          const repo = this.resolveRepoFromZoektRepository(match.repository);
+          if (!repo || !scopedRepoIds.has(repo.id)) return;
+          const hitLine = this.getZoektHitLine(match);
+          this.pushQueryCandidateMatch(candidates, repo, {
+            repo: repo.name,
+            filePath: match.fileName,
+            source: 'zoekt',
+            score: SEARCH_SOURCE_WEIGHTS.zoekt / (RRF_K + index + 1),
+            startLine: hitLine ?? undefined,
+            endLine: hitLine ?? undefined,
+            snippet: this.compactMatchSnippet(
+              match.lineMatches?.find((line: any) => !line.isContext)?.line ??
+                match.lineMatches?.[0]?.line,
+            ),
+          });
+        });
+      } catch (e) {
+        console.error(`GitNexus: Zoekt discovery failed: ${e}`);
+      }
+    })();
+
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const vectorTask = isNeo4jBackendEnabled()
+      ? (async () => {
+          try {
+            const repoById = new Map(repos.map((repo) => [repo.name, repo]));
+            const { embedQuery } = await import('../core/embedder.js');
+            const queryVec = await embedQuery(semanticQuery);
+            const { semanticSearchMany } = await import('../../core/neo4j/embedding-adapter.js');
+            const matches = await semanticSearchMany(
+              repos.map((repo) => repo.name),
+              queryVec,
+              CROSS_REPO_VECTOR_MATCHES_PER_REPO * repos.length,
+            );
+            matches.forEach((match, index) => {
+              const repo = repoById.get(match.repoId ?? '');
+              if (!repo) return;
+              this.pushQueryCandidateMatch(candidates, repo, {
+                repo: repo.name,
+                filePath: match.filePath,
+                source: 'vector',
+                score: SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + index + 1),
+                id: match.nodeId,
+                name: match.name,
+                type: match.type,
+                startLine: match.startLine,
+                endLine: match.endLine,
+              });
+            });
+          } catch (e) {
+            logQueryError('query:vector-discovery:neo4j', e);
+          }
+        })()
+      : mapWithConcurrency(
+          repos,
+          positiveEnvInt(
+            'GITNEXUS_CROSS_REPO_VECTOR_CONCURRENCY',
+            CROSS_REPO_VECTOR_DISCOVERY_CONCURRENCY,
+          ),
+          async (repo) => {
+            try {
+              const matches = await this.runCrossRepoOperationForRepo(repo.id, async () => {
+                await this.ensureInitialized(repo);
+                return this.semanticSearch(repo, semanticQuery, CROSS_REPO_VECTOR_MATCHES_PER_REPO);
+              });
+              matches.forEach((match, index) => {
+                this.pushQueryCandidateMatch(candidates, repo, {
+                  repo: repo.name,
+                  filePath: match.filePath,
+                  source: 'vector',
+                  score: SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + index + 1),
+                  id: match.nodeId,
+                  name: match.name,
+                  type: match.type,
+                  startLine: match.startLine,
+                  endLine: match.endLine,
+                });
+              });
+            } catch (e) {
+              logQueryError(`query:vector-discovery:${repo.name}`, e);
+            }
+          },
+        );
+
+    await Promise.all([zoektTask, vectorTask]);
+
+    return [...candidates.values()]
+      .map((candidate) => ({
+        ...candidate,
+        matches: candidate.matches.sort((a, b) => b.score - a.score).slice(0, 10),
+      }))
+      .sort((a, b) => b.score - a.score);
+  }
+
+  private resolveRepoFromZoektRepository(rawName: string): RepoHandle | null {
+    let handle = this.resolveRepoFromCache(rawName);
+    if (handle) return handle;
+
+    const segments = rawName.split('/');
+    for (let i = 0; i < segments.length; i++) {
+      const suffix = segments.slice(i).join('/');
+      handle = this.resolveRepoFromCache(suffix);
+      if (handle) return handle;
+    }
+    return null;
+  }
+  private selectTopMatchesWithRepoCoverage(
+    matches: QueryMatchSummary[],
+    limit: number,
+  ): QueryMatchSummary[] {
+    const sorted = [...matches].sort((a, b) => b.score - a.score);
+    const selected: QueryMatchSummary[] = [];
+    const selectedMatches = new Set<QueryMatchSummary>();
+    const coveredRepos = new Set<string>();
+
+    for (const match of sorted) {
+      if (selected.length >= limit) break;
+      if (coveredRepos.has(match.repo)) continue;
+      selected.push(match);
+      selectedMatches.add(match);
+      coveredRepos.add(match.repo);
+    }
+
+    for (const match of sorted) {
+      if (selected.length >= limit) break;
+      if (selectedMatches.has(match)) continue;
+      selected.push(match);
+    }
+
+    return selected.sort((a, b) => b.score - a.score);
+  }
+
+  /**
+   * Merge results from multiple single-repo query calls into one unified response.
+   */
+  private mergeQueryResults(results: any[]): any {
+    if (results.length === 0) return { processes: [], process_symbols: [], definitions: [] };
+    if (results.length === 1 && !results[0]?.error && !Array.isArray(results[0]?.errors)) {
+      return results[0];
+    }
+
+    const merged = {
+      processes: [] as any[],
+      process_symbols: [] as any[],
+      definitions: [] as any[],
+      matches: [] as QueryMatchSummary[],
+      matched_repos: [] as string[],
+      timing: { wall: 0 } as Record<string, number>,
+      warning: undefined as string | undefined,
+      errors: [] as Array<{ repo?: string; error: string }>,
+    };
+
+    const seenSymbolIds = new Set<string>();
+    const seenProcessIds = new Set<string>();
+    const seenMatchKeys = new Set<string>();
+
+    for (const res of results) {
+      if (res?.error) {
+        merged.errors.push({ repo: res.repo, error: String(res.error) });
+        continue;
+      }
+      if (Array.isArray(res?.errors)) {
+        merged.errors.push(
+          ...res.errors.map((error: any) => ({
+            repo: error?.repo,
+            error: String(error?.error ?? error),
+          })),
+        );
+      }
+      if (res.processes) {
+        for (const p of res.processes) {
+          const key = `${p.repo ?? ''}:${p.id}`;
+          if (!seenProcessIds.has(key)) {
+            merged.processes.push(p);
+            seenProcessIds.add(key);
+          }
+        }
+      }
+      if (res.process_symbols) {
+        for (const s of res.process_symbols) {
+          const key = `${s.repo ?? ''}:${s.id}`;
+          if (!seenSymbolIds.has(key)) {
+            merged.process_symbols.push(s);
+            seenSymbolIds.add(key);
+          }
+        }
+      }
+      if (res.definitions) {
+        for (const d of res.definitions) {
+          const fallbackKey = `${d.repo ?? ''}:${d.filePath}:${d.name}`;
+          const key = d.id ? `${d.repo ?? ''}:${d.id}` : fallbackKey;
+          if (!seenSymbolIds.has(key)) {
+            merged.definitions.push(d);
+            seenSymbolIds.add(key);
+          }
+        }
+      }
+      if (res.matches) {
+        for (const match of res.matches) {
+          const key = `${match.repo}:${match.filePath}:${match.startLine ?? ''}:${match.endLine ?? ''}:${match.source}`;
+          if (!seenMatchKeys.has(key)) {
+            merged.matches.push(match);
+            seenMatchKeys.add(key);
+          }
+        }
+      }
+      if (res.timing) {
+        merged.timing.wall = Math.max(merged.timing.wall, res.timing.wall || 0);
+        // Accumulate other phases if helpful, but wall is primary
+      }
+      if (res.warning) merged.warning = res.warning;
+    }
+
+    // Re-sort processes by priority across all repos
+    merged.processes = merged.processes.sort((a, b) => b.priority - a.priority).slice(0, 10);
+    merged.definitions = merged.definitions.slice(0, 30);
+    merged.matches = this.selectTopMatchesWithRepoCoverage(merged.matches, 50);
+    merged.matched_repos = [...new Set(merged.matches.map((match) => match.repo))];
+    if (merged.errors.length === 0) delete (merged as any).errors;
+    if (merged.matches.length === 0) {
+      delete (merged as any).matches;
+      delete (merged as any).matched_repos;
+    }
+
+    return merged;
+  }
+  private getZoektHitLine(match: any): number | null {
+    const hitLine =
+      match.lineMatches?.find((line: any) => !line.isContext && Number.isFinite(line.lineNumber))
+        ?.lineNumber ??
+      match.lineMatches?.find((line: any) => Number.isFinite(line.lineNumber))?.lineNumber;
+
+    return Number.isFinite(hitLine) ? hitLine : null;
+  }
+
+  private toZoektSymbol(row: any, match: any): any {
+    const nodeId = row.id ?? row.nodeId ?? row[0];
+    if (!nodeId) return null;
+    return {
+      nodeId,
+      name: row.name ?? row[1] ?? match.fileName.split('/').pop() ?? match.fileName,
+      type: row.type ?? row[2],
+      filePath: row.filePath ?? row[3] ?? match.fileName,
+      startLine: row.startLine ?? row[4],
+      endLine: row.endLine ?? row[5],
+      zoektScore: match.score,
+    };
+  }
+
+  private async resolveZoektMatchSymbols(
+    repo: RepoHandle,
+    matches: any[],
+  ): Promise<Map<number, any>> {
+    const hits = matches
+      .map((match, index) => ({ match, index, lineNumber: this.getZoektHitLine(match) }))
+      .filter(
+        (hit): hit is { match: any; index: number; lineNumber: number } => hit.lineNumber !== null,
+      );
+
+    const resolved = new Map<number, any>();
+    if (hits.length === 0) return resolved;
+
+    const queryParams: Record<string, string | number> = {};
+    const clauses = hits.map((hit, i) => {
+      queryParams[`filePath${i}`] = hit.match.fileName;
+      queryParams[`lineNumber${i}`] = hit.lineNumber;
+      return `(n.filePath = $filePath${i} AND n.startLine <= $lineNumber${i} AND n.endLine >= $lineNumber${i})`;
+    });
+
+    try {
+      const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+      const rows = isNeo4jBackendEnabled()
+        ? await (async () => {
+            const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+            return await executeReadCypher(
+              `
+        MATCH (n {repoId: $repoId})
+        WHERE labels(n)[0] IN ['Function', 'Method', 'Class', 'Interface', 'Constructor', 'Route', 'Tool']
+          AND (${clauses.join(' OR ')})
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+        ORDER BY (n.endLine - n.startLine) ASC
+      `,
+              { repoId: repo.name, ...queryParams },
+            );
+          })()
+        : await executeParameterized(
+            repo.id,
+            `
+        MATCH (n)
+        WHERE labels(n)[0] IN ['Function', 'Method', 'Class', 'Interface', 'Constructor', 'Route', 'Tool']
+          AND (${clauses.join(' OR ')})
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+        ORDER BY (n.endLine - n.startLine) ASC
+      `,
+            queryParams,
+          );
+      for (const hit of hits) {
+        const row = rows
+          .filter((candidate: any) => {
+            const filePath = candidate.filePath ?? candidate[3];
+            const startLine = candidate.startLine ?? candidate[4];
+            const endLine = candidate.endLine ?? candidate[5];
+            return (
+              filePath === hit.match.fileName &&
+              startLine <= hit.lineNumber &&
+              endLine >= hit.lineNumber
+            );
+          })
+          .sort((a: any, b: any) => {
+            const aWidth = (a.endLine ?? a[5] ?? 0) - (a.startLine ?? a[4] ?? 0);
+            const bWidth = (b.endLine ?? b[5] ?? 0) - (b.startLine ?? b[4] ?? 0);
+            return aWidth - bWidth;
+          })[0];
+        if (row) {
+          const sym = this.toZoektSymbol(row, hit.match);
+          if (sym) resolved.set(hit.index, sym);
+        }
+      }
+    } catch (e) {
+      logQueryError('query:zoekt-symbol-lookup', e);
+    }
+    return resolved;
+  }
   async callTool(method: string, params: any): Promise<any> {
     if (method === 'list_repos') {
       // Paginated tool surface (#2119). `listRepos()` is unchanged for internal
@@ -1909,14 +2369,95 @@ export class LocalBackend {
 
     // Resolve repo from optional param (re-reads registry on miss). An optional
     // `branch` param scopes the resolved handle to that branch's index (#2106).
+    // Unscoped query is the only tool that fans out across repositories. The
+    // caller's policy layer may narrow this set before reaching this backend.
+    if (method === 'query' && p.repo === undefined && this.repos.size > 1) {
+      const explicitSearchQuery = resolveAliasString(
+        p.search_query as string | undefined,
+        p.query as string | undefined,
+      );
+      const zoektQuery = typeof p.zoekt === 'string' ? p.zoekt.trim() : '';
+      const searchQuery = explicitSearchQuery || semanticQueryFromZoekt(zoektQuery);
+      const repos = [...this.repos.values()];
+      const candidates = searchQuery || zoektQuery
+        ? await this.discoverQueryCandidates(
+            {
+              keywordQuery: zoektQuery || searchQuery,
+              semanticQuery: searchQuery || zoektQuery,
+            },
+            repos,
+          )
+        : [];
+      const candidateByRepo = new Map(candidates.map((candidate) => [candidate.repo.id, candidate]));
+      const selected = repos
+        .map((repo) => candidateByRepo.get(repo.id) ?? { repo, score: 0, matches: [] })
+        .sort((a, b) => b.score - a.score);
+      const results = await Promise.all(
+        selected.map(async (candidate) => {
+          try {
+            const discoveredSemanticResults = candidate.matches
+              .filter((match) => match.source === 'vector' && match.id)
+              .map((match) => ({
+                repoId: candidate.repo.name,
+                nodeId: match.id,
+                name: match.name,
+                type: match.type,
+                filePath: match.filePath,
+                startLine: match.startLine,
+                endLine: match.endLine,
+              }));
+            const result = await this.runCrossRepoOperationForRepo(candidate.repo.id, () =>
+              this.query(candidate.repo, {
+                ...p,
+                ...(explicitSearchQuery || searchQuery
+                  ? { search_query: explicitSearchQuery || searchQuery }
+                  : {}),
+                _discoveredSemanticResults: discoveredSemanticResults,
+              }),
+            );
+            const candidateMatches = candidate.matches.map((match) => ({ ...match }));
+            return {
+              ...result,
+              repo: candidate.repo.name,
+              processes: (result?.processes ?? []).map((item: any) => ({
+                ...item,
+                repo: item.repo ?? candidate.repo.name,
+              })),
+              process_symbols: (result?.process_symbols ?? []).map((item: any) => ({
+                ...item,
+                repo: item.repo ?? candidate.repo.name,
+              })),
+              definitions: (result?.definitions ?? []).map((item: any) => ({
+                ...item,
+                repo: item.repo ?? candidate.repo.name,
+              })),
+              matches: [...candidateMatches, ...(result?.matches ?? [])].map((item: any) => ({
+                ...item,
+                repo: item.repo ?? candidate.repo.name,
+              })),
+            };
+          } catch (error) {
+            return { repo: candidate.repo.name, error: error instanceof Error ? error.message : String(error) };
+          }
+        }),
+      );
+      return this.mergeQueryResults(results);
+    }
     const repo = await this.resolveRepo(
       p.repo as string | undefined,
       p.branch as string | undefined,
     );
 
     switch (method) {
-      case 'query':
-        return this.withToolStaleness(repo, await this.query(repo, p));
+      case 'query': {
+        const explicitSearchQuery = resolveAliasString(p.search_query, p.query);
+        const zoektQuery = typeof p.zoekt === 'string' ? p.zoekt.trim() : '';
+        const queryParams =
+          explicitSearchQuery || !zoektQuery
+            ? p
+            : { ...p, search_query: semanticQueryFromZoekt(zoektQuery) };
+        return this.withToolStaleness(repo, await this.query(repo, queryParams));
+      }
       case 'cypher': {
         const raw = await this.cypher(repo, p);
         return this.withToolStaleness(repo, this.formatCypherAsMarkdown(raw));
@@ -2210,11 +2751,14 @@ export class LocalBackend {
     params: {
       query?: string;
       search_query?: string;
+      zoekt?: string;
       task_context?: string;
       goal?: string;
       limit?: number;
       max_symbols?: number;
       include_content?: boolean;
+      /** Internal cross-repository vector results; not part of the MCP schema. */
+      _discoveredSemanticResults?: any[];
     },
   ): Promise<any> {
     // #2175: each consumer resolves the search_query/query alias itself (there is no
@@ -2247,11 +2791,30 @@ export class LocalBackend {
     // each so both get independent wall-time records without fighting
     // over a single `current` phase slot.
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
+    const zoektQuery = params.zoekt?.trim() || searchQuery;
     let semanticSearchTimedOut = false;
     const semanticTimeoutMs = getQuerySemanticTimeoutMs();
-    const semanticSearchPromise = this.semanticSearch(repo, searchQuery, searchLimit);
-    const [bm25SearchResult, semanticResults] = await Promise.all([
-      timer.time('bm25', this.bm25Search(repo, searchQuery, searchLimit)),
+    const semanticSearchPromise =
+      params._discoveredSemanticResults !== undefined
+        ? Promise.resolve(params._discoveredSemanticResults)
+        : this.semanticSearch(repo, searchQuery, searchLimit);
+    const zoektConfig = loadZoektConfig();
+    const zoektSearchPromise = zoektConfig.enabled
+      ? new ZoektClient(zoektConfig)
+          .search(zoektQuery, {
+            repoFilter: repo.name,
+            maxDocDisplayCount: searchLimit,
+          })
+          .catch((err) => {
+            logger.warn(
+              { err: err instanceof Error ? err.message : String(err), repo: repo.name },
+              'GitNexus: Zoekt search degraded for query',
+            );
+            return { matches: [], stats: { matchCount: 0, durationMs: 0 } };
+          })
+      : Promise.resolve({ matches: [], stats: { matchCount: 0, durationMs: 0 } });
+    const [bm25SearchResult, semanticResults, zoektResult] = await Promise.all([
+      timer.time('bm25', this.bm25Search(repo, zoektQuery, searchLimit)),
       timer.time(
         'vector',
         (semanticTimeoutMs === undefined
@@ -2270,6 +2833,7 @@ export class LocalBackend {
           return [];
         }),
       ),
+      timer.time('zoekt', zoektSearchPromise),
     ]);
 
     // Guard against undefined results (#1489) — when FTS is entirely
@@ -2284,7 +2848,7 @@ export class LocalBackend {
     for (let i = 0; i < bm25Results.length; i++) {
       const result = bm25Results[i];
       const key = result.nodeId || result.filePath;
-      const rrfScore = 1 / (60 + i);
+      const rrfScore = SEARCH_SOURCE_WEIGHTS.bm25 / (RRF_K + i + 1);
       const existing = scoreMap.get(key);
       if (existing) {
         existing.score += rrfScore;
@@ -2297,7 +2861,7 @@ export class LocalBackend {
     for (let i = 0; i < safeSemanticResults.length; i++) {
       const result = safeSemanticResults[i];
       const key = result.nodeId || result.filePath;
-      const rrfScore = 1 / (60 + i);
+      const rrfScore = SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + i + 1);
       const existing = scoreMap.get(key);
       if (existing) {
         existing.score += rrfScore;
@@ -2306,6 +2870,26 @@ export class LocalBackend {
       }
     }
 
+    const zoektMatches = zoektResult?.matches ?? [];
+    const zoektSymbols = await this.resolveZoektMatchSymbols(repo, zoektMatches);
+    for (let i = 0; i < zoektMatches.length; i++) {
+      const match = zoektMatches[i];
+      const symbol = zoektSymbols.get(i);
+      const data = symbol ?? {
+        name: match.fileName.split('/').pop() || match.fileName,
+        type: 'File',
+        filePath: match.fileName,
+        zoektScore: match.score,
+      };
+      const key = data.nodeId || `File:${data.filePath}`;
+      const rrfScore = SEARCH_SOURCE_WEIGHTS.zoekt / (RRF_K + i + 1);
+      const existing = scoreMap.get(key);
+      if (existing) {
+        existing.score += rrfScore;
+      } else {
+        scoreMap.set(key, { score: rrfScore, data });
+      }
+    }
     const merged = Array.from(scoreMap.entries())
       .sort((a, b) => b[1].score - a[1].score)
       .slice(0, searchLimit);
@@ -2382,9 +2966,15 @@ export class LocalBackend {
             );
         for (const row of rows) {
           const nid = row.nodeId ?? row[0];
-          let list = processRowsByNode.get(nid);
-          if (!list) processRowsByNode.set(nid, (list = []));
-          list.push(row);
+          // Older adapters may omit the leading node id for positional rows.
+          // Keep such a row associated with all requested symbols; native rows
+          // with a node id remain precisely associated.
+          const targetIds = nid ? [nid] : ids;
+          for (const targetId of targetIds) {
+            let list = processRowsByNode.get(targetId);
+            if (!list) processRowsByNode.set(targetId, (list = []));
+            list.push(nid ? row : { ...row, nodeId: targetId });
+          }
         }
       } catch (e) {
         logQueryError('query:process-lookup', e);
@@ -2462,7 +3052,6 @@ export class LocalBackend {
         }
       }
     }
-
     // Aggregation is unchanged from the per-symbol version — it now reads the
     // pre-fetched maps instead of issuing a query per symbol. Iterating `merged`
     // in the same (sorted) order preserves processMap insertion order, the
@@ -2671,10 +3260,47 @@ export class LocalBackend {
       );
     }
 
+    const matches: QueryMatchSummary[] = [];
+    for (let i = 0; i < safeSemanticResults.length; i++) {
+      const result = safeSemanticResults[i];
+      if (!result.filePath) continue;
+      matches.push({
+        repo: repo.name,
+        filePath: result.filePath,
+        source: 'vector',
+        score: SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + i + 1),
+        id: result.nodeId,
+        name: result.name,
+        startLine: toDisplayLine(result.startLine),
+        endLine: toDisplayLine(result.endLine),
+      });
+    }
+    for (let i = 0; i < zoektMatches.length; i++) {
+      const match = zoektMatches[i];
+      const symbol = zoektSymbols.get(i);
+      const lineNumber = this.getZoektHitLine(match);
+      matches.push({
+        repo: repo.name,
+        filePath: match.fileName,
+        source: 'zoekt',
+        score: SEARCH_SOURCE_WEIGHTS.zoekt / (RRF_K + i + 1),
+        id: symbol?.nodeId,
+        name: symbol?.name,
+        startLine: lineNumber ?? symbol?.startLine,
+        endLine: lineNumber ?? symbol?.endLine,
+        snippet: this.compactMatchSnippet(
+          match.lineMatches?.find((line: any) => !line.isContext)?.line ??
+            match.lineMatches?.[0]?.line,
+        ),
+      });
+    }
+    const sortedMatches = this.selectTopMatchesWithRepoCoverage(matches, 50);
     return {
       processes,
       process_symbols: dedupedSymbols,
       definitions: definitions.slice(0, 20), // cap standalone definitions
+      matches: sortedMatches,
+      matched_repos: [...new Set(sortedMatches.map((match) => match.repo))],
       timing,
       ...(warnings.length > 0 && { warning: warnings.join(' ') }),
       ...(enrichmentDegraded && { partial: true }),

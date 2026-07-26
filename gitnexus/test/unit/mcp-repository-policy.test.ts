@@ -149,11 +149,14 @@ describe('MCP repository policy', () => {
     expect(repos.map((repo) => repo.name)).toEqual(['Alpha', 'Beta']);
 
     await scoped.callTool('query', { search_query: 'auth' });
-    expect(backend.callTool).toHaveBeenLastCalledWith('query', {
+    expect(backend.callTool).toHaveBeenNthCalledWith(1, 'query', {
       search_query: 'auth',
       repo: '/repos/alpha',
     });
-
+    expect(backend.callTool).toHaveBeenNthCalledWith(2, 'query', {
+      search_query: 'auth',
+      repo: '/repos/beta',
+    });
     await scoped.callTool('context', { name: 'auth', repo: ' beta ' });
     expect(backend.callTool).toHaveBeenLastCalledWith('context', {
       name: 'auth',
@@ -203,15 +206,18 @@ describe('MCP repository policy', () => {
     });
   });
 
-  it('requires an explicit repo when multiple repositories are allowed without a default', async () => {
+  it('allows query without repo to aggregate all allowed repositories', async () => {
     const backend = createBackend();
     const policy = await createMcpRepositoryPolicy(backend, {
       GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,Beta',
     });
-    await expect(
-      policy.scopeBackend(backend).callTool('query', { search_query: 'auth' }),
-    ).rejects.toThrow(/explicit repo.*multiple repositories are allowed/i);
-    expect(backend.callTool).not.toHaveBeenCalled();
+    const scoped = policy.scopeBackend(backend);
+
+    const result = await scoped.callTool('query', { search_query: 'auth' });
+    expect(backend.callTool).toHaveBeenCalledTimes(2);
+    expect(backend.callTool).toHaveBeenNthCalledWith(1, 'query', { search_query: 'auth', repo: '/repos/alpha' });
+    expect(backend.callTool).toHaveBeenNthCalledWith(2, 'query', { search_query: 'auth', repo: '/repos/beta' });
+    expect(result).toMatchObject({ processes: [], process_symbols: [], definitions: [], matches: [] });
   });
 
   it('fails startup when the default is outside the allowlist after canonical resolution', async () => {

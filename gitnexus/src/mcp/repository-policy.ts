@@ -145,6 +145,58 @@ function unavailableRepositoryError(): Error {
   return new Error('Repository is not available through this MCP server.');
 }
 
+function mergeScopedQueryResults(
+  results: Array<{ repo: ResolvedRepository; result: any }>,
+): any {
+  const merged = {
+    processes: [] as any[],
+    process_symbols: [] as any[],
+    definitions: [] as any[],
+    matches: [] as any[],
+    matched_repos: [] as string[],
+    errors: [] as Array<{ repo: string; error: string }>,
+  };
+  const seen = {
+    processes: new Set<string>(),
+    process_symbols: new Set<string>(),
+    definitions: new Set<string>(),
+    matches: new Set<string>(),
+  };
+
+  for (const { repo, result } of results) {
+    if (result?.error) {
+      merged.errors.push({ repo: repo.name, error: String(result.error) });
+      continue;
+    }
+    if (Array.isArray(result?.errors)) {
+      merged.errors.push(
+        ...result.errors.map((error: any) => ({
+          repo: repo.name,
+          error: String(error?.error ?? error),
+        })),
+      );
+    }
+
+    for (const field of ['processes', 'process_symbols', 'definitions', 'matches'] as const) {
+      for (const item of Array.isArray(result?.[field]) ? result[field] : []) {
+        const normalized = { ...item, repo: item.repo ?? repo.name };
+        const key = `${normalized.repo}:${normalized.id ?? normalized.nodeId ?? normalized.filePath ?? normalized.name ?? JSON.stringify(normalized)}`;
+        if (seen[field].has(key)) continue;
+        seen[field].add(key);
+        merged[field].push(normalized);
+      }
+    }
+  }
+
+  merged.matched_repos = [
+    ...new Set(
+      merged.matches
+        .map((match) => match.repo)
+        .filter((repo): repo is string => typeof repo === 'string'),
+    ),
+  ];
+  return merged;
+}
 export class McpRepositoryPolicy {
   readonly restricted: boolean;
   readonly configured: boolean;
@@ -312,6 +364,19 @@ export class McpRepositoryPolicy {
     if (!this.configured) return backend.callTool(method, params);
     if (this.restricted && method.startsWith('group_')) {
       throw new Error('Group tools are unavailable when an MCP repository allowlist is set.');
+    }
+    if (method === 'query' && this.restricted && params?.repo === undefined && this.allowed.length > 1) {
+      const results = await Promise.all(
+        this.allowed.map(async (repo) => {
+          try {
+            const result = await backend.callTool(method, { ...(params ?? {}), repo: repo.path });
+            return { repo, result };
+          } catch (error) {
+            return { repo, result: { error: error instanceof Error ? error.message : String(error) } };
+          }
+        }),
+      );
+      return mergeScopedQueryResults(results);
     }
     return backend.callTool(method, this.normalizeToolArgs(params));
   }

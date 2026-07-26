@@ -141,6 +141,10 @@ Returns results grouped by process (execution flow):
 
 Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank Fusion.
 
+REPOSITORY SCOPE: repo is optional. When omitted, query searches and aggregates all repositories in the current MCP authorization scope; it never widens the allowlist. Only query supports this cross-repository aggregation. Tools such as context, impact, and code_snippet remain single-repository operations.
+
+When zoekt is provided, Zoekt exact/regex/file-filter matches are fused into the same ranking.
+
 GROUP MODE: set "repo" to "@<groupName>" to search all member repos in that group (merged via RRF), or "@<groupName>/<groupRepoPath>" to run against a single member (same path keys as in group.yaml). If you use "@<groupName>" only, the member repo defaults to the lexicographically first key in group.yaml "repos". Prefer resources for contracts/status (see migration from legacy group_* tools).
 
 SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). When "repo" starts with "@", only processes whose symbols fall under that prefix are included. For a normal indexed repo name (no leading @), this field is currently ignored by the server.`,
@@ -155,6 +159,10 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
         search_query: {
           type: 'string',
           description: 'Natural language or keyword search query.',
+        },
+        zoekt: {
+          type: 'string',
+          description: 'Optional Zoekt query DSL for exact keywords, regular expressions, or file filters. When omitted, search_query is used for semantic/BM25 search.',
         },
         task_context: {
           type: 'string',
@@ -193,7 +201,7 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
         repo: {
           type: 'string',
           description:
-            'Indexed repository name or path, or group mode "@<groupName>" / "@<groupName>/<memberPath>" (member path keys from group.yaml). Omit when only one indexed repo exists.',
+            'Indexed repository name or path, or group mode "@<groupName>" / "@<groupName>/<memberPath>" (member path keys from group.yaml). Omit to search all repositories in the current MCP authorization scope; this does not bypass the allowlist.',
         },
         service: {
           type: 'string',

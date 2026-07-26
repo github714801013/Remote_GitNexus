@@ -182,7 +182,8 @@ describe('LocalBackend.query with Zoekt integration', () => {
       stats: { matchCount: 0, durationMs: 1 },
     });
 
-    // Add repos to backend
+    // Replace the default fixture repo with the repositories under test.
+    (backend as any).repos.clear();
     (backend as any).repos.set('repo-1', { id: 'repo-1', name: 'repo-1', repoPath: '/p1' });
     (backend as any).repos.set('repo-2', { id: 'repo-2', name: 'repo-2', repoPath: '/p2' });
 
@@ -428,6 +429,7 @@ describe('LocalBackend.query with Zoekt integration', () => {
       stats: { matchCount: 2, durationMs: 1 },
     });
 
+    (backend as any).repos.clear();
     (backend as any).repos.set('repo-1', { id: 'repo-1', name: 'repo-1', repoPath: '/p1' });
     (backend as any).repos.set('repo-2', { id: 'repo-2', name: 'repo-2', repoPath: '/p2' });
 
@@ -545,30 +547,17 @@ describe('LocalBackend.query with Zoekt integration', () => {
           ];
         }
         if (query.includes('STEP_IN_PROCESS')) {
-          if (params?.nodeId === 'Function:src/zoekt.ts:exactSymbol') {
-            return [
-              {
-                pid: 'Process:ZoektExact',
-                label: 'ZoektExact',
-                heuristicLabel: 'ZoektExact',
-                processType: 'intra_community',
-                stepCount: 1,
-                step: 1,
-              },
-            ];
-          }
-          if (params?.nodeId === 'Function:src/vector.ts:conceptSymbol') {
-            return [
-              {
-                pid: 'Process:VectorConcept',
-                label: 'VectorConcept',
-                heuristicLabel: 'VectorConcept',
-                processType: 'intra_community',
-                stepCount: 1,
-                step: 1,
-              },
-            ];
-          }
+          const processByNode = new Map([
+            ['Function:src/zoekt.ts:exactSymbol', { pid: 'Process:ZoektExact', label: 'ZoektExact', heuristicLabel: 'ZoektExact' }],
+            ['Function:src/vector.ts:conceptSymbol', { pid: 'Process:VectorConcept', label: 'VectorConcept', heuristicLabel: 'VectorConcept' }],
+          ]);
+          const nodeIds = Array.isArray(params?.nodeIds) ? params.nodeIds : [params?.nodeId];
+          return nodeIds.filter(Boolean).flatMap((nodeId: string) => {
+            const process = processByNode.get(nodeId);
+            return process
+              ? [{ nodeId, ...process, processType: 'intra_community', stepCount: 1, step: 1 }]
+              : [];
+          });
         }
         return [];
       },
