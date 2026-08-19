@@ -266,7 +266,7 @@ describe('Neo4j embedding adapter', () => {
       {
         repoIds: ['repo-a'],
         queryVector: [0.1, 0.2],
-        fetchLimit: expect.objectContaining({ low: 25, high: 0 }),
+        fetchLimit: expect.objectContaining({ low: 100, high: 0 }),
         limit: expect.objectContaining({ low: 5, high: 0 }),
         minScore: 0.1,
       },
