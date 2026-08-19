@@ -16,6 +16,7 @@ import { retryRename } from '../storage/fs-atomic.js';
 import { acquireIndexLock } from '../storage/index-lock.js';
 import { runPipelineFromRepo } from './ingestion/pipeline.js';
 import type { KnowledgeGraph } from './graph/types.js';
+import type { Neo4jGraphLoadProgress } from './neo4j/graph-loader.js';
 import { resetDegradedParseCounter } from './tree-sitter/safe-parse.js';
 import {
   initLbug,
@@ -232,6 +233,12 @@ export interface AnalyzeOptions {
    * silently wipes existing embeddings when run without --embeddings).
    */
   dropEmbeddings?: boolean;
+  /**
+   * Defer Neo4j embedding repair to the long-lived server after structural
+   * finalization. Forked analyze workers must not own background repair work:
+   * they exit immediately after reporting completion.
+   */
+  deferEmbeddingRepair?: boolean;
   skipGit?: boolean;
   /** Skip AGENTS.md and CLAUDE.md gitnexus block updates. */
   skipAgentsMd?: boolean;
@@ -371,6 +378,8 @@ export interface AnalyzeResult {
    * the persisted meta surface the degraded state instead of reporting healthy.
    */
   ftsSkipped?: boolean;
+  /** True when a server worker deferred Neo4j embedding repair to its parent process. */
+  embeddingRepairDeferred?: boolean;
   /**
    * Why FTS was skipped, when `ftsSkipped` is true (#2658 review L2):
    * `extension-unavailable` (the LadybugDB FTS extension could not load — the
@@ -427,11 +436,48 @@ export const PHASE_LABELS: Record<string, string> = {
   communities: 'Detecting communities',
   processes: 'Detecting processes',
   complete: 'Pipeline complete',
+  neo4j: 'Loading into Neo4j',
   lbug: 'Loading into LadybugDB',
   fts: 'Creating search indexes',
   embeddings: 'Generating embeddings',
   done: 'Done',
 };
+
+const NEO4J_WRITE_START_PERCENT = 60;
+const NEO4J_WRITE_END_PERCENT = 90;
+
+function neo4jProgressPercent(event: Neo4jGraphLoadProgress, previousPercent: number): number {
+  const candidate = (() => {
+    switch (event.operation) {
+      case 'schema':
+        return 60;
+      case 'clear':
+        return 65;
+      case 'nodes':
+        return 68 + Math.floor(((event.completedItems / (event.totalItems ?? 1)) * 12));
+      case 'relationships':
+        return 80 + Math.floor(((event.completedItems / (event.totalItems ?? 1)) * 9));
+      case 'relinkEmbeddings':
+        return 89;
+    }
+  })();
+  return Math.min(NEO4J_WRITE_END_PERCENT, Math.max(previousPercent, candidate));
+}
+
+function neo4jProgressMessage(event: Neo4jGraphLoadProgress): string {
+  switch (event.operation) {
+    case 'schema':
+      return 'Applying Neo4j schema...';
+    case 'clear':
+      return `Clearing Neo4j ${event.label ?? 'graph'} data (${event.completedItems} nodes deleted)...`;
+    case 'nodes':
+      return `Writing Neo4j nodes ${event.completedItems}/${event.totalItems ?? '?'} (${event.label ?? 'unknown'})...`;
+    case 'relationships':
+      return `Writing Neo4j relationships ${event.completedItems}/${event.totalItems ?? '?'} (${event.relationshipType ?? 'unknown'})...`;
+    case 'relinkEmbeddings':
+      return 'Re-linking preserved Neo4j embeddings...';
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Main orchestrator
@@ -885,10 +931,15 @@ async function runFullAnalysisInner(
   // set from the built graph below, so a prior run's size can't leak in.
   setBufferPoolSizeHint(undefined);
 
-  // Clean up stale KuzuDB files from before the LadybugDB migration.
-  const kuzuResult = await cleanupOldKuzuFiles(storagePath);
-  if (kuzuResult.found && kuzuResult.needsReindex) {
-    log('Migrating from KuzuDB to LadybugDB — rebuilding index...');
+  const neo4jBackendEnabled = isNeo4jBackendEnabled();
+
+  // Old Kuzu files belong to the retired local graph backend. Neo4j stores
+  // graph data remotely and must not inspect or mutate local database files.
+  if (!neo4jBackendEnabled) {
+    const kuzuResult = await cleanupOldKuzuFiles(storagePath);
+    if (kuzuResult.found && kuzuResult.needsReindex) {
+      log('Migrating from KuzuDB to LadybugDB — rebuilding index...');
+    }
   }
 
   // Keep gitnexus.json and the legacy meta.json mirror in sync (fresher
@@ -904,7 +955,6 @@ async function runFullAnalysisInner(
   }
 
   const existingMeta = await loadMeta(metaDir);
-  const neo4jBackendEnabled = isNeo4jBackendEnabled();
   const projectNameInitial =
     options.registryName ??
     getInferredRepoName(repoPath) ??
@@ -923,9 +973,41 @@ async function runFullAnalysisInner(
   // ── FTS-only repair path ────────────────────────────────────────────
   if (options.repairFts) {
     if (neo4jBackendEnabled) {
-      throw new Error(
-        'Neo4j backend does not use LadybugDB FTS repair. Neo4j full-text indexes are managed during analysis.',
+      // Neo4j 后端:FULLTEXT 索引在 analyze 期间由 schema 管理,坏索引(如创建时
+      // population 中断遗留部分仓库数据)不会因 `IF NOT EXISTS` 自动重建。
+      // 逐对 DROP + CREATE 触发全量 population(避免全部 DROP 后 CREATE 中途失败
+      // 导致索引全毁),随后 awaitIndexes 等待 population 完成再报成功。
+      if (!canReturnAlreadyUpToDate) {
+        throw new Error(
+          'Cannot repair FTS indexes because this repository has not been analyzed yet. ' +
+            'Run `gitnexus analyze` first to create the initial index, then retry `--repair-fts`.',
+        );
+      }
+      const { getNeo4jSchemaStatements } = await import('./neo4j/schema.js');
+      const { withNeo4jSession } = await import('./neo4j/driver.js');
+      const fulltextStatements = getNeo4jSchemaStatements().indexes.filter((statement) =>
+        statement.includes('CREATE FULLTEXT INDEX'),
       );
+      await withNeo4jSession(async (session) => {
+        for (const statement of fulltextStatements) {
+          const match = /CREATE FULLTEXT INDEX (\S+)/.exec(statement);
+          if (!match) continue;
+          await session.executeWrite(async (tx) => tx.run(`DROP INDEX ${match[1]} IF EXISTS`));
+          await session.executeWrite(async (tx) => tx.run(statement));
+        }
+        await session.executeWrite(async (tx) => tx.run('CALL db.awaitIndexes()'));
+      });
+      progress('fts', 90, 'Neo4j fulltext indexes rebuilt');
+      progress('done', 100, 'Done');
+      return {
+        repoName:
+          options.registryName ??
+          getInferredRepoName(repoPath) ??
+          path.basename(resolveRepoIdentityRoot(repoPath)),
+        repoPath,
+        stats: existingMeta?.stats ?? {},
+        ftsRepairedOnly: true,
+      };
     }
     if (!existingMeta) {
       throw new Error(
@@ -1499,10 +1581,18 @@ async function runFullAnalysisInner(
     const { loadGraphToNeo4j } = await import('./neo4j/graph-loader.js');
     const existingNeo4jEmbeddingCount = await countEmbeddings(projectNameInitial).catch(() => 0);
 
-    progress('lbug', 60, 'Loading into Neo4j...');
+    progress('neo4j', 60, 'Applying Neo4j schema...');
+    let lastNeo4jPercent = 60;
+    const reportNeo4jProgress = (event: Neo4jGraphLoadProgress) => {
+      const percent = neo4jProgressPercent(event, lastNeo4jPercent);
+      lastNeo4jPercent = percent;
+      progress('neo4j', percent, neo4jProgressMessage(event));
+    };
     const graphStats = await loadGraphToNeo4j(projectNameInitial, pipelineResult.graph, {
       preserveEmbeddings: !options.dropEmbeddings,
+      onProgress: reportNeo4jProgress,
     });
+    progress('neo4j', 90, 'Neo4j graph write complete.');
 
     const { skipForCap, nodeLimit } = deriveEmbeddingCap(
       graphStats.nodes,
@@ -1515,7 +1605,7 @@ async function runFullAnalysisInner(
         (existingMeta?.stats?.embeddings ?? 0) > 0);
     let embeddingCount = await countEmbeddings(projectNameInitial);
 
-    if (shouldRepairEmbeddings && !skipForCap) {
+    if (shouldRepairEmbeddings && !skipForCap && !options.deferEmbeddingRepair) {
       progress('embeddings', 90, 'Connecting to embedding endpoint...');
       await runNeo4jEmbeddingRepair(
         projectNameInitial,
@@ -1530,6 +1620,8 @@ async function runFullAnalysisInner(
         repoPath,
       );
       embeddingCount = await countEmbeddings(projectNameInitial);
+    } else if (shouldRepairEmbeddings && !skipForCap && options.deferEmbeddingRepair) {
+      log('Neo4j embedding repair deferred until server-side analysis finalization.');
     } else if (shouldRepairEmbeddings && skipForCap) {
       log(
         `Embeddings skipped: ${graphStats.nodes.toLocaleString()} nodes exceeds the ${nodeLimit.toLocaleString()}-node safety cap.`,
@@ -1642,6 +1734,7 @@ async function runFullAnalysisInner(
       repoPath,
       stats: meta.stats,
       pipelineResult,
+      embeddingRepairDeferred: shouldRepairEmbeddings && !skipForCap && options.deferEmbeddingRepair,
       isPrimaryBranch: !placement.branch,
     };
   }

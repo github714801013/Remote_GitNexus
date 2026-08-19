@@ -1201,4 +1201,50 @@ describe('runFullAnalysis re-resolves git state under the lock (#2658 review H2)
       await tmpRepo.cleanup();
     }
   });
+
+  it('rebuilds Neo4j fulltext indexes when the Neo4j backend is enabled (--repair-fts)', async () => {
+    const txRun = vi.fn();
+    const executeWrite = vi.fn(async (work: any) => work({ run: txRun }));
+    vi.doMock('../../src/core/neo4j/driver.js', () => ({
+      withNeo4jSession: vi.fn(async (work: any) => work({ executeWrite })),
+    }));
+    vi.doMock('../../src/core/neo4j/schema.js', () => ({
+      getNeo4jSchemaStatements: () => ({
+        indexes: [
+          'CREATE FULLTEXT INDEX function_fts IF NOT EXISTS FOR (n:`Function`) ON EACH [n.name, n.content, n.description]',
+          'CREATE INDEX gitnexus_File_repo_filePath IF NOT EXISTS FOR (n:`File`) ON (n.repoId, n.filePath)',
+        ],
+      }),
+    }));
+    vi.doMock('../../src/core/neo4j/graph-loader.js', () => ({
+      countRepoGraphNodes: vi.fn(async () => 1),
+    }));
+    vi.stubEnv('GITNEXUS_STORAGE_BACKEND', 'neo4j');
+
+    const tmpRepo = await createTempDir('gitnexus-run-analyze-repair-neo4j-');
+    try {
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      const result = await runFullAnalysis(
+        tmpRepo.dbPath,
+        { repairFts: true },
+        { onProgress: () => {} },
+      );
+
+      expect(result.ftsRepairedOnly).toBe(true);
+      // DROP 先行,随后 CREATE 触发全量 population,最后等待 population 完成
+      expect(txRun).toHaveBeenCalledWith('DROP INDEX function_fts IF EXISTS');
+      expect(txRun).toHaveBeenCalledWith(
+        'CREATE FULLTEXT INDEX function_fts IF NOT EXISTS FOR (n:`Function`) ON EACH [n.name, n.content, n.description]',
+      );
+      expect(txRun).toHaveBeenCalledWith('CALL db.awaitIndexes()');
+      // 普通 RANGE 索引不属于 FTS 修复范围,不得被 DROP
+      expect(txRun).not.toHaveBeenCalledWith('DROP INDEX gitnexus_File_repo_filePath IF EXISTS');
+    } finally {
+      vi.doUnmock('../../src/core/neo4j/driver.js');
+      vi.doUnmock('../../src/core/neo4j/schema.js');
+      vi.doUnmock('../../src/core/neo4j/graph-loader.js');
+      vi.unstubAllEnvs();
+      await tmpRepo.cleanup();
+    }
+  });
 });
