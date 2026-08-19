@@ -404,8 +404,9 @@ export const semanticSearchMany = async (
 
   const boundedLimit = Math.max(1, Math.trunc(limit));
   // vector.queryNodes 的 $fetchLimit 在相似度排序后先截断,再按 repoId 过滤;窗口
-  // 太小时目标仓库的匹配会被截掉返回空,放大窗口(10 倍、下限 100)过滤后再截断。
-  const fetchLimit = Math.max(100, boundedLimit * 10);
+  // 太小时目标仓库的匹配会被截掉返回空。少数仓库的向量与查询普遍高相似会垄断
+  // 排名,实测业务仓库匹配位于 1000-5000 区间,固定 5000 窗口(~1.2s)覆盖。
+  const fetchLimit = Math.max(5000, boundedLimit * 10);
   return await withNeo4jSession(async (session) => {
     return await session.executeRead(async (tx) => {
       const result = await tx.run(
