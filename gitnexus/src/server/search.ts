@@ -23,13 +23,16 @@ const searchNeo4jFulltext = async (
   const { executeReadCypher } = await import('../core/neo4j/read-adapter.js');
   const { escapeNeo4jFulltextQuery } = await import('../core/neo4j/fulltext-query.js');
   const fulltextQuery = escapeNeo4jFulltextQuery(query);
+  // queryNodes 的 {limit} 在相关性排序后先截断,再按 repoId 过滤;窗口太小时
+  // 目标仓库的匹配会被截掉返回空,放大窗口(10 倍、下限 100)过滤后再截断。
+  const windowLimit = Math.max(100, limit * 10);
   const merged = new Map<string, any>();
 
   for (const { indexName } of FTS_INDEXES) {
     try {
       const rows = await executeReadCypher(
         `
-        CALL db.index.fulltext.queryNodes('${indexName}', $query, {limit: $limit})
+        CALL db.index.fulltext.queryNodes('${indexName}', $query, {limit: $windowLimit})
         YIELD node, score
         WHERE node.repoId = $repoId
         RETURN node.id AS nodeId,
@@ -40,7 +43,7 @@ const searchNeo4jFulltext = async (
                node.endLine AS endLine,
                score AS score
       `,
-        { repoId: repoName, query: fulltextQuery, limit },
+        { repoId: repoName, query: fulltextQuery, windowLimit },
       );
 
       for (const row of rows) {
@@ -343,9 +346,10 @@ RETURN a.id AS sourceId,
 
 export type EmbeddingProgressCallback = (progress: any) => void;
 
-const NEO4J_EMBEDDING_REPAIR_BATCH_SIZE = 16;
+const DEFAULT_EMBEDDING_REPAIR_BATCH_SIZE = 8;
 const DEFAULT_EMBEDDING_REPAIR_REPO_COOLDOWN_MS = 5 * 60_000;
 const embeddingRepairCooldownByRepo = new Map<string, number>();
+const activeEmbeddingRepairByRepo = new Map<string, Promise<number>>();
 
 export class Neo4jEmbeddingRepairCooldownError extends Error {
   constructor(
@@ -386,6 +390,12 @@ const readPositiveInt = (value: string | undefined, fallback: number): number =>
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
 
+const readEmbeddingRepairBatchSize = (): number =>
+  readPositiveInt(
+    process.env.GITNEXUS_EMBEDDING_REPAIR_BATCH_SIZE,
+    DEFAULT_EMBEDDING_REPAIR_BATCH_SIZE,
+  );
+
 const readEmbeddingRepairRepoCooldownMs = (): number =>
   readPositiveInt(
     process.env.GITNEXUS_EMBEDDING_REPAIR_REPO_COOLDOWN_MS,
@@ -405,7 +415,14 @@ const coolDownEmbeddingRepairRepo = (repoName: string): void => {
   embeddingRepairCooldownByRepo.set(repoName, Date.now() + readEmbeddingRepairRepoCooldownMs());
 };
 
-export const runNeo4jEmbeddingRepair = async (
+const isSystemicEmbeddingFailure = (err: unknown): boolean => {
+  const message = err instanceof Error ? err.message : String(err);
+  return /(?:request failed|request timed out|circuit open|fetch failed|network|ECONN|ENOTFOUND|EAI_AGAIN)/i.test(
+    message,
+  );
+};
+
+const runNeo4jEmbeddingRepairOnce = async (
   repoName: string,
   onProgress: EmbeddingProgressCallback,
   repoPath?: string,
@@ -417,7 +434,6 @@ export const runNeo4jEmbeddingRepair = async (
   const { buildNeo4jEmbeddingText } = await import('./neo4j-embedding-text.js');
   const {
     countEmbeddings,
-    deleteEmbeddingsForNodes,
     ensureNeo4jEmbeddingIndex,
     fetchExistingEmbeddingHashes,
     countEmbeddableNodes,
@@ -461,6 +477,19 @@ export const runNeo4jEmbeddingRepair = async (
     try {
       vectors = await embedBatch(texts);
     } catch (err) {
+      if (isSystemicEmbeddingFailure(err)) {
+        const cooldownMs = readEmbeddingRepairRepoCooldownMs();
+        coolDownEmbeddingRepairRepo(repoName);
+        logger.warn(
+          { err, repo: repoName, batchSize: embeddingInputs.length, cooldownMs },
+          'Neo4j embedding repair deferred after systemic embedding endpoint failure',
+        );
+        throw new Neo4jEmbeddingRepairDeferredError(
+          repoName,
+          embeddingInputs.length,
+          cooldownMs,
+        );
+      }
       if (embeddingInputs.length > 1) {
         logger.warn(
           {
@@ -513,6 +542,7 @@ export const runNeo4jEmbeddingRepair = async (
     return embeddingInputs.length;
   };
 
+  const repairBatchSize = readEmbeddingRepairBatchSize();
   for await (const nodePage of loadEmbeddableNodeBatches(repoName, resolvedRepoPath)) {
     const nodesToEmbed = nodePage.filter((node) => {
       const currentHash = contentHashForNode(node);
@@ -523,19 +553,9 @@ export const runNeo4jEmbeddingRepair = async (
         (shouldSummarizeNode(node) && !existing.hasSummaryText)
       );
     });
-    const staleNodeIds = nodesToEmbed
-      .filter((node) => {
-        const existing = existingEmbeddings.get(node.id);
-        return existing !== undefined && existing.contentHash !== contentHashForNode(node);
-      })
-      .map((node) => node.id);
-    if (staleNodeIds.length > 0) {
-      await deleteEmbeddingsForNodes(repoName, staleNodeIds);
-    }
-
     nodesToEmbedCount += nodesToEmbed.length;
-    for (let i = 0; i < nodesToEmbed.length; i += NEO4J_EMBEDDING_REPAIR_BATCH_SIZE) {
-      const batch = nodesToEmbed.slice(i, i + NEO4J_EMBEDDING_REPAIR_BATCH_SIZE);
+    for (let i = 0; i < nodesToEmbed.length; i += repairBatchSize) {
+      const batch = nodesToEmbed.slice(i, i + repairBatchSize);
       const embeddingInputs = await Promise.all(
         batch.map(async (node) => {
           const contentHash = contentHashForNode(node);
@@ -570,4 +590,23 @@ export const runNeo4jEmbeddingRepair = async (
   onProgress({ phase: 'ready', percent: 100 });
 
   return await countEmbeddings(repoName);
+};
+
+export const runNeo4jEmbeddingRepair = async (
+  repoName: string,
+  onProgress: EmbeddingProgressCallback,
+  repoPath?: string,
+): Promise<number> => {
+  const activeRepair = activeEmbeddingRepairByRepo.get(repoName);
+  if (activeRepair) return activeRepair;
+
+  const repair = runNeo4jEmbeddingRepairOnce(repoName, onProgress, repoPath);
+  activeEmbeddingRepairByRepo.set(repoName, repair);
+  try {
+    return await repair;
+  } finally {
+    if (activeEmbeddingRepairByRepo.get(repoName) === repair) {
+      activeEmbeddingRepairByRepo.delete(repoName);
+    }
+  }
 };

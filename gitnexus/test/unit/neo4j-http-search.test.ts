@@ -97,7 +97,8 @@ describe('Neo4j HTTP search fallback', () => {
     expect(executeReadCypher).toHaveBeenCalledWith(expect.stringContaining("'function_fts'"), {
       repoId: 'Repo A',
       query: 'handler',
-      limit: 5,
+      // queryNodes 先按相关性截断再按 repoId 过滤,窗口必须放大到上限
+      windowLimit: 100,
     });
     expect(results).toEqual([
       expect.objectContaining({
