@@ -101,6 +101,7 @@ function makeCtx(
     mro?: Record<string, readonly string[]>;
     implsByInterface?: Record<string, readonly string[]>;
     ownedMembersByOwner?: RegistryContext['ownedMembersByOwner'];
+    visibleBindingsAt?: RegistryContext['visibleBindingsAt'];
     arity?: (
       callsite: { arity: number },
       def: SymbolDefinition,
@@ -145,6 +146,7 @@ function makeCtx(
     qualifiedNames: qualifiedNameIndex,
     moduleScopes,
     ownedMembersByOwner: opts.ownedMembersByOwner ?? defaultOwnedMembersByOwner,
+    ...(opts.visibleBindingsAt !== undefined ? { visibleBindingsAt: opts.visibleBindingsAt } : {}),
     methodDispatch,
     providers: opts.arity !== undefined ? { arityCompatibility: opts.arity } : {},
   };
@@ -212,6 +214,40 @@ describe('Step 1: lexical scope-chain walk', () => {
     // Inner binding is a Variable (not a Class) → class registry returns empty.
     const results = buildClassRegistry(ctx).lookup('User', 'scope:f');
     expect(results).toEqual([]);
+  });
+
+  it('reads injected post-finalize bindings and retains hard-shadow behavior', () => {
+    const sharedUser = mkDef({ nodeId: 'def:sharedUser', type: 'Class' });
+    const localVariable = mkDef({ nodeId: 'def:localUser', type: 'Variable' });
+    const moduleScope = mkScope({ id: 'scope:module', parent: null });
+    const functionScope = mkScope({
+      id: 'scope:function',
+      parent: moduleScope.id,
+      kind: 'Function',
+    });
+    const visibleBindingsAt: NonNullable<RegistryContext['visibleBindingsAt']> = (scopeId, name) => {
+      if (scopeId === moduleScope.id && name === 'User') {
+        return [mkBinding(sharedUser, 'namespace')];
+      }
+      return [];
+    };
+    const ctx = makeCtx([moduleScope, functionScope], [sharedUser, localVariable], {
+      visibleBindingsAt,
+    });
+
+    expect(buildClassRegistry(ctx).lookup('User', functionScope.id)[0]?.def).toBe(sharedUser);
+
+    const shadowedScope = mkScope({
+      id: 'scope:shadowed',
+      parent: moduleScope.id,
+      kind: 'Function',
+      bindings: { User: [mkBinding(localVariable, 'local')] },
+    });
+    const shadowedCtx = makeCtx([moduleScope, shadowedScope], [sharedUser, localVariable], {
+      visibleBindingsAt,
+    });
+
+    expect(buildClassRegistry(shadowedCtx).lookup('User', shadowedScope.id)).toEqual([]);
   });
 
   it('emits origin=import evidence when the binding is imported', () => {

@@ -83,6 +83,8 @@ export function csharpScanToEvidence(scan: CSharpProjectScan): CSharpNamespaceEv
 
 /** Swift Package Manager module config */
 export interface SwiftPackageConfig {
+  /** Whether the repository has a SwiftPM Package.swift manifest. */
+  hasPackageManifest: boolean;
   /** Map of target name -> source directory path (e.g., "SiuperModel" -> "Package/Sources/SiuperModel") */
   targets: Map<string, string>;
 }
@@ -437,37 +439,75 @@ async function collectDeclaredNamespaces(
 }
 
 export async function loadSwiftPackageConfig(repoRoot: string): Promise<SwiftPackageConfig | null> {
-  // Swift imports are module-name based (e.g., `import SiuperModel`)
-  // SPM convention: Sources/<TargetName>/ or Package/Sources/<TargetName>/
-  // We scan for these directories to build a target map
+  let manifest: string;
+  try {
+    manifest = await fs.readFile(path.join(repoRoot, 'Package.swift'), 'utf-8');
+  } catch {
+    return null;
+  }
+
   const targets = new Map<string, string>();
-
-  const sourceDirs = ['Sources', 'Package/Sources', 'src'];
-  for (const sourceDir of sourceDirs) {
-    try {
-      const fullPath = path.join(repoRoot, sourceDir);
-      const entries = await fs.readdir(fullPath, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory()) {
-          targets.set(entry.name, sourceDir + '/' + entry.name);
-        }
-      }
-    } catch {
-      // Directory doesn't exist
-    }
+  for (const targetCall of swiftTargetCalls(manifest)) {
+    const name = /\bname\s*:\s*"([^"]+)"/.exec(targetCall.argumentsText)?.[1];
+    if (name === undefined) continue;
+    const customPath = /\bpath\s*:\s*"([^"]+)"/.exec(targetCall.argumentsText)?.[1];
+    const defaultRoot = targetCall.kind === 'testTarget' ? 'Tests' : 'Sources';
+    targets.set(name, customPath ?? `${defaultRoot}/${name}`);
   }
 
-  if (targets.size > 0) {
-    if (isDev) {
-      logger.info(`📦 Loaded ${targets.size} Swift package targets`);
-    }
-    return { targets };
+  if (isDev) {
+    logger.info(`📦 Loaded ${targets.size} Swift package targets from Package.swift`);
   }
-  return null;
+  return { hasPackageManifest: true, targets };
 }
 
-// ============================================================================
-// BUNDLED CONFIG LOADER
+interface SwiftTargetCall {
+  readonly kind: 'target' | 'testTarget' | 'executableTarget' | 'macro' | 'plugin';
+  readonly argumentsText: string;
+}
+
+function swiftTargetCalls(manifest: string): readonly SwiftTargetCall[] {
+  const calls: SwiftTargetCall[] = [];
+  const targetStart = /\.(target|testTarget|executableTarget|macro|plugin)\s*\(/g;
+  for (let match = targetStart.exec(manifest); match !== null; match = targetStart.exec(manifest)) {
+    const kind = match[1] as SwiftTargetCall['kind'];
+    const openParen = targetStart.lastIndex - 1;
+    const closeParen = findSwiftCallClosingParen(manifest, openParen);
+    if (closeParen === -1) continue;
+    calls.push({ kind, argumentsText: manifest.slice(openParen + 1, closeParen) });
+    targetStart.lastIndex = closeParen + 1;
+  }
+  return calls;
+}
+
+function findSwiftCallClosingParen(text: string, openParen: number): number {
+  let depth = 0;
+  let quote: '"' | null = null;
+  let escaped = false;
+  for (let index = openParen; index < text.length; index++) {
+    const char = text[index]!;
+    if (quote !== null) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '"') {
+      quote = char;
+    } else if (char === '(') {
+      depth++;
+    } else if (char === ')') {
+      depth--;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
 // ============================================================================
 
 /** Load all language-specific configs once for an ingestion run. */

@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 
 vi.mock('@ladybugdb/core', () => ({
   default: {},
@@ -71,5 +73,48 @@ describe('startup embedding schedule', () => {
         'keyword-summary:zh-business-keywords-v2:中文',
       ),
     ).toBe(false);
+  });
+
+  it('keeps stale structure repair and Neo4j embedding repair as independent startup schedules', async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, '..', '..', 'src', 'server', 'api.ts'),
+      'utf-8',
+    );
+    const repairPosition = source.indexOf('if (isNeo4jBackendEnabled() && needsEmbeddings)');
+    const stalePosition = source.indexOf('if (shouldScheduleStartupIncrementalAnalyze(staleness))');
+
+    expect(repairPosition).toBeGreaterThanOrEqual(0);
+    expect(stalePosition).toBeGreaterThan(repairPosition);
+    expect(source.slice(repairPosition, stalePosition)).toMatch(
+      /startEmbeddingRepairForEntry\(entry, \{ source, registryBranch \}\)/,
+    );
+    expect(source.slice(stalePosition)).toMatch(/scheduleStaleAnalyze\(\);\n          continue;/);
+  });
+
+  it('does not make Neo4j embedding repair acquire the structure/Ladybug repository lock', async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, '..', '..', 'src', 'server', 'api.ts'),
+      'utf-8',
+    );
+    const start = source.indexOf('const startEmbeddingRepairForEntry =');
+    const end = source.indexOf('const storagePath = repoLockKey', start);
+    const neo4jRepair = source.slice(start, end);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(neo4jRepair).toMatch(/if \(isNeo4jBackendEnabled\(\)\) \{/);
+    expect(neo4jRepair).not.toMatch(/acquireRepoLock|withLbugDb/);
+  });
+
+  it('uses the Neo4j repository name rather than the Ladybug storage path as repair identity', async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, '..', '..', 'src', 'server', 'api.ts'),
+      'utf-8',
+    );
+    const start = source.indexOf('const startEmbeddingRepairForEntry =');
+    const end = source.indexOf('const storagePath = repoLockKey', start);
+    const neo4jRepair = source.slice(start, end);
+
+    expect(neo4jRepair).toMatch(/embeddingRepairRequests\.set\(entry\.name/);
+    expect(neo4jRepair).toMatch(/repo: entry\.name/);
   });
 });

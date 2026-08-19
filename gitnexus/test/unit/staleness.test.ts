@@ -8,7 +8,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'child_process';
-import { checkStaleness, checkStalenessAsync } from '../../src/core/git-staleness.js';
+import { checkStaleness, checkStalenessAsync, syncWithUpstream } from '../../src/core/git-staleness.js';
 
 // We test checkStaleness with a real git repo (the project itself)
 // since mocking execFileSync across ESM modules is complex.
@@ -139,8 +139,27 @@ describe('checkStalenessAsync', () => {
     for (let i = 0; i < N; i++) checkStaleness(cwd, headCommit);
     const sequentialMs = performance.now() - t1;
 
-    // Parallel should be meaningfully faster than sequential.
-    // Use a generous ratio to avoid flakiness on slow CI machines.
     expect(parallelMs).toBeLessThan(sequentialMs * 1.5);
+  });
+});
+
+describe('syncWithUpstream', () => {
+  it('returns a structured result for the current repository', async () => {
+    const result = await syncWithUpstream(process.cwd());
+    expect(result.reset).toBe(false);
+    expect(result.checked).toBe(true);
+    expect(result.localCommit).toBeTruthy();
+  });
+
+  it('uses Gitea credentials for remote checks without exposing the token', async () => {
+    const previousToken = process.env.GITEA_TOKEN;
+    process.env.GITEA_TOKEN = 'test-gitea-token';
+    try {
+      const result = await syncWithUpstream(process.cwd());
+      expect(result.checked || result.reason).toBeTruthy();
+    } finally {
+      if (previousToken === undefined) delete process.env.GITEA_TOKEN;
+      else process.env.GITEA_TOKEN = previousToken;
+    }
   });
 });

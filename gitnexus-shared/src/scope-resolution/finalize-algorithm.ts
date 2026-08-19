@@ -502,9 +502,9 @@ function tryFinalize(
     return null;
   }
 
-  const viaFiles = [targetFile, ...followed.via];
+  const viaFiles = materializeVia(prependVia(targetFile, followed.via));
   const transitiveVia =
-    draft.source.kind === 'reexport' || viaFiles.length > 1 ? Object.freeze(viaFiles) : undefined;
+    draft.source.kind === 'reexport' || viaFiles.length > 1 ? viaFiles : undefined;
 
   return {
     ...draft.base,
@@ -525,8 +525,29 @@ function tryFinalize(
  *
  * Built once per finalize pass. Lookups are O(1).
  */
-type ReexportClosureEntry = { readonly def: SymbolDefinition; readonly via: readonly string[] };
+type ViaPath = { readonly file: string; readonly next: ViaPath | null };
+type ReexportClosureEntry = { readonly def: SymbolDefinition; readonly via: ViaPath };
 type FileReexportClosure = ReadonlyMap<string, ReexportClosureEntry>;
+
+function prependVia(file: string, next: ViaPath | null): ViaPath {
+  return { file, next };
+}
+
+function viaContains(path: ViaPath | null, file: string): boolean {
+  for (let cursor = path; cursor !== null; cursor = cursor.next) {
+    if (cursor.file === file) return true;
+  }
+  return false;
+}
+
+function materializeVia(path: ViaPath): readonly string[] {
+  const files: string[] = [];
+  for (let cursor: ViaPath | null = path; cursor !== null; cursor = cursor.next) {
+    files.push(cursor.file);
+  }
+  return Object.freeze(files);
+}
+
 
 /**
  * Build per-file re-export closures.
@@ -565,10 +586,8 @@ type FileReexportClosure = ReadonlyMap<string, ReexportClosureEntry>;
  *     collapses to O(E_re) total.
  *   * Per-edge lookup at finalize time: O(1).
  *   * `transitiveVia` preserves the exact file path chain for diagnostics
- *     and graph provenance. Building those arrays copies the inherited path,
- *     which is O(depth²) in a pathological single-name barrel chain; practical
- *     TypeScript barrel chains are shallow enough that we keep exact paths
- *     instead of capping or summarizing them.
+ *     and graph provenance. Propagation shares immutable path nodes and
+ *     materializes the public array only at output time.
  *   * Pathological deep chains that previously needed
  *     `MAX_REEXPORT_DEPTH=100` to bound stack growth now resolve
  *     in full and are bounded only by available memory — the
@@ -675,14 +694,18 @@ function populateFileClosure(
     const importedName = draft.source.importedName;
     const direct = findExportByName(targetModule.localDefs, importedName);
     if (direct !== undefined) {
-      myClosure.set(localName, { def: direct, via: Object.freeze([targetFile]) });
+      myClosure.set(localName, { def: direct, via: prependVia(targetFile, null) });
       continue;
     }
     const inherited = closures.get(targetFile)?.get(importedName);
-    if (inherited !== undefined) {
+    if (
+      inherited !== undefined &&
+      !viaContains(inherited.via, filePath) &&
+      !viaContains(inherited.via, targetFile)
+    ) {
       myClosure.set(localName, {
         def: inherited.def,
-        via: Object.freeze([targetFile, ...inherited.via]),
+        via: prependVia(targetFile, inherited.via),
       });
     }
     // Else: target's closure is still empty (in-SCC, awaiting next
@@ -702,15 +725,16 @@ function populateFileClosure(
     for (const def of targetModule.localDefs) {
       const name = deriveSimpleName(def);
       if (name === null || myClosure.has(name)) continue;
-      myClosure.set(name, { def, via: Object.freeze([targetFile]) });
+      myClosure.set(name, { def, via: prependVia(targetFile, null) });
     }
     const targetClosure = closures.get(targetFile);
     if (targetClosure !== undefined) {
       for (const [name, entry] of targetClosure) {
         if (myClosure.has(name)) continue;
+        if (viaContains(entry.via, filePath) || viaContains(entry.via, targetFile)) continue;
         myClosure.set(name, {
           def: entry.def,
-          via: Object.freeze([targetFile, ...entry.via]),
+          via: prependVia(targetFile, entry.via),
         });
       }
     }
@@ -727,12 +751,12 @@ function lookupReexportedName(
   closures: ReadonlyMap<string, FileReexportClosure>,
   filePath: string,
   name: string,
-): { def: SymbolDefinition; via: readonly string[] } | null {
+): { def: SymbolDefinition; via: ViaPath } | null {
   const closure = closures.get(filePath);
   if (closure === undefined) return null;
   const entry = closure.get(name);
   if (entry === undefined) return null;
-  return { def: entry.def, via: entry.via };
+  return entry;
 }
 
 /**

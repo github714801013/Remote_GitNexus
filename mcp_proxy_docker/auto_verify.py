@@ -9,7 +9,7 @@ from urllib.error import URLError, HTTPError
 API_URL = "http://localhost:1347/api/repos"
 
 LOCAL_REPOS = "repos.json"
-REMOTE_REPOS = "/home/ji99/gitnexus/repos.json"
+REMOTE_REPOS = "/data1/gitnexus/projects/repos.json"
 
 repos_dict = {}
 

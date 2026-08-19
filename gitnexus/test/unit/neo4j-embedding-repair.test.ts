@@ -63,8 +63,25 @@ describe('Neo4j embedding repair resilience', () => {
     logs?.restore();
     vi.clearAllMocks();
     delete process.env.GITNEXUS_EMBEDDING_REPAIR_REPO_COOLDOWN_MS;
+    delete process.env.GITNEXUS_EMBEDDING_REPAIR_BATCH_SIZE;
   });
 
+  it('uses the configured repair batch size', async () => {
+    process.env.GITNEXUS_EMBEDDING_REPAIR_BATCH_SIZE = '1';
+    countEmbeddableNodes.mockResolvedValue(2);
+    loadEmbeddableNodeBatches.mockImplementationOnce(async function* () {
+      yield [node('node-a'), node('node-b')];
+    });
+    embedBatch.mockImplementation(async (texts: string[]) =>
+      texts.map(() => new Float32Array([1, 2, 3])),
+    );
+
+    const { runNeo4jEmbeddingRepair } = await import('../../src/server/search.js');
+    await expect(runNeo4jEmbeddingRepair('repo-batch-size', vi.fn())).resolves.toBe(3);
+
+    expect(embedBatch).toHaveBeenNthCalledWith(1, ['node-a']);
+    expect(embedBatch).toHaveBeenNthCalledWith(2, ['node-b']);
+  });
   it('splits failed batches and skips only nodes that still fail individually', async () => {
     logs = _captureLogger('warn');
     countEmbeddableNodes.mockResolvedValueOnce(4);
@@ -100,6 +117,63 @@ describe('Neo4j embedding repair resilience', () => {
             record.msg === 'Neo4j embedding repair skipped node after repeated embedding failures',
         ),
     ).toBe(true);
+  });
+
+  it('does not retry later batches after a systemic endpoint failure', async () => {
+    countEmbeddableNodes.mockResolvedValue(4);
+    loadEmbeddableNodeBatches.mockImplementationOnce(async function* () {
+      yield [node('node-a'), node('node-b'), node('node-c'), node('node-d')];
+    });
+    embedBatch.mockRejectedValue(
+      new Error('Embedding request failed (http://embed/embeddings, batch 0): fetch failed'),
+    );
+
+    const { runNeo4jEmbeddingRepair } = await import('../../src/server/search.js');
+    await expect(runNeo4jEmbeddingRepair('repo-systemic-batch', vi.fn())).rejects.toThrow(
+      'failed for all 4 nodes',
+    );
+    expect(embedBatch).toHaveBeenCalledTimes(1);
+  });
+  it('does not recursively split a systemic endpoint failure', async () => {
+    countEmbeddableNodes.mockResolvedValue(4);
+    loadEmbeddableNodeBatches.mockImplementationOnce(async function* () {
+      yield [node('node-a'), node('node-b'), node('node-c'), node('node-d')];
+    });
+    embedBatch.mockRejectedValue(
+      new Error('Embedding request failed (http://embed/embeddings, batch 0): fetch failed'),
+    );
+
+    const { runNeo4jEmbeddingRepair } = await import('../../src/server/search.js');
+    await expect(runNeo4jEmbeddingRepair('repo-network-failure', vi.fn())).rejects.toThrow(
+      'failed for all 4 nodes',
+    );
+    expect(embedBatch).toHaveBeenCalledTimes(1);
+    expect(embedBatch).toHaveBeenCalledWith(['node-a', 'node-b', 'node-c', 'node-d']);
+    expect(deleteEmbeddingsForNodes).not.toHaveBeenCalled();
+  });
+  it('deduplicates concurrent repair requests for the same repo', async () => {
+    countEmbeddableNodes.mockResolvedValue(1);
+    loadEmbeddableNodeBatches.mockImplementationOnce(async function* () {
+      yield [node('node-dedup')];
+    });
+
+    let releaseEmbedding!: () => void;
+    embedBatch.mockImplementationOnce(
+      () =>
+        new Promise<Float32Array[]>((resolve) => {
+          releaseEmbedding = () => resolve([new Float32Array([1, 2, 3])]);
+        }),
+    );
+
+    const { runNeo4jEmbeddingRepair } = await import('../../src/server/search.js');
+    const first = runNeo4jEmbeddingRepair('repo-dedup', vi.fn());
+    const second = runNeo4jEmbeddingRepair('repo-dedup', vi.fn());
+
+    await vi.waitFor(() => expect(embedBatch).toHaveBeenCalledTimes(1));
+    releaseEmbedding();
+
+    await expect(Promise.all([first, second])).resolves.toEqual([3, 3]);
+    expect(loadEmbeddableNodeBatches).toHaveBeenCalledTimes(1);
   });
 
   it('puts a repo into cooldown when all nodes fail embedding repair', async () => {

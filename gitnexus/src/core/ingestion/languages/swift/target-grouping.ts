@@ -27,29 +27,34 @@
 
 import type { SwiftPackageConfig } from '../../language-config.js';
 
-const DEFAULT_TARGET = '__default__';
+export const DEFAULT_TARGET = '__default__';
+const UNMATCHED_TARGET_PREFIX = '__unmatched__:';
 
 /**
  * Group `items` by SPM target subtree, replicating legacy
  * `groupSwiftFilesByTarget` semantics exactly:
  *
- *   - `targets` null/empty (no scanned source dir found) → ALL items go to
- *     a single `__default__` bucket (single-Xcode-project assumption).
- *   - Otherwise: a file matches a target when its normalized path either
+ *   - `targets` null/empty (no package manifest) → ALL items go to a
+ *     single `__default__` bucket (single-Xcode-project assumption).
+ *   - With package metadata: a file matches a target when its normalized path
  *     starts with `<targetDir>/` (`indexOf === 0`) OR contains it at a `/`
  *     boundary (`norm[idx - 1] === '/'`). Each file is assigned to the
  *     FIRST matching target only (one bucket per file, no fan-out).
- *   - Files matching no target fall into the `__default__` bucket.
+ *   - Files matching no target use one-file isolation buckets when a
+ *     `Package.swift` manifest is present; otherwise they share `__default__`.
  *
  * `targets` is `name → directory` (the `SwiftPackageConfig.targets` map).
  */
 export function groupSwiftFilesBySpmTarget<T>(
   items: readonly T[],
   getPath: (item: T) => string,
-  targets: ReadonlyMap<string, string> | null,
+  config: SwiftPackageConfig | ReadonlyMap<string, string> | null,
 ): Map<string, T[]> {
-  // No SPM config -> single target (common for Xcode projects).
-  if (targets === null || targets.size === 0) {
+  const packageConfig =
+    config !== null && 'targets' in config ? (config as SwiftPackageConfig) : null;
+  const targets = packageConfig?.targets ?? (config instanceof Map ? config : undefined);
+  // No package manifest -> single target (common for Xcode projects).
+  if (targets === undefined || targets.size === 0) {
     return new Map([[DEFAULT_TARGET, [...items]]]);
   }
 
@@ -79,7 +84,13 @@ export function groupSwiftFilesBySpmTarget<T>(
         break; // FIRST match only — one bucket per file, no fan-out.
       }
     }
-    if (!assigned) defaultGroup.push(item);
+    if (!assigned) {
+      if (packageConfig?.hasPackageManifest === true) {
+        groups.set(`${UNMATCHED_TARGET_PREFIX}${normalized}`, [item]);
+      } else {
+        defaultGroup.push(item);
+      }
+    }
   }
 
   if (defaultGroup.length > 0) groups.set(DEFAULT_TARGET, defaultGroup);
@@ -89,16 +100,19 @@ export function groupSwiftFilesBySpmTarget<T>(
 /**
  * Duck-type the opaque `resolutionConfig` (loaded by
  * `loadSwiftPackageConfig` and threaded through the orchestrator) into the
- * SPM `targets` map, or `null` when no Swift package config is present.
+ * Swift package config, or `null` when no Swift package config is present.
  *
  * Uses structural duck-typing (no `instanceof`) because the value crosses
  * the `unknown`-typed `resolutionConfig` channel and may be `null`,
  * `undefined`, or a config object whose `targets` is a `Map<string,string>`.
  */
-export function coerceSwiftTargets(resolutionConfig: unknown): ReadonlyMap<string, string> | null {
+export function coerceSwiftTargets(resolutionConfig: unknown): SwiftPackageConfig | null {
   const config = resolutionConfig as Partial<SwiftPackageConfig> | null | undefined;
   if (config != null && config.targets instanceof Map) {
-    return config.targets;
+    return {
+      targets: config.targets,
+      hasPackageManifest: config.hasPackageManifest === true,
+    };
   }
   return null;
 }

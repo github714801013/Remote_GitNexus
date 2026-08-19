@@ -19,7 +19,12 @@
  * and all files form one `__default__` module (single-Xcode-project
  * assumption). Every pair of distinct `.swift` files in the same module
  * gets a directed IMPORTS edge in both directions (whole-module
- * visibility is symmetric).
+ * visibility is symmetric). To bound the graph and memory growth in large
+ * non-SPM/Xcode projects, groups whose complete relationship count exceeds
+ * `GITNEXUS_SWIFT_IMPLICIT_IMPORT_EDGE_CAP` (default 100,000) are skipped
+ * as a whole. This deliberately avoids materializing a partial, asymmetric
+ * visibility graph; it does not remove the separate sibling-definition and
+ * type-binding costs.
  *
  * Node identity + edge construction mirror the generic `emitImportEdges`
  * convention (`graph-bridge/imports-to-edges.ts`): `generateId('File', path)`
@@ -32,8 +37,24 @@
 import type { ParsedFile } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
 import type { GraphNodeLookup } from '../../scope-resolution/graph-bridge/node-lookup.js';
+import { logger } from '../../../logger.js';
 import { generateId } from '../../../../lib/utils.js';
 import { coerceSwiftTargets, groupSwiftFilesBySpmTarget } from './target-grouping.js';
+
+export const DEFAULT_SWIFT_IMPLICIT_IMPORT_EDGE_CAP = 100_000;
+const SWIFT_IMPLICIT_IMPORT_EDGE_CAP_ENV = 'GITNEXUS_SWIFT_IMPLICIT_IMPORT_EDGE_CAP';
+
+export function swiftImplicitImportEdgeCap(): number {
+  const rawCap = process.env[SWIFT_IMPLICIT_IMPORT_EDGE_CAP_ENV];
+  if (rawCap === undefined || rawCap.trim() === '') {
+    return DEFAULT_SWIFT_IMPLICIT_IMPORT_EDGE_CAP;
+  }
+
+  const configuredCap = Number(rawCap);
+  return Number.isSafeInteger(configuredCap) && configuredCap >= 0
+    ? configuredCap
+    : DEFAULT_SWIFT_IMPLICIT_IMPORT_EDGE_CAP;
+}
 
 export function emitSwiftImplicitImportEdges(
   graph: KnowledgeGraph,
@@ -50,8 +71,19 @@ export function emitSwiftImplicitImportEdges(
     targets,
   );
 
-  for (const [, group] of filesByTarget) {
+  const edgeCap = swiftImplicitImportEdgeCap();
+  for (const [targetName, group] of filesByTarget) {
     if (group.length < 2) continue; // no siblings to import
+
+    const expectedEdgeCount = group.length * (group.length - 1);
+    if (expectedEdgeCount > edgeCap) {
+      logger.warn(
+        { targetName, fileCount: group.length, expectedEdgeCount, edgeCap },
+        'Swift implicit import edges skipped because the target exceeds the edge cap',
+      );
+      continue;
+    }
+
     for (const source of group) {
       for (const target of group) {
         if (source.filePath === target.filePath) continue; // no self-import

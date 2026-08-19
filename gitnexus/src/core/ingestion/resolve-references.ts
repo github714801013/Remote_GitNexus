@@ -56,9 +56,11 @@ import {
   type RegistryContext,
   type RegistryProviders,
   type Resolution,
+  type BindingRef,
   type ScopeId,
 } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from './model/scope-resolution-indexes.js';
+import { lookupBindingsAt } from './scope-resolution/scope/walkers.js';
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -97,6 +99,7 @@ export function resolveReferenceSites(input: ResolveReferencesInput): ResolveRef
     qualifiedNames: scopes.qualifiedNames,
     moduleScopes: scopes.moduleScopes,
     ownedMembersByOwner: input.ownedMembersByOwner,
+    visibleBindingsAt: (scopeId, name) => visibleBindingsAt(scopeId, name, scopes),
     methodDispatch: scopes.methodDispatch,
     providers,
   };
@@ -166,6 +169,21 @@ export function resolveReferenceSites(input: ResolveReferencesInput): ResolveRef
 }
 
 // ─── Internal ───────────────────────────────────────────────────────────────
+
+function visibleBindingsAt(
+  scopeId: ScopeId,
+  name: string,
+  indexes: ScopeResolutionIndexes,
+): readonly BindingRef[] {
+  const scope = indexes.scopeTree.getScope(scopeId);
+  const lexical = scope?.bindings.get(name);
+  if (lexical !== undefined && lexical.length > 0) return lexical;
+  // Post-finalize visibility is module-scoped. Returning it from a child scope
+  // would stop lookupCore before it visits the enclosing module's lexical
+  // bindings, incorrectly letting a shared target name bypass a local shadow.
+  if (scope?.kind !== 'Module') return [];
+  return lookupBindingsAt(scopeId, name, indexes);
+}
 
 /**
  * Pick the right registry for the site's `kind` and call `lookup`.

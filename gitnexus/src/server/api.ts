@@ -78,12 +78,13 @@ import {
   isRepoAlreadyActiveError,
 } from './error-classification.js';
 import { getKeywordSummaryHashSalt } from '../core/embeddings/keyword-summary.js';
+import { getAllowedEnvironments } from '../config/environment-policy.js';
 export {
   isAnalysisAlreadyInProgressError,
   isJsonBodyParseError,
   isRepoAlreadyActiveError,
 } from './error-classification.js';
-import { checkStaleness, type StalenessInfo } from '../core/git-staleness.js';
+import { checkStaleness, syncWithUpstream, type StalenessInfo } from '../core/git-staleness.js';
 import {
   WebhookWorktreeError,
   assertEnvAllowed,
@@ -97,7 +98,6 @@ import {
   getManagedWorktreePath,
   getProjectsRoot,
   parseGiteaWebhookRepo,
-  parseAllowedEnvs,
   upsertWebhookRepoConfig,
   type WebhookRepoConfigEntry,
 } from './webhook-worktree.js';
@@ -108,6 +108,9 @@ import {
   requireLoopbackPeer,
 } from './middleware.js';
 import { createLaunchAnalysisWorker } from './analyze-launch.js';
+import { RepoLockRegistry } from './repo-lock-registry.js';
+import { createEmbeddingRepairCoordinator } from './embedding-repair-coordinator.js';
+import type { AnalyzeResultIpc } from './analyze-worker-ipc.js';
 import { ensureCocoaPodsDependencies } from './cocoapods.js';
 import { UPLOAD_ROOT } from './upload-paths.js';
 import { sweepStaleUploads } from './upload-sweep.js';
@@ -1154,21 +1157,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // Backstop: remove any upload staging dirs orphaned by a previous crash.
   void sweepStaleUploads().catch(() => {});
 
-  // Shared repo lock — prevents concurrent analyze + embed on the same repo path,
-  // which would corrupt LadybugDB (analyze calls closeLbug + initLbug while embed has queries in flight).
-  const activeRepoPaths = new Set<string>();
+  // Shared repo lock serializes graph and metadata writes for one repository.
+  // The registry also notifies deferred embedding repair rounds when a structure
+  // worker releases the lock.
+  const repoLocks = new RepoLockRegistry();
+  const repoLockKey = (repoPath: string): string => canonicalizePath(path.resolve(repoPath));
+  const acquireRepoLock = (repoPath: string): string | null => repoLocks.acquire(repoLockKey(repoPath));
+  const releaseRepoLock = (repoPath: string): void => repoLocks.release(repoLockKey(repoPath));
 
-  const acquireRepoLock = (repoPath: string): string | null => {
-    if (activeRepoPaths.has(repoPath)) {
-      return `Another job is already active for this repository`;
-    }
-    activeRepoPaths.add(repoPath);
-    return null;
-  };
-
-  const releaseRepoLock = (repoPath: string): void => {
-    activeRepoPaths.delete(repoPath);
-  };
+  let onAnalysisFinalized:
+    | ((result: AnalyzeResultIpc, context: { jobId: string; repoPath: string }) => void)
+    | undefined;
 
   // Launch the analyze worker for an already-resolved repo directory. Shared by
   // the JSON /api/analyze route and the multipart /api/analyze/upload route.
@@ -1178,6 +1177,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     acquireRepoLock,
     releaseRepoLock,
     closeDbHandle: closeLbug,
+    onAnalysisFinalized: (result, context) => onAnalysisFinalized?.(result, context),
   });
 
   const resourceController = new ResourceAwareConcurrencyController();
@@ -1192,9 +1192,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   );
   const webhookEmbeddingRepairQueue = new WebhookAnalyzeQueue(
     () => resourceController.getConcurrency('embedding'),
-    {
-      startGate: webhookParallelStartGate,
-    },
   );
 
   const startAnalyzeForPath = (
@@ -1204,6 +1201,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       repoName?: string;
       force?: boolean;
       embeddings?: boolean;
+      deferEmbeddingRepair?: boolean;
       registryName?: string;
       registryBranch?: string;
       allowDuplicateName?: boolean;
@@ -1227,6 +1225,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     launchAnalysisWorker(job, repoPath, {
       force: !!params.force,
       embeddings: params.embeddings,
+      deferEmbeddingRepair: params.deferEmbeddingRepair,
       registryName: params.registryName,
       registryBranch: params.registryBranch,
       allowDuplicateName: params.allowDuplicateName,
@@ -1256,6 +1255,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     repoPath: string,
     params: Parameters<typeof startAnalyzeForPath>[1] = {},
     beforeAnalyze?: () => Promise<void>,
+    lockAlreadyHeld = false,
   ) => {
     let job: ReturnType<typeof startAnalyzeForPath> | undefined;
     const resolvedRepoPath = path.resolve(repoPath);
@@ -1263,17 +1263,22 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       key: resolvedRepoPath,
       run: async (releaseStructureSlot) => {
         const lockKey = getStoragePath(repoPath);
-        const lockErr = acquireRepoLock(lockKey);
-        if (lockErr) {
-          if (isRepoAlreadyActiveError(new Error(lockErr))) return;
-          throw new Error(lockErr);
+        if (!lockAlreadyHeld) {
+          const lockErr = acquireRepoLock(lockKey);
+          if (lockErr) {
+            if (isRepoAlreadyActiveError(new Error(lockErr))) return;
+            throw new Error(lockErr);
+          }
         }
         let releaseProgressListener: (() => void) | undefined;
         try {
           await beforeAnalyze?.();
           await ensureCocoaPodsDependencies(repoPath);
           await waitForJobManagerIdle(jobManager);
-          job = startAnalyzeForPath(repoPath, params, true);
+          job = startAnalyzeForPath(repoPath, {
+            ...params,
+            deferEmbeddingRepair: Boolean(params.deferEmbeddingRepair),
+          }, true);
           releaseProgressListener = jobManager.onProgress(job.id, (progress) => {
             if (progress.phase === 'embeddings' && progress.percent >= 90) {
               releaseStructureSlot();
@@ -1284,7 +1289,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           await waitForAnalyzeJob(job.id);
         } finally {
           releaseProgressListener?.();
-          releaseRepoLock(lockKey);
+          if (!lockAlreadyHeld) releaseRepoLock(lockKey);
         }
       },
     });
@@ -1298,108 +1303,181 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   };
 
   type EmbeddingRepairEntry = Awaited<ReturnType<typeof listRegisteredRepos>>[number];
+  const embeddingRepairRequests = new Map<
+    string,
+    { entry: EmbeddingRepairEntry; options: { source: string; registryBranch?: string } }
+  >();
+
+  const runEmbeddingRepairForStoragePath = async (storagePath: string): Promise<void> => {
+    const request = embeddingRepairRequests.get(storagePath);
+    if (!request) return;
+    const { entry, options } = request;
+    let job: ReturnType<JobManager['createJob']> | undefined;
+    const updateEmbeddingMeta = async (
+      embeddingStatus: EmbeddingStatus,
+      embeddings?: number,
+    ): Promise<void> => {
+      const latestMeta = await loadMeta(entry.storagePath);
+      const stats = {
+        ...(entry.stats ?? {}),
+        ...(latestMeta?.stats ?? {}),
+        ...(embeddings === undefined ? {} : { embeddings }),
+      };
+      const meta = {
+        ...(latestMeta ?? {}),
+        repoPath: latestMeta?.repoPath ?? entry.path,
+        lastCommit: latestMeta?.lastCommit ?? entry.lastCommit,
+        indexedAt: new Date().toISOString(),
+        branch: options.registryBranch ?? latestMeta?.branch ?? entry.branch,
+        remoteUrl: latestMeta?.remoteUrl ?? entry.remoteUrl,
+        embeddingStatus,
+        keywordSummaryHashSalt: getKeywordSummaryHashSalt(),
+        stats,
+      };
+      await saveMeta(entry.storagePath, meta);
+      await registerRepo(entry.path, meta, { name: entry.name, allowDuplicateName: true });
+    };
+    const progress = (p: any) => {
+      embedJobManager.updateJob(job!.id, {
+        progress: {
+          phase: p.phase === 'ready' ? 'complete' : p.phase === 'error' ? 'failed' : p.phase,
+          percent: p.percent,
+          message: p.message ?? `${p.phase} (${p.percent}%)`,
+        },
+      });
+    };
+    try {
+      job = embedJobManager.createJob({ repoPath: entry.path });
+      embedJobManager.updateJob(job.id, {
+        repoName: entry.name,
+        status: 'analyzing' as any,
+        progress: { phase: 'embeddings', percent: 0, message: 'Starting embedding repair...' },
+      });
+      await updateEmbeddingMeta(EMBEDDING_STATUS_RUNNING);
+      let embeddingCount = 0;
+      if (isNeo4jBackendEnabled()) {
+        embeddingCount = await runNeo4jEmbeddingRepair(entry.name, progress, entry.path);
+      } else {
+        const queued = enqueueWebhookAnalyze(entry.path, {
+          repoName: entry.name,
+          embeddings: true,
+          registryName: entry.name,
+          registryBranch: options.registryBranch,
+          allowDuplicateName: true,
+        }, undefined, true);
+        await queued.done;
+        await withLbugDb(path.join(entry.storagePath, 'lbug'), async () => {
+          const rows = await executeQuery(
+            `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS embeddings`,
+          );
+          embeddingCount = Number(rows?.[0]?.embeddings ?? rows?.[0]?.[0] ?? 0);
+        });
+      }
+      await updateEmbeddingMeta(EMBEDDING_STATUS_COMPLETE, embeddingCount);
+      await backend.init();
+      embedJobManager.updateJob(job.id, { status: 'complete', repoName: entry.name });
+    } catch (err) {
+      await updateEmbeddingMeta(EMBEDDING_STATUS_FAILED).catch(() => {});
+      if (job) {
+        embedJobManager.updateJob(job.id, {
+          status: 'failed',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      throw err;
+    }
+  };
+
+  const embeddingRepairCoordinator = createEmbeddingRepairCoordinator({
+    queue: {
+      enqueue: (repoId, task) => {
+        void webhookEmbeddingRepairQueue
+          .enqueue({ key: repoId, run: async () => task() })
+          .done.catch((err) => {
+            const repo = embeddingRepairRequests.get(repoId)?.entry.name ?? repoId;
+            handleEmbeddingRepairError(err, repo);
+          });
+      },
+    },
+    runner: { run: runEmbeddingRepairForStoragePath },
+    lock: isNeo4jBackendEnabled()
+      ? {
+          tryAcquire: () => true,
+          release: () => {},
+          onReleased: () => () => {},
+        }
+      : {
+          tryAcquire: (storagePath) => acquireRepoLock(storagePath) === null,
+          release: releaseRepoLock,
+          onReleased: (listener) => repoLocks.onReleased(listener),
+        },
+    timers: { setTimeout },
+    now: () => new Date().toISOString(),
+  });
 
   const startEmbeddingRepairForEntry = (
     entry: EmbeddingRepairEntry,
     options: { source: string; registryBranch?: string },
   ) => {
-    let job: ReturnType<JobManager['createJob']> | undefined;
-    const queued = webhookEmbeddingRepairQueue.enqueue({
-      key: path.resolve(entry.storagePath),
-      run: async () => {
-        const repoLockPath = entry.storagePath;
-        const lockErr = acquireRepoLock(repoLockPath);
-        if (lockErr) {
-          if (isRepoAlreadyActiveError(new Error(lockErr))) return;
-          throw new Error(lockErr);
-        }
-        const updateEmbeddingMeta = async (
-          embeddingStatus: EmbeddingStatus,
-          embeddings?: number,
-        ): Promise<void> => {
-          const latestMeta = await loadMeta(entry.storagePath);
-          const stats = {
-            ...(entry.stats ?? {}),
-            ...(latestMeta?.stats ?? {}),
-            ...(embeddings === undefined ? {} : { embeddings }),
-          };
-          const meta: any = {
-            repoPath: entry.path,
-            lastCommit: latestMeta?.lastCommit ?? entry.lastCommit,
-            indexedAt: new Date().toISOString(),
-            branch: options.registryBranch ?? latestMeta?.branch ?? entry.branch,
-            remoteUrl: latestMeta?.remoteUrl ?? entry.remoteUrl,
-            embeddingStatus,
-            keywordSummaryHashSalt: getKeywordSummaryHashSalt(),
-            stats,
-          };
-          await saveMeta(entry.storagePath, meta);
-          await registerRepo(entry.path, meta, {
-            name: entry.name,
-            allowDuplicateName: true,
-          });
-        };
-        const progress = (p: any) => {
-          embedJobManager.updateJob(job!.id, {
-            progress: {
-              phase: p.phase === 'ready' ? 'complete' : p.phase === 'error' ? 'failed' : p.phase,
-              percent: p.percent,
-              message: p.message ?? `${p.phase} (${p.percent}%)`,
-            },
-          });
-        };
-        try {
-          job = embedJobManager.createJob({ repoPath: entry.path });
-          embedJobManager.updateJob(job.id, {
-            repoName: entry.name,
-            status: 'analyzing' as any,
-            progress: { phase: 'embeddings', percent: 0, message: 'Starting embedding repair...' },
-          });
-          await updateEmbeddingMeta(EMBEDDING_STATUS_RUNNING);
-          let embeddingCount = 0;
-          if (isNeo4jBackendEnabled()) {
-            embeddingCount = await runNeo4jEmbeddingRepair(entry.name, progress, entry.path);
-          } else {
-            const queued = enqueueWebhookAnalyze(entry.path, {
-              repoName: entry.name,
-              embeddings: true,
-              registryName: entry.name,
-              registryBranch: options.registryBranch,
-              allowDuplicateName: true,
-            });
-            await queued.done;
-            await withLbugDb(path.join(entry.storagePath, 'lbug'), async () => {
-              const rows = await executeQuery(
-                `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS embeddings`,
-              );
-              embeddingCount = Number(rows?.[0]?.embeddings ?? rows?.[0]?.[0] ?? 0);
-            });
-          }
-          await updateEmbeddingMeta(EMBEDDING_STATUS_COMPLETE, embeddingCount);
-          await backend.init();
-          embedJobManager.updateJob(job.id, { status: 'complete', repoName: entry.name });
-        } catch (err) {
-          if (isAnalysisAlreadyInProgressError(err)) return;
-          await updateEmbeddingMeta(EMBEDDING_STATUS_FAILED).catch(() => {});
-          if (job) {
-            embedJobManager.updateJob(job.id, {
-              status: 'failed',
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-          throw err;
-        } finally {
-          releaseRepoLock(repoLockPath);
-        }
-      },
+    if (isNeo4jBackendEnabled()) {
+      embeddingRepairRequests.set(entry.name, { entry, options });
+      const projection = embeddingRepairCoordinator.request({
+        repo: entry.name,
+        source:
+          options.source === 'manual'
+            ? 'manual'
+            : options.source === 'finalization'
+              ? 'finalization'
+              : 'startup',
+      });
+      return { status: projection.status, job: undefined };
+    }
+
+    const storagePath = repoLockKey(entry.storagePath);
+    embeddingRepairRequests.set(storagePath, { entry, options });
+    const projection = embeddingRepairCoordinator.request({
+      repo: storagePath,
+      source:
+        options.source === 'manual'
+          ? 'manual'
+          : options.source === 'finalization'
+            ? 'finalization'
+            : 'startup',
     });
-    return {
-      status: queued.status,
-      get job() {
-        return job;
-      },
-      done: queued.done,
-    };
+    return { status: projection.status, job: undefined };
+  };
+
+  onAnalysisFinalized = (result: AnalyzeResultIpc, context: { jobId: string; repoPath: string }): void => {
+    if (!result.embeddingRepairDeferred || !isNeo4jBackendEnabled()) return;
+    void (async () => {
+      try {
+        const entry = (await listRegisteredRepos()).find((candidate) =>
+          registryPathEquals(canonicalizePath(candidate.path), canonicalizePath(context.repoPath)),
+        );
+        if (!entry) return;
+        const meta = await loadMeta(entry.storagePath);
+        const { countEmbeddings } = await import('../core/neo4j/embedding-adapter.js');
+        const actualEmbeddings = await countEmbeddings(entry.name).catch(() => undefined);
+        if ((meta?.stats?.nodes ?? 0) <= 0 && actualEmbeddings === 0) return;
+        startEmbeddingRepairForEntry(entry, { source: 'finalization', registryBranch: entry.branch });
+      } catch (err) {
+        logger.error({ err, repoPath: context.repoPath }, 'post-analysis embedding repair scheduling failed');
+      }
+    })();
+  };
+  const handleEmbeddingRepairError = (err: unknown, repo: string): void => {
+    if (isAnalysisAlreadyInProgressError(err)) return;
+    if (isNeo4jEmbeddingRepairCooldownError(err)) {
+      const log = err.name === 'Neo4jEmbeddingRepairDeferredError' ? logger.warn : logger.debug;
+      log(
+        { repo, retryAfterMs: err.retryAfterMs },
+        err.name === 'Neo4jEmbeddingRepairDeferredError'
+          ? 'embedding repair deferred: embedding endpoint failures cooling repo down'
+          : 'embedding repair skipped: repo cooling down',
+      );
+      return;
+    }
+    logger.error({ err, repo }, 'embedding repair failed');
   };
 
   app.get('/api/internal/repo-locks/:repoName', requireLoopbackPeer, async (req, res) => {
@@ -1427,7 +1505,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
       res.json({
         repoName: entry.name,
-        lockHeld: activeRepoPaths.has(entry.storagePath),
+        lockHeld: repoLocks.has(repoLockKey(entry.storagePath)),
         jobs,
       });
     } catch {
@@ -1525,7 +1603,21 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           }
         }
         const needsEmbeddings = shouldScheduleStartupEmbeddings(meta, actualEmbeddings);
-        const staleness = checkStaleness(entry.path, entry.lastCommit);
+        const remoteSync = await syncWithUpstream(entry.path);
+        if (!remoteSync.checked) {
+          logger.warn(
+            { repo: entry.name, reason: remoteSync.reason },
+            'index remote version check skipped; continuing local health check',
+          );
+        } else if (remoteSync.reset) {
+          logger.info(
+            { repo: entry.name, upstreamRef: remoteSync.upstreamRef },
+            'index project reset to remote upstream; scheduling reanalysis',
+          );
+        }
+        const staleness = remoteSync.reset
+          ? { isStale: true, commitsBehind: 1 }
+          : checkStaleness(entry.path, entry.lastCommit);
 
         if (shouldRunStartupLbugHealthCheck()) {
           try {
@@ -1553,11 +1645,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           }
         }
 
-        if (shouldScheduleStartupIncrementalAnalyze(staleness)) {
+        const scheduleStaleAnalyze = (): void => {
+          logger.info(
+            { repo: entry.name, path: entry.path },
+            'Stale index analyze scheduled',
+          );
           const queued = enqueueWebhookAnalyze(entry.path, {
             repoName: entry.name,
             force: false,
-            embeddings: needsEmbeddings || undefined,
+            deferEmbeddingRepair: true,
             registryName: entry.name,
             registryBranch,
             allowDuplicateName: true,
@@ -1572,26 +1668,30 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             }
             logger.error({ err, repo: entry.name }, 'stale index refresh failed');
           });
+        };
+
+        if (isNeo4jBackendEnabled() && needsEmbeddings) {
+          logger.info(
+            { repo: entry.name, actualEmbeddings, nodes: meta?.stats?.nodes ?? 0 },
+            'Embedding repair scheduled for existing graph',
+          );
+          startEmbeddingRepairForEntry(entry, { source, registryBranch });
+        }
+
+        if (shouldScheduleStartupIncrementalAnalyze(staleness)) {
+          scheduleStaleAnalyze();
           continue;
         }
 
-        if (needsEmbeddings) {
+        if (!isNeo4jBackendEnabled() && needsEmbeddings) {
+          logger.info(
+            { repo: entry.name, actualEmbeddings, nodes: meta?.stats?.nodes ?? 0 },
+            'Embedding repair scheduled for existing graph',
+          );
           const queued = startEmbeddingRepairForEntry(entry, { source, registryBranch });
-          queued.done.catch((err) => {
-            if (isAnalysisAlreadyInProgressError(err)) return;
-            if (isNeo4jEmbeddingRepairCooldownError(err)) {
-              const log =
-                err.name === 'Neo4jEmbeddingRepairDeferredError' ? logger.warn : logger.debug;
-              log(
-                { repo: entry.name, retryAfterMs: err.retryAfterMs },
-                err.name === 'Neo4jEmbeddingRepairDeferredError'
-                  ? 'embedding repair deferred: embedding endpoint failures cooling repo down'
-                  : 'embedding repair skipped: repo cooling down',
-              );
-              return;
-            }
-            logger.error({ err, repo: entry.name }, 'embedding repair failed');
-          });
+          if (queued.status === 'waiting_for_lock') {
+            logger.debug({ repo: entry.name }, 'embedding repair waiting for repository lock');
+          }
         }
       }
       return { skipped: false };
@@ -1607,25 +1707,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     logger.error({ err }, 'startup index health check failed');
   });
 
-  const indexHealthIntervalMs = Number.parseInt(
-    process.env.GITNEXUS_INDEX_HEALTH_INTERVAL_MS ?? '',
-    10,
-  );
-  if (Number.isFinite(indexHealthIntervalMs) && indexHealthIntervalMs > 0) {
-    setInterval(() => {
-      void runIndexHealthCheck('scheduled').catch((err) => {
-        logger.error({ err }, 'scheduled index health check failed');
-      });
-    }, indexHealthIntervalMs).unref?.();
-  }
-
-  app.post('/api/index-health-check', async (_req, res) => {
-    try {
-      const result = await runIndexHealthCheck('manual');
-      res.status(result.skipped ? 202 : 200).json({ ok: true, ...result });
-    } catch (err: any) {
-      res.status(500).json({ ok: false, error: err.message || 'Index health check failed' });
-    }
+  app.post('/api/index-health-check', (_req, res) => {
+    void runIndexHealthCheck('manual').catch((err) => {
+      logger.error({ err }, 'manual index health check failed');
+    });
+    res.status(202).json({ ok: true, accepted: true });
   });
 
   /**
@@ -2420,7 +2506,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     try {
       const env = req.params.env.toLowerCase();
       assertSafeSegment(env, 'env');
-      assertEnvAllowed(env, parseAllowedEnvs(process.env.GITNEXUS_ALLOWED_WEBHOOK_ENVS));
+      assertEnvAllowed(env, getAllowedEnvironments());
       const repo = parseGiteaWebhookRepo(req.body);
       const sourceBranch = repo.branch || 'master';
       const projectsRoot = getProjectsRoot();

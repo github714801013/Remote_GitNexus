@@ -93,6 +93,34 @@ describe('MCP request repository scope', () => {
     ]);
   });
 
+  it('uses the shared environment allowlist and maps iteng projects to iteng-prefixed repositories', async () => {
+    vi.stubEnv('GITNEXUS_WEBHOOK_ALLOWED_ENVS', 'dev,pro,iteng');
+    const backend = createBackend([
+      {
+        name: 'iteng-saasoanew',
+        path: '/repos/iteng-saasoanew',
+        indexedAt: '2026-01-01',
+        lastCommit: '7'.repeat(40),
+      },
+    ]);
+    const policy = await createMcpRepositoryPolicy(backend, {});
+
+    expect(
+      (await policy.forRequestScope({ projects: 'saasoanew', env: 'iteng' }).scopeBackend(backend).listRepos()).map(
+        (repo) => repo.name,
+      ),
+    ).toEqual(['iteng-saasoanew']);
+  });
+
+  it('rejects an environment that is not in the shared allowlist', async () => {
+    vi.stubEnv('GITNEXUS_WEBHOOK_ALLOWED_ENVS', 'dev,pro');
+    const policy = await createMcpRepositoryPolicy(createBackend(), {});
+
+    expect(() => policy.forRequestScope({ env: 'iteng' })).toThrow(
+      /unknown environment: iteng/i,
+    );
+  });
+
   it('does not require projects when environment is provided', async () => {
     const repos: RepoListing[] = [
       {

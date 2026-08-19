@@ -1,31 +1,62 @@
 /**
- * Swift same-module (SPM target) implicit visibility for the
- * `populateNamespaceSiblings` hook.
+ * Swift same-module (SPM target) implicit visibility.
  *
- * Swift gives every file in a module access to every other file's
- * top-level declarations WITHOUT any `import` statement (whole-module
- * visibility). This is the Swift analogue of Go's same-package sibling
- * visibility — `populateGoPackageSiblings` is the template.
- *
- * Module identity: Swift has no in-source `package X` marker. The SPM
- * target is a directory subtree (`Sources/<Target>/…`). Module membership
- * is threaded in via the SPM target map (`ctx.resolutionConfig` →
- * `coerceSwiftTargets`) and grouped by `groupSwiftFilesBySpmTarget`,
- * replicating legacy `wireSwiftImplicitImports`'s `groupSwiftFilesByTarget`:
- * files are grouped by SPM target subtree when a package config is present,
- * else ALL Swift files form one module (`__default__`,
- * single-Xcode-project assumption). Every `.swift` file in the same target
- * sees its siblings' top-level defs.
- *
- * Bindings are added through the append-only `bindingAugmentations`
- * channel (Contract Invariant I8) with `origin: 'namespace'`, exactly
- * like the Go implementation — `indexes.bindings` is frozen post-
- * finalize and must not be mutated.
+ * A Swift target has one module-wide top-level declaration space.  This hook
+ * publishes that surface once in a gated namespace channel rather than copying
+ * every sibling declaration into every module scope.
  */
 
-import type { BindingRef, ParsedFile, ScopeId, SymbolDefinition } from 'gitnexus-shared';
+import type { BindingRef, ParsedFile, Scope, ScopeId, SymbolDefinition } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import { coerceSwiftTargets, groupSwiftFilesBySpmTarget } from './target-grouping.js';
+
+const SWIFT_TARGET_NAMESPACE_PREFIX = 'swift-target:';
+const TOP_LEVEL_VALUE_KINDS = new Set(['Property', 'Const', 'Variable', 'Static']);
+const TOP_LEVEL_TYPE_KINDS = new Set([
+  'Class',
+  'Interface',
+  'Enum',
+  'Struct',
+  'Union',
+  'Trait',
+  'TypeAlias',
+  'Typedef',
+  'Record',
+  'Delegate',
+  'Annotation',
+  'Template',
+]);
+
+export function swiftTargetNamespace(targetName: string): string {
+  return `${SWIFT_TARGET_NAMESPACE_PREFIX}${targetName}`;
+}
+
+/** Return only declarations that Swift exposes as bare target-level names. */
+export function swiftTargetVisibleDefs(parsed: ParsedFile): readonly SymbolDefinition[] {
+  const scopesById = new Map<ScopeId, Scope>();
+  for (const scope of parsed.scopes) scopesById.set(scope.id, scope);
+
+  const seen = new Set<string>();
+  const visible: SymbolDefinition[] = [];
+  for (const scope of parsed.scopes) {
+    const parent = scope.parent === null ? null : scopesById.get(scope.parent);
+    const acceptsScopeDefs = scope.kind === 'Module';
+    const acceptsTypeScope = scope.kind === 'Class';
+    const acceptsFreeFunction = scope.kind === 'Function' && parent?.kind === 'Module';
+
+    for (const def of scope.ownedDefs) {
+      const isVisibleType = TOP_LEVEL_TYPE_KINDS.has(def.type) && (acceptsScopeDefs || acceptsTypeScope);
+      const isVisibleValue = acceptsScopeDefs && TOP_LEVEL_VALUE_KINDS.has(def.type);
+      const isVisibleFunction =
+        (def.type === 'Function' || def.type === 'Method') &&
+        (acceptsScopeDefs || acceptsFreeFunction);
+      if ((!isVisibleType && !isVisibleValue && !isVisibleFunction) || seen.has(def.nodeId)) continue;
+      seen.add(def.nodeId);
+      visible.push(def);
+    }
+  }
+  return visible;
+}
 
 export function populateSwiftTargetSiblings(
   parsedFiles: readonly ParsedFile[],
@@ -35,55 +66,55 @@ export function populateSwiftTargetSiblings(
     readonly resolutionConfig?: unknown;
   },
 ): void {
-  // Group files by SPM target subtree (the module). No-source-dir → all
-  // files in one `__default__` bucket.
-  const targets = coerceSwiftTargets(ctx.resolutionConfig);
-  const filesByTarget = groupSwiftFilesBySpmTarget(
-    parsedFiles,
-    (parsed) => parsed.filePath,
-    targets,
-  );
+  const config = coerceSwiftTargets(ctx.resolutionConfig);
+  const filesByTarget = groupSwiftFilesBySpmTarget(parsedFiles, (parsed) => parsed.filePath, config);
+  const namespaceBindings = indexes.namespaceFqnBindings as Map<
+    string,
+    Map<string, BindingRef[]>
+  >;
+  const accessibleNamespaces = indexes.accessibleNamespacesByScope as Map<ScopeId, string[]>;
 
-  const augmentations = indexes.bindingAugmentations as Map<ScopeId, Map<string, BindingRef[]>>;
+  for (const [targetName, group] of filesByTarget) {
+    const namespace = swiftTargetNamespace(targetName);
+    let targetBindings = namespaceBindings.get(namespace);
+    const seenByName = new Map<string, Set<string>>();
 
-  for (const [, group] of filesByTarget) {
-    if (group.length < 2) continue; // no siblings to share
-    const siblings = group.map((parsed) => ({
-      filePath: parsed.filePath,
-      defs: [...parsed.localDefs] as SymbolDefinition[],
-    }));
-    for (const target of siblings) {
-      for (const receiver of siblings) {
-        if (receiver.filePath === target.filePath) continue; // no self-reference
-        const receiverModule = indexes.moduleScopes.byFilePath.get(receiver.filePath);
-        if (receiverModule === undefined) continue;
-
-        for (const def of target.defs) {
-          const name = def.qualifiedName?.split('.').pop() ?? def.qualifiedName ?? '';
-          if (name === '') continue;
-          const bucket = getAugmentationBucket(augmentations, receiverModule, name);
-          if (bucket.some((b) => b.def.nodeId === def.nodeId)) continue;
-          bucket.push({ def, origin: 'namespace' });
+    for (const parsed of group) {
+      const moduleScopeId = indexes.moduleScopes.byFilePath.get(parsed.filePath);
+      if (moduleScopeId !== undefined) {
+        const existing = accessibleNamespaces.get(moduleScopeId) ?? [];
+        if (!existing.includes(namespace)) {
+          accessibleNamespaces.set(moduleScopeId, [...existing, namespace]);
         }
+      }
+
+      for (const def of swiftTargetVisibleDefs(parsed)) {
+        const name = simpleName(def);
+        if (name === '') continue;
+        if (targetBindings === undefined) {
+          targetBindings = new Map<string, BindingRef[]>();
+          namespaceBindings.set(namespace, targetBindings);
+        }
+        let bucket = targetBindings.get(name);
+        if (bucket === undefined) {
+          bucket = [];
+          targetBindings.set(name, bucket);
+        }
+        let seen = seenByName.get(name);
+        if (seen === undefined) {
+          seen = new Set(bucket.map((binding) => binding.def.nodeId));
+          seenByName.set(name, seen);
+        }
+        if (seen.has(def.nodeId)) continue;
+        seen.add(def.nodeId);
+        bucket.push({ def, origin: 'namespace' });
       }
     }
   }
 }
 
-function getAugmentationBucket(
-  augmentations: Map<ScopeId, Map<string, BindingRef[]>>,
-  scopeId: ScopeId,
-  name: string,
-): BindingRef[] {
-  let scopeBindings = augmentations.get(scopeId);
-  if (scopeBindings === undefined) {
-    scopeBindings = new Map<string, BindingRef[]>();
-    augmentations.set(scopeId, scopeBindings);
-  }
-  let bucketArr = scopeBindings.get(name);
-  if (bucketArr === undefined) {
-    bucketArr = [];
-    scopeBindings.set(name, bucketArr);
-  }
-  return bucketArr;
+function simpleName(def: SymbolDefinition): string {
+  const qualifiedName = def.qualifiedName ?? '';
+  const dot = qualifiedName.lastIndexOf('.');
+  return dot === -1 ? qualifiedName : qualifiedName.slice(dot + 1);
 }

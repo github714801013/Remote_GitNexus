@@ -98,17 +98,23 @@ export function lookupBindingsAt(
 /**
  * Collect `BindingRef`s for `name` from the per-namespace channel
  * (`namespaceFqnBindings`) across every namespace accessible from `scopeId`.
- * Accessibility comes from `accessibleNamespacesByScope`, which is keyed by
- * *module* scope id — so this returns `undefined` at non-module scopes and at
- * every scope in a bundle that didn't populate the channel (all non-C# today).
- * Language-neutral: keyed only by namespace strings and the index.
+ * Accessibility comes from `accessibleNamespacesByScope`, keyed by module scope.
+ * Child scopes resolve their enclosing module before consulting the channel, so
+ * a call inside a function sees the same namespace-visible definitions as its
+ * containing file.
  */
 function collectNamespaceFqnBindings(
   scopeId: ScopeId,
   name: string,
   scopes: ScopeResolutionIndexes,
 ): readonly BindingRef[] | undefined {
-  const namespaces = scopes.accessibleNamespacesByScope?.get(scopeId);
+  const accessibleNamespacesByScope = scopes.accessibleNamespacesByScope;
+  if (accessibleNamespacesByScope === undefined || accessibleNamespacesByScope.size === 0) {
+    return undefined;
+  }
+  const moduleScopeId = moduleScopeIdOf(scopeId, scopes);
+  const namespaces =
+    moduleScopeId === null ? undefined : accessibleNamespacesByScope.get(moduleScopeId);
   if (namespaces === undefined || namespaces.length === 0) return undefined;
   let collected: BindingRef[] | undefined;
   for (const ns of namespaces) {

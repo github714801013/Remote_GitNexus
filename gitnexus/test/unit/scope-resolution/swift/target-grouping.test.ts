@@ -24,8 +24,10 @@ import {
   groupSwiftFilesBySpmTarget,
   coerceSwiftTargets,
 } from '../../../../src/core/ingestion/languages/swift/target-grouping.js';
+import type { SwiftPackageConfig } from '../../../../src/core/ingestion/language-config.js';
 
 const id = (s: string) => s;
+
 
 describe('groupSwiftFilesBySpmTarget — legacy SPM-subtree parity (drift guard)', () => {
   it('buckets a multi-subdir single target into ONE group', () => {
@@ -36,7 +38,7 @@ describe('groupSwiftFilesBySpmTarget — legacy SPM-subtree parity (drift guard)
     ];
     const targets = new Map([['Alpha', 'Sources/Alpha']]);
 
-    const groups = groupSwiftFilesBySpmTarget(files, id, targets);
+    const groups = groupSwiftFilesBySpmTarget(files, id, { targets, hasPackageManifest: true });
 
     expect([...groups.keys()]).toEqual(['Alpha']);
     expect(groups.get('Alpha')).toEqual(files);
@@ -47,12 +49,13 @@ describe('groupSwiftFilesBySpmTarget — legacy SPM-subtree parity (drift guard)
     // Both targets are prefixes of the file's path (Beta dir nested under
     // Alpha). Legacy `break`s on the first match → one bucket per file.
     const files = ['Sources/Alpha/Beta/User.swift'];
-    const targets = new Map([
-      ['Alpha', 'Sources/Alpha'],
-      ['Beta', 'Sources/Alpha/Beta'],
-    ]);
-
-    const groups = groupSwiftFilesBySpmTarget(files, id, targets);
+    const groups = groupSwiftFilesBySpmTarget(files, id, {
+      targets: new Map([
+        ['Alpha', 'Sources/Alpha'],
+        ['Beta', 'Sources/Alpha/Beta'],
+      ]),
+      hasPackageManifest: true,
+    });
 
     expect(groups.get('Alpha')).toEqual(files);
     expect(groups.has('Beta')).toBe(false);
@@ -64,17 +67,27 @@ describe('groupSwiftFilesBySpmTarget — legacy SPM-subtree parity (drift guard)
     const files = ['Sources/AlphaBeta/User.swift'];
     const targets = new Map([['Alpha', 'Sources/Alpha']]);
 
-    const groups = groupSwiftFilesBySpmTarget(files, id, targets);
+    const groups = groupSwiftFilesBySpmTarget(files, id, { targets, hasPackageManifest: true });
 
     expect(groups.has('Alpha')).toBe(false);
-    expect(groups.get('__default__')).toEqual(files);
+    expect(groups.get('__unmatched__:Sources/AlphaBeta/User.swift')).toEqual(files);
   });
 
-  it('routes unmatched files (with targets present) to __default__', () => {
+  it('isolates unmatched package-manifest files instead of grouping them by default', () => {
     const files = ['Sources/Alpha/User.swift', 'Loose/Orphan.swift'];
     const targets = new Map([['Alpha', 'Sources/Alpha']]);
 
-    const groups = groupSwiftFilesBySpmTarget(files, id, targets);
+    const groups = groupSwiftFilesBySpmTarget(files, id, { targets, hasPackageManifest: true });
+
+    expect(groups.get('Alpha')).toEqual(['Sources/Alpha/User.swift']);
+    expect(groups.get('__unmatched__:Loose/Orphan.swift')).toEqual(['Loose/Orphan.swift']);
+  });
+
+  it('keeps unmatched files together for a non-manifest fallback configuration', () => {
+    const files = ['Sources/Alpha/User.swift', 'Loose/Orphan.swift'];
+    const targets = new Map([['Alpha', 'Sources/Alpha']]);
+
+    const groups = groupSwiftFilesBySpmTarget(files, id, { targets, hasPackageManifest: false });
 
     expect(groups.get('Alpha')).toEqual(['Sources/Alpha/User.swift']);
     expect(groups.get('__default__')).toEqual(['Loose/Orphan.swift']);
@@ -108,7 +121,10 @@ describe('groupSwiftFilesBySpmTarget — legacy SPM-subtree parity (drift guard)
       ['Beta', 'Sources/Beta'],
     ]);
 
-    const groups = groupSwiftFilesBySpmTarget(items, (i) => i.filePath, targets);
+    const groups = groupSwiftFilesBySpmTarget(items, (i) => i.filePath, {
+      targets,
+      hasPackageManifest: true,
+    });
 
     expect(groups.get('Alpha')).toEqual([items[0]]);
     expect(groups.get('Beta')).toEqual([items[1]]);
@@ -118,16 +134,19 @@ describe('groupSwiftFilesBySpmTarget — legacy SPM-subtree parity (drift guard)
     const files = ['Sources\\Alpha\\Core\\User.swift'];
     const targets = new Map([['Alpha', 'Sources/Alpha']]);
 
-    const groups = groupSwiftFilesBySpmTarget(files, id, targets);
+    const groups = groupSwiftFilesBySpmTarget(files, id, { targets, hasPackageManifest: true });
 
     expect(groups.get('Alpha')).toEqual(files);
   });
 });
 
 describe('coerceSwiftTargets — duck-type the opaque resolutionConfig', () => {
-  it('returns the targets map from a SwiftPackageConfig-shaped object', () => {
-    const targets = new Map([['Alpha', 'Sources/Alpha']]);
-    expect(coerceSwiftTargets({ targets })).toBe(targets);
+  it('returns the SwiftPackageConfig-shaped object', () => {
+    const config: SwiftPackageConfig = {
+      targets: new Map([['Alpha', 'Sources/Alpha']]),
+      hasPackageManifest: true,
+    };
+    expect(coerceSwiftTargets(config)).toStrictEqual(config);
   });
 
   it('returns null for null / undefined / non-config values', () => {

@@ -2,7 +2,10 @@ import { spawn } from 'child_process';
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
+import { parseAllowedEnvs } from '../config/environment-policy.js';
 import type { RepoMeta } from '../storage/repo-manager.js';
+
+export { parseAllowedEnvs };
 
 export class WebhookWorktreeError extends Error {
   constructor(
@@ -13,16 +16,6 @@ export class WebhookWorktreeError extends Error {
     this.name = 'WebhookWorktreeError';
   }
 }
-
-export const parseAllowedEnvs = (raw: string | undefined): string[] => {
-  const values = new Set(
-    (raw ?? '')
-      .split(',')
-      .map((env) => env.trim().toLowerCase())
-      .filter(Boolean),
-  );
-  return [...values];
-};
 
 export const assertEnvAllowed = (env: string, allowedEnvs: string[]): void => {
   assertSafeSegment(env, 'env');
@@ -231,6 +224,34 @@ const fetchOriginRef = async (ref: string | undefined, cwd: string): Promise<voi
   await runGit(['fetch', 'origin', `${branch}:refs/remotes/origin/${branch}`], cwd);
 };
 
+const preserveGitNexusMetadata = async (repoPath: string): Promise<string | undefined> => {
+  const source = path.join(repoPath, '.gitnexus');
+  const exists = await pathExists(source);
+  if (!exists) return undefined;
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-meta-'));
+  const destination = path.join(tempDir, '.gitnexus');
+  await fs.cp(source, destination, { recursive: true, force: true });
+  return destination;
+};
+
+const restoreGitNexusMetadata = async (
+  metadataDir: string | undefined,
+  repoPath: string,
+): Promise<void> => {
+  if (!metadataDir) return;
+  try {
+    await fs.mkdir(repoPath, { recursive: true });
+    await fs.rm(path.join(repoPath, '.gitnexus'), { recursive: true, force: true });
+    await fs.cp(metadataDir, path.join(repoPath, '.gitnexus'), { recursive: true, force: true });
+    await fs.rm(path.dirname(metadataDir), { recursive: true, force: true });
+  } catch (err) {
+    throw new WebhookWorktreeError(
+      `GitNexus metadata backup retained after restore failure: ${err instanceof Error ? err.message : String(err)}`,
+      500,
+    );
+  }
+};
+
 export interface EnsureWorktreeParams {
   mainRepoPath: string;
   worktreePath: string;
@@ -276,13 +297,18 @@ export const ensureLocalWorktree = async (
     throw new WebhookWorktreeError('Managed worktree path uses a different branch', 409);
   }
   if (params.resetToRef) {
-    if (params.resetToRef.startsWith('origin/')) {
-      await fetchOriginRef(params.resetToRef, params.worktreePath);
-      await runGit(['reset', '--hard', 'FETCH_HEAD'], params.worktreePath);
-    } else {
-      await runGit(['reset', '--hard', params.resetToRef], params.worktreePath);
+    const metadataDir = await preserveGitNexusMetadata(params.worktreePath);
+    try {
+      if (params.resetToRef.startsWith('origin/')) {
+        await fetchOriginRef(params.resetToRef, params.worktreePath);
+        await runGit(['reset', '--hard', 'FETCH_HEAD'], params.worktreePath);
+      } else {
+        await runGit(['reset', '--hard', params.resetToRef], params.worktreePath);
+      }
+      await runGit(['clean', '-fd', '-e', '.gitnexus', '-e', '.gitnexus/'], params.worktreePath);
+    } finally {
+      await restoreGitNexusMetadata(metadataDir, params.worktreePath);
     }
-    await runGit(['clean', '-fd', '-e', '.gitnexus', '-e', '.gitnexus/'], params.worktreePath);
   }
   const commit = await runGit(['rev-parse', 'HEAD'], params.worktreePath);
   return { worktreePath: params.worktreePath, branch: currentBranch, commit };

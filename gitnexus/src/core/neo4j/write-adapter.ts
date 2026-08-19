@@ -7,6 +7,7 @@ import {
 } from 'gitnexus-shared';
 import neo4j from 'neo4j-driver';
 import { withNeo4jSession } from './driver.js';
+import { logger } from '../logger.js';
 
 export interface Neo4jNodeInput {
   label: string;
@@ -24,11 +25,26 @@ const NODE_LABELS = new Set<string>(NODE_TABLES);
 const RELATIONSHIP_TYPES = new Set<string>(REL_TYPES);
 const CODE_NODE_LABEL = 'CodeNode';
 const WRITE_BATCH_SIZE = 500;
+const RELATIONSHIP_WRITE_TIMEOUT_MS = 600_000;
 const CLEAR_REPO_LABELS = [...NODE_TABLES, CODE_NODE_LABEL, EMBEDDING_TABLE_NAME] as const;
+
+export interface Neo4jWriteProgress {
+  readonly operation: 'clear' | 'nodes' | 'relationships';
+  readonly completedBatches: number;
+  readonly totalBatches?: number;
+  readonly completedItems: number;
+  readonly totalItems?: number;
+  readonly label?: string;
+  readonly relationshipType?: string;
+}
+
+export type Neo4jWriteProgressCallback = (progress: Neo4jWriteProgress) => void;
 
 export interface ClearRepoIndexOptions {
   /** Keep existing vectors so unchanged nodes can be re-linked after a graph rebuild. */
   preserveEmbeddings?: boolean;
+  /** Receives progress only after each successful delete transaction. */
+  onProgress?: Neo4jWriteProgressCallback;
 }
 
 const checkedNodeLabel = (label: string): NodeTableName => {
@@ -82,6 +98,8 @@ export const clearRepoIndex = async (
   const labels = options.preserveEmbeddings
     ? CLEAR_REPO_LABELS.filter((label) => label !== EMBEDDING_TABLE_NAME)
     : CLEAR_REPO_LABELS;
+  let completedBatches = 0;
+  let completedItems = 0;
   await withNeo4jSession(async (session) => {
     for (const label of labels) {
       let deleted = WRITE_BATCH_SIZE;
@@ -93,12 +111,25 @@ export const clearRepoIndex = async (
           );
           return asNumber(result.records[0]?.get('deleted'));
         });
+        if (deleted === 0) continue;
+        completedBatches++;
+        completedItems += deleted;
+        options.onProgress?.({
+          operation: 'clear',
+          completedBatches,
+          completedItems,
+          label,
+        });
       }
     }
   });
 };
 
-export const upsertNodes = async (repoId: string, nodes: Neo4jNodeInput[]): Promise<void> => {
+export const upsertNodes = async (
+  repoId: string,
+  nodes: Neo4jNodeInput[],
+  onProgress?: Neo4jWriteProgressCallback,
+): Promise<void> => {
   if (nodes.length === 0) return;
 
   for (const node of nodes) {
@@ -109,6 +140,12 @@ export const upsertNodes = async (repoId: string, nodes: Neo4jNodeInput[]): Prom
   }
 
   const grouped = groupBy(nodes, (node) => node.label);
+  const totalBatches = [...grouped.values()].reduce(
+    (total, bucket) => total + Math.ceil(bucket.length / WRITE_BATCH_SIZE),
+    0,
+  );
+  let completedBatches = 0;
+  let completedItems = 0;
   await withNeo4jSession(async (session) => {
     for (const [label, bucket] of grouped) {
       const safeLabel = checkedNodeLabel(label);
@@ -129,6 +166,16 @@ export const upsertNodes = async (repoId: string, nodes: Neo4jNodeInput[]): Prom
             },
           );
         });
+        completedBatches++;
+        completedItems += chunk.length;
+        onProgress?.({
+          operation: 'nodes',
+          completedBatches,
+          totalBatches,
+          completedItems,
+          totalItems: nodes.length,
+          label,
+        });
       }
     }
   });
@@ -137,6 +184,7 @@ export const upsertNodes = async (repoId: string, nodes: Neo4jNodeInput[]): Prom
 export const upsertRelations = async (
   repoId: string,
   relationships: Neo4jRelationshipInput[],
+  onProgress?: Neo4jWriteProgressCallback,
 ): Promise<void> => {
   if (relationships.length === 0) return;
 
@@ -148,25 +196,97 @@ export const upsertRelations = async (
   }
 
   const grouped = groupBy(relationships, (relationship) => relationship.type);
+  const totalBatches = [...grouped.values()].reduce(
+    (total, bucket) => total + Math.ceil(bucket.length / WRITE_BATCH_SIZE),
+    0,
+  );
+  let completedBatches = 0;
+  let completedItems = 0;
+  const relationshipWriteStartedAt = performance.now();
   await withNeo4jSession(async (session) => {
     for (const [type, bucket] of grouped) {
       const safeType = checkedRelationshipType(type);
       for (const chunk of chunksOf(bucket, WRITE_BATCH_SIZE)) {
-        await session.executeWrite(async (tx) => {
-          await tx.run(
-            `UNWIND $relationships AS row MATCH (from:\`${CODE_NODE_LABEL}\` {repoId: $repoId, id: row.fromId}) MATCH (to:\`${CODE_NODE_LABEL}\` {repoId: $repoId, id: row.toId}) MERGE (from)-[r:\`${safeType}\`]->(to) SET r += row.props`,
+        const batchIndex = completedBatches + 1;
+        const batchStartedAt = performance.now();
+        let transactionAttempt = 0;
+        const batchContext = {
+          operation: 'neo4j.relationships',
+          relationshipType: type,
+          batchIndex,
+          totalBatches,
+          batchSize: chunk.length,
+          totalRelationships: relationships.length,
+          completedRelationships: completedItems,
+        };
+        logger.info(batchContext, 'Neo4j relationship batch started');
+        try {
+          await session.executeWrite(async (tx) => {
+            transactionAttempt++;
+            const transactionStartedAt = performance.now();
+            logger.info(
+              { ...batchContext, transactionAttempt },
+              'Neo4j relationship transaction attempt started',
+            );
+            await tx.run(
+              `UNWIND $relationships AS row MATCH (from:\`${CODE_NODE_LABEL}\` {repoId: $repoId, id: row.fromId}) MATCH (to:\`${CODE_NODE_LABEL}\` {repoId: $repoId, id: row.toId}) MERGE (from)-[r:\`${safeType}\`]->(to) SET r += row.props`,
+              {
+                repoId,
+                relationships: chunk.map((relationship) => ({
+                  fromId: relationship.fromId,
+                  toId: relationship.toId,
+                  props: {
+                    type,
+                    ...(relationship.properties ?? {}),
+                  },
+                })),
+              },
+            );
+            logger.info(
+              {
+                ...batchContext,
+                transactionAttempt,
+                txRunElapsedMs: Math.round(performance.now() - transactionStartedAt),
+              },
+              'Neo4j relationship tx.run returned',
+            );
+          }, { timeout: RELATIONSHIP_WRITE_TIMEOUT_MS });
+        } catch (err) {
+          logger.error(
             {
-              repoId,
-              relationships: chunk.map((relationship) => ({
-                fromId: relationship.fromId,
-                toId: relationship.toId,
-                props: {
-                  type,
-                  ...(relationship.properties ?? {}),
-                },
-              })),
+              ...batchContext,
+              transactionAttempt,
+              batchElapsedMs: Math.round(performance.now() - batchStartedAt),
+              cumulativeElapsedMs: Math.round(performance.now() - relationshipWriteStartedAt),
+              errorName: err instanceof Error ? err.name : typeof err,
+              errorCode:
+                err && typeof err === 'object' && 'code' in err
+                  ? String((err as { code?: unknown }).code ?? '')
+                  : undefined,
             },
+            'Neo4j relationship batch failed',
           );
+          throw err;
+        }
+        completedBatches++;
+        completedItems += chunk.length;
+        logger.info(
+          {
+            ...batchContext,
+            transactionAttempt,
+            completedRelationships: completedItems,
+            batchElapsedMs: Math.round(performance.now() - batchStartedAt),
+            cumulativeElapsedMs: Math.round(performance.now() - relationshipWriteStartedAt),
+          },
+          'Neo4j relationship batch committed',
+        );
+        onProgress?.({
+          operation: 'relationships',
+          completedBatches,
+          totalBatches,
+          completedItems,
+          totalItems: relationships.length,
+          relationshipType: type,
         });
       }
     }

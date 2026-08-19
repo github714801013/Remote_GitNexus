@@ -15,7 +15,8 @@
  * ## Algorithm (RFC §4.2, verbatim names)
  *
  * **Step 1 — Lexical scope-chain walk.** From `startScope`, walk
- *   parent-ward. At each scope, consult `scope.bindings.get(name)`:
+ *   parent-ward. At each scope, consult the injected visible-binding reader
+ *   when present, otherwise `scope.bindings.get(name)`:
  *     - Filter candidates whose `def.type ∈ acceptedKinds`.
  *     - For each surviving candidate, record a raw signal with the
  *       binding's origin + the current scope-chain depth.
@@ -189,7 +190,7 @@ function ensureCandidate(
 
 /**
  * Walk the lexical scope chain from `startScope` upward. Returns `true`
- * iff a scope with any `bindings.get(name)` entries was found — the
+ * iff a scope with any local or injected visible binding entries was found — the
  * caller uses this to decide whether to run the global fallback.
  */
 function walkLexicalChain(
@@ -210,7 +211,11 @@ function walkLexicalChain(
     const scope: Scope | undefined = ctx.scopes.getScope(currentId);
     if (scope === undefined) return false;
 
-    const bindings = scope.bindings.get(name);
+    const lexicalBindings = scope.bindings.get(name);
+    const bindings =
+      lexicalBindings !== undefined && lexicalBindings.length > 0
+        ? lexicalBindings
+        : (ctx.visibleBindingsAt?.(currentId, name) ?? lexicalBindings);
     if (bindings !== undefined && bindings.length > 0) {
       for (const binding of bindings) {
         if (!acceptedKinds.has(binding.def.type)) continue;

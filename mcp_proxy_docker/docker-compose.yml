@@ -6,6 +6,8 @@ services:
     volumes:
       - ${REMOTE_REPOS_PATH:-./repos}:/repos:ro
       - zoekt-index:/data/index
+    environment:
+      - GITNEXUS_MAX_FILE_SIZE=${GITNEXUS_MAX_FILE_SIZE:-5120}
     entrypoint:
       - sh
       - -c
@@ -17,7 +19,7 @@ services:
 
         index_repo() {
           repo_dir="$$1"
-          zoekt-git-index -index "$$INDEX_DIR" "$$repo_dir" 2>/dev/null || true
+          zoekt-git-index -file_limit "$$((GITNEXUS_MAX_FILE_SIZE * 1024))" -index "$$INDEX_DIR" "$$repo_dir" 2>/dev/null || true
         }
 
         # 清理已删除仓库的孤立 shard：shard 文件名含 URL 编码路径，
@@ -83,16 +85,16 @@ services:
     image: neo4j:2026.04.0
     container_name: gitnexus-neo4j
     ports:
-      - '${HOST_NEO4J_HTTP_PORT:-7474}:7474'
-      - '${HOST_NEO4J_BOLT_PORT:-7687}:7687'
+      - '${HOST_NEO4J_HTTP_PORT:-7475}:7474'
+      - '${HOST_NEO4J_BOLT_PORT:-7688}:7687'
     environment:
       - NEO4J_AUTH=${GITNEXUS_NEO4J_USER:-neo4j}/${GITNEXUS_NEO4J_PASSWORD:?GITNEXUS_NEO4J_PASSWORD is required}
       - NEO4J_server_memory_heap_initial__size=${GITNEXUS_NEO4J_HEAP_INITIAL:-2G}
       - NEO4J_server_memory_heap_max__size=${GITNEXUS_NEO4J_HEAP_MAX:-8G}
       - NEO4J_server_memory_pagecache_size=${GITNEXUS_NEO4J_PAGECACHE:-4G}
     volumes:
-      - neo4j-data:/data
-      - neo4j-logs:/logs
+      - ${REMOTE_NEO4J_DATA_PATH:-/data1/gitnexus/neo4j}/data:/data
+      - ${REMOTE_NEO4J_DATA_PATH:-/data1/gitnexus/neo4j}/logs:/logs
     healthcheck:
       test:
         [
@@ -100,8 +102,9 @@ services:
           'cypher-shell -u ${GITNEXUS_NEO4J_USER:-neo4j} -p ${GITNEXUS_NEO4J_PASSWORD:?GITNEXUS_NEO4J_PASSWORD is required} "RETURN 1"',
         ]
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 20s
+      retries: 10
+      start_period: 60s
     restart: always
 
   # ─── 代码关键词摘要模型：为向量化前生成中文业务词摘要 ────────────────────────
@@ -127,9 +130,9 @@ services:
         '-ngl',
         '99',
         '-np',
-        '2',
+        '${KEYWORD_SUMMARY_PARALLEL_SLOTS:-1}',
         '--parallel',
-        '2',
+        '${KEYWORD_SUMMARY_PARALLEL_REQUESTS:-1}',
         '--cont-batching',
         '--jinja',
       ]
@@ -165,12 +168,14 @@ services:
       - GITNEXUS_EMBEDDING_DIMS=${GITNEXUS_EMBEDDING_DIMS:-2560}
       - GITNEXUS_EMBEDDING_TIMEOUT_MS=3600000
       - GITNEXUS_EMBEDDING_BATCH_SIZE=${GITNEXUS_EMBEDDING_BATCH_SIZE:-32}
+      - GITNEXUS_EMBEDDING_REPAIR_BATCH_SIZE=${GITNEXUS_EMBEDDING_REPAIR_BATCH_SIZE:-8}
       - GITNEXUS_QUERY_SEMANTIC_TIMEOUT_MS=${GITNEXUS_QUERY_SEMANTIC_TIMEOUT_MS:-0}
       - GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS=3600000
-      - GITNEXUS_WEBHOOK_ALLOWED_ENVS=dev,iteng
+      - GITNEXUS_WEBHOOK_ALLOWED_ENVS=${GITNEXUS_WEBHOOK_ALLOWED_ENVS:-pro}
       - GITNEXUS_STARTUP_WEBHOOK_REPOS_ENABLED=${GITNEXUS_STARTUP_WEBHOOK_REPOS_ENABLED:-false}
       - GITNEXUS_ANALYZE_MAX_OLD_SPACE_MB=${GITNEXUS_ANALYZE_MAX_OLD_SPACE_MB:-8192}
-      - GITNEXUS_MAX_FILE_SIZE_BYTES=5242880
+      - GITNEXUS_SERVER_ANALYZE_HEAP_MB=${GITNEXUS_SERVER_ANALYZE_HEAP_MB:-16384}
+      - GITNEXUS_MAX_FILE_SIZE=${GITNEXUS_MAX_FILE_SIZE:-5120}
       - GITNEXUS_MAX_PROCESSES=1000
       - GITNEXUS_EMBEDDING_LIMIT=20000000
       - GITNEXUS_ALLOW_REMOTE_MODELS=true
@@ -184,6 +189,9 @@ services:
       - GITNEXUS_EMBEDDING_REPAIR_CONCURRENCY=${GITNEXUS_EMBEDDING_REPAIR_CONCURRENCY:-1}
       - GITNEXUS_LOCAL_DIAGNOSTICS_ENABLED=${GITNEXUS_LOCAL_DIAGNOSTICS_ENABLED:-false}
       - GITNEXUS_KEYWORD_SUMMARY_ENABLED=${GITNEXUS_KEYWORD_SUMMARY_ENABLED:-true}
+      - GITNEXUS_KEYWORD_SUMMARY_CONCURRENCY=${GITNEXUS_KEYWORD_SUMMARY_CONCURRENCY:-1}
+      - KEYWORD_SUMMARY_PARALLEL_SLOTS=${KEYWORD_SUMMARY_PARALLEL_SLOTS:-1}
+      - KEYWORD_SUMMARY_PARALLEL_REQUESTS=${KEYWORD_SUMMARY_PARALLEL_REQUESTS:-1}
       - GITNEXUS_KEYWORD_SUMMARY_URL=${GITNEXUS_KEYWORD_SUMMARY_URL:?GITNEXUS_KEYWORD_SUMMARY_URL is required}
       - GITNEXUS_KEYWORD_SUMMARY_API_KEY=${GITNEXUS_KEYWORD_SUMMARY_API_KEY:?GITNEXUS_KEYWORD_SUMMARY_API_KEY is required}
       - GITNEXUS_KEYWORD_SUMMARY_MODEL=${GITNEXUS_KEYWORD_SUMMARY_MODEL:-qwen3.6-35b-carnice}

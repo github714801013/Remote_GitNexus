@@ -128,6 +128,70 @@ describe('resolveReferenceSites', () => {
     expect(result.referenceIndex.bySourceScope.get('scope:call')?.[0]?.toDef).toBe('def:User.save');
   });
 
+  it('resolves a post-finalize augmentation from a child scope', () => {
+    const userClass = mkDef({ nodeId: 'def:User', type: 'Class', qualifiedName: 'User' });
+    const moduleScope = mkScope({ id: 'scope:module', parent: null, filePath: 'app.swift' });
+    const functionScope = mkScope({
+      id: 'scope:run',
+      parent: moduleScope.id,
+      kind: 'Function',
+      filePath: 'app.swift',
+    });
+    const referenceSite: ReferenceSite = {
+      name: 'User',
+      atRange: range(5, 2, 5, 6),
+      inScope: functionScope.id,
+      kind: 'type-reference',
+    };
+    const indexes = makeIndexes([moduleScope, functionScope], [userClass], [referenceSite]);
+    const augmentation = new Map<ScopeId, Map<string, readonly BindingRef[]>>([
+      [
+        moduleScope.id,
+        new Map([['User', [{ def: userClass, origin: 'namespace' }]]]),
+      ],
+    ]);
+    (indexes as { bindingAugmentations: typeof augmentation }).bindingAugmentations = augmentation;
+
+    const result = resolveReferenceSites({
+      scopes: indexes,
+      ownedMembersByOwner: () => [],
+    });
+
+    expect(result.stats).toEqual({ sitesProcessed: 1, referencesEmitted: 1, unresolved: 0 });
+    expect(result.referenceIndex.bySourceScope.get(functionScope.id)?.[0]?.toDef).toBe('def:User');
+  });
+
+  it('keeps a lexical non-class binding as a hard shadow over post-finalize visibility', () => {
+    const hiddenUser = mkDef({ nodeId: 'def:localUser', type: 'Variable', qualifiedName: 'User' });
+    const sharedUser = mkDef({ nodeId: 'def:sharedUser', type: 'Class', qualifiedName: 'User' });
+    const moduleScope = mkScope({
+      id: 'scope:module',
+      parent: null,
+      filePath: 'app.swift',
+      bindings: { User: [{ def: hiddenUser, origin: 'local' }] },
+    });
+    const referenceSite: ReferenceSite = {
+      name: 'User',
+      atRange: range(5, 2, 5, 6),
+      inScope: moduleScope.id,
+      kind: 'type-reference',
+    };
+    const indexes = makeIndexes([moduleScope], [hiddenUser, sharedUser], [referenceSite]);
+    const augmentation = new Map<ScopeId, Map<string, readonly BindingRef[]>>([
+      [
+        moduleScope.id,
+        new Map([['User', [{ def: sharedUser, origin: 'namespace' }]]]),
+      ],
+    ]);
+    (indexes as { bindingAugmentations: typeof augmentation }).bindingAugmentations = augmentation;
+
+    const result = resolveReferenceSites({
+      scopes: indexes,
+      ownedMembersByOwner: () => [],
+    });
+
+    expect(result.stats).toEqual({ sitesProcessed: 1, referencesEmitted: 0, unresolved: 1 });
+  });
   it('threads providers.arityCompatibility through to filter hook-provided overloads', () => {
     const userClass = mkDef({ nodeId: 'def:User', type: 'Class', qualifiedName: 'User' });
     const saveOne = mkDef({

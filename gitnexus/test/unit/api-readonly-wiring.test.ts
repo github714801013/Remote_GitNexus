@@ -47,6 +47,14 @@ describe('api read-only endpoint wiring', () => {
     expect(source).toMatch(/MATCH \(n:File\)[\s\S]{0,300}readOnly:\s*true/);
   });
 
+  it('keeps startup and manual index health checks without interval scheduling', async () => {
+    const source = await readSource();
+    expect(source).toContain("void runIndexHealthCheck('startup')");
+    expect(source).toContain("app.post('/api/index-health-check'");
+    expect(source).not.toContain('GITNEXUS_INDEX_HEALTH_INTERVAL_MS');
+    expect(source).not.toContain("runIndexHealthCheck('scheduled')");
+  });
+
   it('/api/embed remains write-mode (writes embeddings — must not be flipped to readOnly)', async () => {
     const source = await readSource();
     // Negative assertion: no `readOnly: true` between the embed job's

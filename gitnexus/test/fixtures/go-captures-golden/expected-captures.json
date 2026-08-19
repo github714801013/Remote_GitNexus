@@ -9,27 +9,27 @@
   },
   "go-ambiguous/internal/models/handler.go": {
     "captureGroups": 9,
-    "digest": "737d7ca26cf03aebcae6b5df6a13267d400b42cd37799d72eda92db3485a1add"
+    "digest": "611a98503d97c1efc73188b673ea8f8ca63acc4e5a076631513aa765aefb69c6"
   },
   "go-ambiguous/internal/other/handler.go": {
     "captureGroups": 9,
-    "digest": "645a526694111ba6066715515ef4055d84f5c328505f7fa92d00b0b253d0aeca"
+    "digest": "c0b9ac73277f885945336079fb3ed353dedf59c22105dfc190ff010622b3c9c4"
   },
   "go-ambiguous/internal/services/user.go": {
     "captureGroups": 9,
-    "digest": "0a988c48838a34eb7a6f29b324191c39c19087e728914fffa06bbb9221841d23"
+    "digest": "8a89b9c96ebf7128388027e8f541a0bb2e758c54ac106d5c148dbc1ee8f341f4"
   },
   "go-assignment-chain/cmd/main.go": {
     "captureGroups": 54,
-    "digest": "2bd7f8e2df13345ed77b4b438fa5af0b666aa238fe32be0d9ef39865b04a27e2"
+    "digest": "a9b3260b7eafeaa5bcdf490b2732d93e7561a4611a1f09a0720e2a37608e4b69"
   },
   "go-assignment-chain/models/repo.go": {
     "captureGroups": 8,
-    "digest": "63cb96d06478f4b2039d6eaeab1468a8af3c503ec45e5785ff3e4de5aabe9240"
+    "digest": "47268c97afdf5ab1909a5b78500e4f4e298c861edd9726b2066f1ee85987cd6d"
   },
   "go-assignment-chain/models/user.go": {
     "captureGroups": 8,
-    "digest": "fcee44ed373eda2ff00778ff951fc2fa1503c5187b9e7d43dea3ee8b63656907"
+    "digest": "71f9c4e582de4156353bd86153d880f477ea2b82e58a1af889a924a08593aa37"
   },
   "go-call-result-binding/cmd/main.go": {
     "captureGroups": 17,
@@ -41,15 +41,15 @@
   },
   "go-calls/cmd/main.go": {
     "captureGroups": 6,
-    "digest": "deaea55087c2652aa2d39fefa30048d5393cec40f7af1ab13921331b035030d6"
+    "digest": "580d88ffad6a80d7ad12ec719283d5621298acd75a9f349e31e54b9c5da161fe"
   },
   "go-calls/internal/onearg/log.go": {
     "captureGroups": 7,
-    "digest": "d6a41da15dcba594b747b76b726738bcfbb86b9fb9d444571f6749c361bd4d59"
+    "digest": "d7003a922797b86d308dc082b8d35eb9bfd621e9200091b201e804baa14b30e8"
   },
   "go-calls/internal/zeroarg/log.go": {
     "captureGroups": 5,
-    "digest": "eae0988b2f001f06b275487d4c8154ce64c222642fff2cbabaff8d51b389dea3"
+    "digest": "3acea81f1aa4b06f6a61d77e6d3b6346b5660329f6ff8cbae99c8e30bfdb82b3"
   },
   "go-chain-call/cmd/main.go": {
     "captureGroups": 20,
@@ -89,7 +89,7 @@
   },
   "go-constructor-type-inference/models/repo.go": {
     "captureGroups": 8,
-    "digest": "63cb96d06478f4b2039d6eaeab1468a8af3c503ec45e5785ff3e4de5aabe9240"
+    "digest": "47268c97afdf5ab1909a5b78500e4f4e298c861edd9726b2066f1ee85987cd6d"
   },
   "go-constructor-type-inference/models/user.go": {
     "captureGroups": 12,
@@ -129,19 +129,19 @@
   },
   "go-local-shadow/cmd/main.go": {
     "captureGroups": 14,
-    "digest": "ce7220df98df08741f772150b5572bec0364d576741bc8c76647615fab859f92"
+    "digest": "78631dfb8d04def4ffc476ae46c9e1ef2982b95b02126e889d250a833420fc35"
   },
   "go-local-shadow/internal/utils/utils.go": {
     "captureGroups": 7,
-    "digest": "9e4c8b37e90b1abeb8a0f8ca615793fc4a77bea5178ebc4875a3a595ec59f03d"
+    "digest": "46df2cb24b37075ecb6a5b8f63db70f8277e0004e4c06b28060f8501bea6e721"
   },
   "go-make-builtin/main.go": {
     "captureGroups": 18,
-    "digest": "7c56328d8416338ae0075ae7dd9669b16f2035aa353fac7ee1e46109a58e80a6"
+    "digest": "fef202a3d7224c48bc6013794c20df9c3ff2266f5fc988a6f085f413c805caa1"
   },
   "go-make-builtin/models.go": {
     "captureGroups": 15,
-    "digest": "2af382fcd2e59cf01d9439bdb8709cba150bb239fae71b6f0d09c1fa7248fc5b"
+    "digest": "f50d609b9a8a4b53199acf486decf4c30c729cc2a20791ef2f795c7b2f297184"
   },
   "go-map-range/main.go": {
     "captureGroups": 11,
@@ -157,11 +157,11 @@
   },
   "go-member-calls/cmd/main.go": {
     "captureGroups": 11,
-    "digest": "b65bbfd200e4be9a991403a44bc68fb0a0abfe0bbf764b2acbd472d3eaf6742e"
+    "digest": "4e2d9ff603823262a65adf028c8c7b45dce4fc007bc371d20399a7c182b4efe4"
   },
   "go-member-calls/models/user.go": {
     "captureGroups": 8,
-    "digest": "fcee44ed373eda2ff00778ff951fc2fa1503c5187b9e7d43dea3ee8b63656907"
+    "digest": "71f9c4e582de4156353bd86153d880f477ea2b82e58a1af889a924a08593aa37"
   },
   "go-method-chain-binding/cmd/main.go": {
     "captureGroups": 22,
@@ -189,83 +189,83 @@
   },
   "go-multi-assign/app.go": {
     "captureGroups": 18,
-    "digest": "6ca3fdfb8708da1503367902ea458927bd2eb33582eeccbbb0a1dab585cc30c1"
+    "digest": "02545e46cecbe40d56da098fea44cd2e5aaba40f879fdf6a28ff77379c201e1e"
   },
   "go-multi-assign/models.go": {
     "captureGroups": 19,
-    "digest": "e071ebdd59b5bbebb42785ebf850a9c0ee7c2e3a8cc13fb0b17233480efa26ed"
+    "digest": "b907fe3c9e442feabc015977b646786288131aaae72dbf9d14094a1ec2004c8d"
   },
   "go-multi-return-inference/cmd/main.go": {
     "captureGroups": 38,
-    "digest": "9f7320349e8fd04f40c23a9a04ab67826140034e98d9851538db1b8a6f9f2b7b"
+    "digest": "c6759c6d0c47ffdb0fcf90c2a4534b825567346f1938b6cd16b0c056a269d8c4"
   },
   "go-multi-return-inference/models/repo.go": {
     "captureGroups": 10,
-    "digest": "94b6f138a062dfd96969dc7ec3d3eddecab591cb29d16fed4ea91da20ff0363b"
+    "digest": "9af24a9a5b8b2f0932a7a952999b327061d62f00733b6a320cfcc6a60cc1e075"
   },
   "go-multi-return-inference/models/user.go": {
     "captureGroups": 10,
-    "digest": "4193f6356f75505415e36d4b090dc9f5265937efe72b4251c33e5b5f06aaa99d"
+    "digest": "ae3ae2d4b048a6433622d21ee34d4a43420bbb9bf94a3c492ca5dd9ebc147e8f"
   },
   "go-new-builtin/main.go": {
     "captureGroups": 12,
-    "digest": "1177b99217a42a28b0d768d29e1df4198f0d5ca5f1c2b584d528f5f02354b38f"
+    "digest": "6b1d32d4a41e9773558a7768146f815eb104ca271be987af9bb7cd9fde845514"
   },
   "go-new-builtin/models.go": {
     "captureGroups": 17,
-    "digest": "d5ce8ba6ff38c6c78bb87e746a5382822745d0c9841a8092495ff386c7c4ee24"
+    "digest": "9858b6d15c5a3e3a97446680267b23125e3cdf879753a73c6f6cefbbca1404fc"
   },
   "go-nullable-receiver/cmd/main.go": {
     "captureGroups": 27,
-    "digest": "7430c0c8f4877d1b41e62aee9017eadc66d2a8f01b70acf2836584a84f254335"
+    "digest": "3ba6ccb3e56eedfa73f13aa1bd6da11f4e782d284567b77cbccbdf5bc1ca8e8f"
   },
   "go-nullable-receiver/models/repo.go": {
     "captureGroups": 8,
-    "digest": "63cb96d06478f4b2039d6eaeab1468a8af3c503ec45e5785ff3e4de5aabe9240"
+    "digest": "47268c97afdf5ab1909a5b78500e4f4e298c861edd9726b2066f1ee85987cd6d"
   },
   "go-nullable-receiver/models/user.go": {
     "captureGroups": 8,
-    "digest": "fcee44ed373eda2ff00778ff951fc2fa1503c5187b9e7d43dea3ee8b63656907"
+    "digest": "71f9c4e582de4156353bd86153d880f477ea2b82e58a1af889a924a08593aa37"
   },
   "go-parent-resolution/models/base.go": {
     "captureGroups": 8,
-    "digest": "a5138789f8e35111dced225841a4d0e209eabad582973a55f5d47f882cf777e8"
+    "digest": "5b14e6b242e3975e61a5b470c4d91da7b19779358e20f73fd04418be60c90a74"
   },
   "go-parent-resolution/models/user.go": {
     "captureGroups": 9,
-    "digest": "e1b57b0c5865d84b80518fe52e3807f813ae5589b4b558d0037e6ea136843f85"
+    "digest": "bc06f5c5ecfede862e41ed5971b2086e232457e8946082731ac016aab654e346"
   },
   "go-pkg/cmd/main.go": {
     "captureGroups": 15,
-    "digest": "b763b372c88c64d31b4a746d24a422b490dfad0f33a55ac4e0f697979995b34f"
+    "digest": "41c8cbe8ab2007468e9e01ffcc5101ba1bb0e6b16d1c0b200dc04098b3ff3795"
   },
   "go-pkg/internal/auth/service.go": {
     "captureGroups": 21,
-    "digest": "8a5a2fef24f2803396b2314ffc951487b1adbc2a28a733bd2dcb65e2961fc479"
+    "digest": "c0bdd1b37565997dd2067e643cacdb03aeb22ca9893a54d786843d011cf0ec97"
   },
   "go-pkg/internal/models/admin.go": {
     "captureGroups": 17,
-    "digest": "087b8188a2e3d5d58f70d5a812b1a31a135dbd435de0ee7799d63199a38eb6cf"
+    "digest": "43e1df1ec70f4f8565603ceeb0b4d48cd2cf12308c7b78762192de2976a6534d"
   },
   "go-pkg/internal/models/repository.go": {
     "captureGroups": 5,
-    "digest": "73a5c9bfcb59011f36c47e1b806edba89bad1ed32f81d46acbefdb8abdba67c7"
+    "digest": "b5141a94ec2ee03b472dd852b50149efe5978a267f93f985152e00b509187850"
   },
   "go-pkg/internal/models/user.go": {
     "captureGroups": 14,
-    "digest": "04a3005d9f97325b79c0ac524a424c84c004aed5af24318389a413462dee2c4f"
+    "digest": "1dfe6fcb39c9276e88f2ddc8ae6b77c12ab146ce95e634059ad7258074c975ec"
   },
   "go-pointer-constructor-inference/cmd/main.go": {
     "captureGroups": 15,
-    "digest": "39f9030e909a37f0e13724f50673dd4a72ba240fb6ac263192ee4feadbc88adf"
+    "digest": "2cfab35a6a7b56adab1bc433227bec59aec4618c29284f954f9b257c52c08583"
   },
   "go-pointer-constructor-inference/models/repo.go": {
     "captureGroups": 10,
-    "digest": "94b6f138a062dfd96969dc7ec3d3eddecab591cb29d16fed4ea91da20ff0363b"
+    "digest": "9af24a9a5b8b2f0932a7a952999b327061d62f00733b6a320cfcc6a60cc1e075"
   },
   "go-pointer-constructor-inference/models/user.go": {
     "captureGroups": 10,
-    "digest": "4193f6356f75505415e36d4b090dc9f5265937efe72b4251c33e5b5f06aaa99d"
+    "digest": "ae3ae2d4b048a6433622d21ee34d4a43420bbb9bf94a3c492ca5dd9ebc147e8f"
   },
   "go-qualified-base/base/base.go": {
     "captureGroups": 17,
@@ -289,27 +289,27 @@
   },
   "go-receiver-resolution/cmd/main.go": {
     "captureGroups": 13,
-    "digest": "e92c59312a46972a6083ba489888b550cdd024b809acbbf367ad025efb844a5c"
+    "digest": "0209893b3764eacd42eef2fed5619bbfa8bf9762b33dc62dacc5c6e49e460d52"
   },
   "go-receiver-resolution/models/repo.go": {
     "captureGroups": 8,
-    "digest": "63cb96d06478f4b2039d6eaeab1468a8af3c503ec45e5785ff3e4de5aabe9240"
+    "digest": "47268c97afdf5ab1909a5b78500e4f4e298c861edd9726b2066f1ee85987cd6d"
   },
   "go-receiver-resolution/models/user.go": {
     "captureGroups": 8,
-    "digest": "fcee44ed373eda2ff00778ff951fc2fa1503c5187b9e7d43dea3ee8b63656907"
+    "digest": "71f9c4e582de4156353bd86153d880f477ea2b82e58a1af889a924a08593aa37"
   },
   "go-return-type-inference/cmd/main.go": {
     "captureGroups": 41,
-    "digest": "6133d61b247732eddad431c28c1374e46d85937ab42e88d7b1ab134aca1e593b"
+    "digest": "a045298689e1b88d2fef3378244bd46ad7222d8177e06dc1c6a6e4ce27050c5d"
   },
   "go-return-type-inference/models/repo.go": {
     "captureGroups": 17,
-    "digest": "1117b573967ac1c687fe336f476f3c4e94680925f9a3ff2a84a47a87bdf86208"
+    "digest": "2ef789b8b281f63c8a41a9b1902f143d48d13aa5f6155ee256afb8590e58cc53"
   },
   "go-return-type-inference/models/user.go": {
     "captureGroups": 17,
-    "digest": "a83045c31b12d9dc45b07315b081bef26ec380479d39706ee8c5d79e4efe5d88"
+    "digest": "6d9cef939871de47c07903932ebf52e72170191b22a69c2ae32a490e5696b733"
   },
   "go-same-package-factory/main.go": {
     "captureGroups": 14,
@@ -341,11 +341,11 @@
   },
   "go-struct-literals/app.go": {
     "captureGroups": 11,
-    "digest": "bcdf97254bb1518219d85ff75795f72ef7a41c4e43ddeb7a09648349d46ec347"
+    "digest": "45f264f255a53f0e9000a70737d64f9ee31be59c6d949f47b0606b792b026425"
   },
   "go-struct-literals/user.go": {
     "captureGroups": 10,
-    "digest": "16f0d425b25bdc7eaaf331bd47ce1ece6d476ae0e24e72110ce96c1f315bd314"
+    "digest": "2235a48fbad231a4f27c4e6ac25b7fa11630b08481ae1aa7f65c520fa66b7112"
   },
   "go-structural-interface-cross-package/api/repository.go": {
     "captureGroups": 12,
@@ -377,19 +377,19 @@
   },
   "go-type-assertion/main.go": {
     "captureGroups": 12,
-    "digest": "046533d699a7a037ea6b891b0e5dbcdeda19cc1554c2c0aca14005151a72c7f5"
+    "digest": "e4e7fe4782ca4852abbdeb979a7d1c43df41a265aa6145fefca866f03b06bf2f"
   },
   "go-type-assertion/models.go": {
     "captureGroups": 18,
-    "digest": "018658521c83d757464357f9963cd5952e040be01a02d9f1d41304f3748fd1a5"
+    "digest": "65e713b71ad5abf738bcca4d4d0fbcdcb68a1f1792c2c9377fc1ac5dbed9aa5e"
   },
   "go-variadic-resolution/cmd/main.go": {
     "captureGroups": 6,
-    "digest": "443f9736b9c67df30fe97d8353ddc2584de4c88ba698e62878683d5d77362d89"
+    "digest": "d6d374574607a4047324d8dae6933dd847da11bc109a996d7b2708108bb7f817"
   },
   "go-variadic-resolution/internal/logger/logger.go": {
     "captureGroups": 6,
-    "digest": "7c8738c8300962e5ade309013e229008499c6e34971eacf1d785bf17cf17af7f"
+    "digest": "927e3a0ffc0f38eb29fd48a0ed1d53b15486c19cceff34e78d1d57d9e8ddd4b4"
   },
   "go-write-access/main.go": {
     "captureGroups": 21,

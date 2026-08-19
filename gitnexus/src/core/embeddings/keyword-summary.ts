@@ -9,7 +9,7 @@ const DEFAULT_MAX_TOKENS = 512;
 const DEFAULT_MODEL = 'qwen2.5-coder-14b-keyword-summary';
 const DEFAULT_LANGUAGE = '中文';
 const DEFAULT_FAILURE_COOLDOWN_MS = 5 * 60_000;
-const DEFAULT_SUMMARY_CONCURRENCY = 2;
+const DEFAULT_SUMMARY_CONCURRENCY = 1;
 // Minimum code-body length (after trim) below which keyword summary is skipped.
 // Nodes whose code body is empty or trivially short carry no signal for keyword
 // extraction (the LLM would only see the symbol name + file path). Skipping them

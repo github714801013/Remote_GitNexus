@@ -29,6 +29,7 @@ describe('keyword summary', () => {
     process.env.GITNEXUS_KEYWORD_SUMMARY_MODEL = 'summary-model';
     process.env.GITNEXUS_KEYWORD_SUMMARY_FAILURE_COOLDOWN_MS = '60000';
     delete process.env.GITNEXUS_KEYWORD_SUMMARY_MAX_TOKENS;
+    delete process.env.GITNEXUS_KEYWORD_SUMMARY_CONCURRENCY;
     globalThis.fetch = vi.fn(async () => {
       throw new Error('connection timed out');
     }) as any;
@@ -126,6 +127,30 @@ describe('keyword summary', () => {
     expect(body.max_tokens).toBe(768);
   });
 
+  it('uses a conservative default summary concurrency', async () => {
+    let active = 0;
+    let maxActive = 0;
+    globalThis.fetch = vi.fn(async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      active -= 1;
+      return {
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: JSON.stringify({ businessKeywords: ['订单查询'] }) } }] }),
+      };
+    }) as any;
+
+    const { buildKeywordSummaryPrefix } =
+      await import('../../src/core/embeddings/keyword-summary.js');
+
+    await Promise.all([
+      buildKeywordSummaryPrefix({ ...node, id: `${node.id}#default-1` }, node.content, 'hash-default-1'),
+      buildKeywordSummaryPrefix({ ...node, id: `${node.id}#default-2` }, node.content, 'hash-default-2'),
+    ]);
+
+    expect(maxActive).toBe(1);
+  });
   it('limits concurrent keyword summary requests', async () => {
     process.env.GITNEXUS_KEYWORD_SUMMARY_CONCURRENCY = '1';
     let active = 0;

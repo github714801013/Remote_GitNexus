@@ -26,7 +26,9 @@ import { logger } from '../core/logger.js';
 import { autoHeapCapMb } from '../core/ingestion/utils/effective-ram.js';
 import type { JobManager } from './analyze-job.js';
 import type { WorkerMessage } from './analyze-worker.js';
+import type { AnalyzeResultIpc } from './analyze-worker-ipc.js';
 import { buildAnalyzeWorkerExecArgv } from './analyze-worker-options.js';
+import { isNeo4jBackendEnabled } from '../core/neo4j/config.js';
 
 const _require = createRequire(import.meta.url);
 
@@ -41,12 +43,18 @@ export interface LaunchDeps {
    * before the rewrite keeps reading the pre-rewrite state until evicted.
    */
   closeDbHandle: () => Promise<void>;
+  /** Schedules server-owned work only after structural finalization is observable. */
+  onAnalysisFinalized?: (
+    result: AnalyzeResultIpc,
+    context: { jobId: string; repoPath: string },
+  ) => void;
 }
 
 export interface LaunchOptions {
   force?: boolean;
   embeddings?: boolean;
   dropEmbeddings?: boolean;
+  deferEmbeddingRepair?: boolean;
   registryName?: string;
   registryBranch?: string;
   allowDuplicateName?: boolean;
@@ -54,6 +62,32 @@ export interface LaunchOptions {
 }
 
 const MAX_WORKER_RETRIES = 2;
+const MAX_WORKER_STDERR_CHARS = 4096;
+const STDERR_TRUNCATION_MARKER = '[stderr truncated] ';
+
+function appendWorkerStderr(current: string, chunk: unknown): string {
+  const text = Buffer.isBuffer(chunk)
+    ? chunk.toString('utf8')
+    : typeof chunk === 'string'
+      ? chunk
+      : String(chunk ?? '');
+  if (!text) return current;
+
+  const withoutMarker = current.startsWith(STDERR_TRUNCATION_MARKER)
+    ? current.slice(STDERR_TRUNCATION_MARKER.length)
+    : current;
+  const next = withoutMarker + text;
+  if (next.length <= MAX_WORKER_STDERR_CHARS) return next;
+
+  const available = MAX_WORKER_STDERR_CHARS - STDERR_TRUNCATION_MARKER.length;
+  let tail = next.slice(-available);
+  if (tail.length > 0 && /[\uDC00-\uDFFF]/u.test(tail[0])) tail = tail.slice(1);
+  return STDERR_TRUNCATION_MARKER + tail;
+}
+
+function workerStderrDiagnostic(stderr: string): string {
+  return stderr.trim();
+}
 
 /**
  * The worker reports `complete` over IPC before its on-disk finalization
@@ -127,7 +161,8 @@ const waitForSettledIndex = async (targetPath: string, jobStartMs: number): Prom
 };
 
 export function createLaunchAnalysisWorker(deps: LaunchDeps) {
-  const { jobManager, backend, acquireRepoLock, releaseRepoLock, closeDbHandle } = deps;
+  const { jobManager, backend, acquireRepoLock, releaseRepoLock, closeDbHandle, onAnalysisFinalized } =
+    deps;
 
   return function launchAnalysisWorker(
     job: { id: string },
@@ -148,6 +183,14 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
     }
 
     jobManager.updateJob(job.id, { repoPath: targetPath, status: 'analyzing' });
+
+    // 终态路径共享幂等锁释放，避免 error/complete/exit 竞态重复释放。
+    let lockReleased = false;
+    const releaseLock = (): void => {
+      if (lockReleased || opts.lockAlreadyHeld) return;
+      lockReleased = true;
+      releaseRepoLock(analyzeLockKey);
+    };
 
     // ── Worker fork with auto-retry ──────────────────────────────
     const callerPath = fileURLToPath(import.meta.url);
@@ -170,17 +213,31 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
       const currentJob = jobManager.getJob(job.id);
       if (!currentJob || currentJob.status === 'complete' || currentJob.status === 'failed') return;
 
+      const attempt = currentJob.retryCount + 1;
       const child = fork(workerPath, [], {
         execArgv: buildAnalyzeWorkerExecArgv(tsxHookArgs, String(workerHeapMb)),
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       });
 
-      // Capture stderr for crash diagnostics
+      // Capture stderr for this fork attempt's crash diagnostics only.
       let stderrChunks = '';
+      let workerReportedTerminalOutcome = false;
       child.stderr?.on('data', (chunk: Buffer) => {
-        stderrChunks += chunk.toString();
-        if (stderrChunks.length > 4096) stderrChunks = stderrChunks.slice(-4096);
+        stderrChunks = appendWorkerStderr(stderrChunks, chunk);
       });
+
+      logger.info(
+        {
+          jobId: job.id,
+          repoPath: targetPath,
+          attempt,
+          phase: currentJob.progress.phase,
+          heapMb: workerHeapMb,
+          embeddings: Boolean(opts.embeddings),
+          deferEmbeddingRepair: Boolean(opts.deferEmbeddingRepair),
+        },
+        'Analyze worker started',
+      );
 
       child.on('message', (msg: WorkerMessage) => {
         // Ignore any message once the job is terminal — a late worker message (a
@@ -189,27 +246,50 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         // handler guard below; pairs with the worker's terminal-claim (#2264 P3).
         const current = jobManager.getJob(job.id);
         if (!current || current.status === 'complete' || current.status === 'failed') return;
+        if (msg.type === 'complete' || msg.type === 'error') workerReportedTerminalOutcome = true;
 
         if (msg.type === 'progress') {
+          logger.info(
+            {
+              jobId: job.id,
+              repoPath: targetPath,
+              attempt,
+              phase: msg.phase,
+              percent: msg.percent,
+              message: msg.message,
+            },
+            'Analyze worker progress',
+          );
           jobManager.updateJob(job.id, {
             status: 'analyzing',
             progress: { phase: msg.phase, percent: msg.percent, message: msg.message },
           });
         } else if (msg.type === 'complete') {
-          releaseRepoLock(analyzeLockKey);
-          // Before marking complete: (1) wait for the worker's on-disk
-          // finalization to settle (see waitForSettledIndex), (2) evict the
-          // cached DB handle — same invalidation DELETE /api/repo performs, a
-          // handle opened before the rewrite reads pre-rewrite state — and
-          // only then (3) reinitialize the backend. This makes the ordering
-          // comment below true in practice: the repo is actually queryable
-          // when the client receives the SSE complete event.
-          waitForSettledIndex(targetPath, jobStartMs)
-            .then(() => closeDbHandle())
+          logger.info(
+            { jobId: job.id, repoPath: targetPath, attempt, repoName: msg.result.repoName },
+            'Analyze worker completed; finalizing index',
+          );
+          releaseLock();
+          // LadybugDB requires its native file close/checkpoint to become visible
+          // before re-opening a cached handle. Neo4j commits remotely, so it must
+          // not probe the unrelated local lbug file or wait for its sidecars.
+          const reload = isNeo4jBackendEnabled()
+            ? Promise.resolve()
+            : waitForSettledIndex(targetPath, jobStartMs).then(() => closeDbHandle());
+          reload
             .catch(() => {}) // best-effort: eviction failure must not fail the job
             .then(() => backend.init())
             .then(() => {
+              logger.info({ jobId: job.id, repoPath: targetPath }, 'Analyze index finalization complete');
               jobManager.updateJob(job.id, { status: 'complete', repoName: msg.result.repoName });
+              try {
+                onAnalysisFinalized?.(msg.result, { jobId: job.id, repoPath: targetPath });
+              } catch (err) {
+                logger.error(
+                  { err, jobId: job.id, repoPath: targetPath },
+                  'post-analysis finalizer could not schedule background work',
+                );
+              }
             })
             .catch((err) => {
               logger.error({ err }, 'backend.init() failed after analyze:');
@@ -219,51 +299,90 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
               });
             });
         } else if (msg.type === 'error') {
-          releaseRepoLock(analyzeLockKey);
-          // A failed (force) analyze may still have rewritten DB files first.
-          void closeDbHandle().catch(() => {});
+          releaseLock();
+          // Only LadybugDB workers can rewrite a local database handle.
+          if (!isNeo4jBackendEnabled()) {
+            void closeDbHandle().catch(() => {});
+          }
           jobManager.updateJob(job.id, { status: 'failed', error: msg.message });
         }
       });
 
       child.on('error', (err) => {
-        releaseRepoLock(analyzeLockKey);
+        releaseLock();
+        const current = jobManager.getJob(job.id);
+        const phase = current?.progress.phase ?? 'unknown';
+        logger.error(
+          {
+            jobId: job.id,
+            repoPath: targetPath,
+            attempt,
+            progress: { phase },
+            exitCode: null,
+            signal: null,
+            err,
+          },
+          'Analyze worker process error',
+        );
         jobManager.updateJob(job.id, {
           status: 'failed',
-          error: `Worker process error: ${err.message}`,
+          error: `Worker process error (job ${job.id}, repo ${targetPath}, phase ${phase}, attempt ${attempt}, exitCode null, signal null): ${err.message}`,
         });
       });
 
-      child.on('exit', (code) => {
+      child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
         const j = jobManager.getJob(job.id);
-        if (!j || j.status === 'complete' || j.status === 'failed') return;
-        if (code === 0) return;
+        if (!j) return;
+        if (j.status === 'complete' || j.status === 'failed') {
+          releaseLock();
+          return;
+        }
+        if (code === 0 && signal === null && workerReportedTerminalOutcome) return;
+
+        const phase = j.progress.phase;
+        const stderrDiagnostic = workerStderrDiagnostic(stderrChunks);
+        const context = {
+          jobId: job.id,
+          repoPath: targetPath,
+          attempt,
+          progress: { phase },
+          exitCode: code,
+          signal,
+        };
 
         // Worker crashed — attempt retry if under the limit
         if (j.retryCount < MAX_WORKER_RETRIES) {
           j.retryCount++;
           const delay = 1000 * Math.pow(2, j.retryCount - 1); // 1s, 2s
-          const lastErr = stderrChunks.trim().split('\n').pop() || '';
           logger.warn(
-            `Analyze worker crashed (code ${code}), retry ${j.retryCount}/${MAX_WORKER_RETRIES} in ${delay}ms` +
-              (lastErr ? `: ${lastErr}` : ''),
+            {
+              ...context,
+              stderr: stderrDiagnostic || undefined,
+              retry: `${j.retryCount}/${MAX_WORKER_RETRIES}`,
+              delayMs: delay,
+            },
+            `Analyze worker crashed (exitCode ${code}, signal ${signal ?? 'none'}); retry scheduled` +
+              (stderrDiagnostic ? `: ${stderrDiagnostic}` : ''),
           );
           jobManager.updateJob(job.id, {
             status: 'analyzing',
             progress: {
               phase: 'retrying',
               percent: j.progress.percent,
-              message: `Worker crashed, retrying (${j.retryCount}/${MAX_WORKER_RETRIES})...`,
+              message: `Worker crashed (exitCode ${code}, signal ${signal ?? 'none'}), retrying (${j.retryCount}/${MAX_WORKER_RETRIES})...`,
             },
           });
-          stderrChunks = '';
           setTimeout(forkWorker, delay);
         } else {
           // Exhausted retries — permanent failure
-          releaseRepoLock(analyzeLockKey);
+          releaseLock();
+          logger.error(
+            { ...context, stderr: stderrDiagnostic || undefined, attempts: attempt },
+            'Analyze worker retry exhaustion',
+          );
           jobManager.updateJob(job.id, {
             status: 'failed',
-            error: `Worker crashed ${MAX_WORKER_RETRIES + 1} times (code ${code})${stderrChunks ? ': ' + stderrChunks.trim().split('\n').pop() : ''}`,
+            error: `Worker crashed after ${attempt} attempts (job ${job.id}, repo ${targetPath}, phase ${phase}, exitCode ${code}, signal ${signal ?? 'none'})${stderrDiagnostic ? `: ${stderrDiagnostic}` : ''}`,
           });
         }
       });
@@ -279,6 +398,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           force: !!opts.force,
           embeddings: !!opts.embeddings,
           dropEmbeddings: !!opts.dropEmbeddings,
+          deferEmbeddingRepair: !!opts.deferEmbeddingRepair,
           ...(opts.registryName ? { registryName: opts.registryName } : {}),
           ...(opts.registryBranch ? { registryBranch: opts.registryBranch } : {}),
           ...(opts.allowDuplicateName !== undefined

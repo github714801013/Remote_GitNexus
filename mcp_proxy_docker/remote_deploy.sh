@@ -20,7 +20,13 @@ read_windows_env() {
     fi
 }
 
-# 配置参数
+# 配置参数；默认部署到 10.1.14.158，仍允许通过环境变量覆盖
+REMOTE_HOST="${REMOTE_HOST:-10.1.14.158}"
+REMOTE_USER="${REMOTE_USER:-root}"
+REMOTE_PATH="${REMOTE_PATH:-/data1/gitnexus/app}"
+REMOTE_REPOS_PATH="${REMOTE_REPOS_PATH:-/data1/gitnexus/projects}"
+REMOTE_GITNEXUS_DATA_PATH="${REMOTE_GITNEXUS_DATA_PATH:-/data1/gitnexus/.gitnexus}"
+REMOTE_NEO4J_DATA_PATH="${REMOTE_NEO4J_DATA_PATH:-/data1/gitnexus/neo4j}"
 : "${REMOTE_HOST:?REMOTE_HOST environment variable is required}"
 : "${REMOTE_USER:?REMOTE_USER environment variable is required}"
 : "${REMOTE_PATH:?REMOTE_PATH environment variable is required}"
@@ -84,16 +90,31 @@ write_remote_env() {
         echo "REMOTE_PATH=${REMOTE_PATH}"
         echo "REMOTE_REPOS_PATH=${REMOTE_REPOS_PATH}"
         echo "REMOTE_GITNEXUS_DATA_PATH=${REMOTE_GITNEXUS_DATA_PATH}"
+        echo "REMOTE_NEO4J_DATA_PATH=${REMOTE_NEO4J_DATA_PATH}"
         echo "GITEA_TOKEN=${GITEA_TOKEN}"
         echo "GITNEXUS_EMBEDDING_URL=${GITNEXUS_EMBEDDING_URL}"
         echo "GITNEXUS_INDEX_EMBEDDING_URL=${GITNEXUS_INDEX_EMBEDDING_URL}"
         echo "GITNEXUS_EMBEDDING_MODEL=${GITNEXUS_EMBEDDING_MODEL:-qwen3-embedding-4b}"
         echo "GITNEXUS_EMBEDDING_DIMS=${GITNEXUS_EMBEDDING_DIMS:-2560}"
+        echo "GITNEXUS_EMBEDDING_REPAIR_BATCH_SIZE=${GITNEXUS_EMBEDDING_REPAIR_BATCH_SIZE:-8}"
+        echo "GITNEXUS_EMBEDDING_REPAIR_CONCURRENCY=${GITNEXUS_EMBEDDING_REPAIR_CONCURRENCY:-1}"
+        echo "GITNEXUS_STRUCTURE_PARALLEL_CONCURRENCY=${GITNEXUS_STRUCTURE_PARALLEL_CONCURRENCY:-1}"
+        echo "GITNEXUS_STRUCTURE_PARALLEL_FREE_MEMORY_RATIO=${GITNEXUS_STRUCTURE_PARALLEL_FREE_MEMORY_RATIO:-0.4}"
+        echo "GITNEXUS_EMBEDDING_PARALLEL_CONCURRENCY=${GITNEXUS_EMBEDDING_PARALLEL_CONCURRENCY:-1}"
+        echo "GITNEXUS_CONTAINER_MEMORY_LIMIT=${GITNEXUS_CONTAINER_MEMORY_LIMIT:-28g}"
+        echo "GITNEXUS_NODE_MAX_OLD_SPACE_MB=${GITNEXUS_NODE_MAX_OLD_SPACE_MB:-32768}"
+        echo "GITNEXUS_ANALYZE_MAX_OLD_SPACE_MB=${GITNEXUS_ANALYZE_MAX_OLD_SPACE_MB:-32768}"
+        echo "GITNEXUS_SERVER_ANALYZE_HEAP_MB=${GITNEXUS_SERVER_ANALYZE_HEAP_MB:-16384}"
         echo "GITNEXUS_LOCAL_DIAGNOSTICS_ENABLED=${GITNEXUS_LOCAL_DIAGNOSTICS_ENABLED:-false}"
+        echo "GITNEXUS_MAX_FILE_SIZE=${GITNEXUS_MAX_FILE_SIZE:-5120}"
+        echo "GITNEXUS_WEBHOOK_ALLOWED_ENVS=${GITNEXUS_WEBHOOK_ALLOWED_ENVS:-dev,pro,iteng}"
         echo "GITNEXUS_KEYWORD_SUMMARY_URL=${GITNEXUS_KEYWORD_SUMMARY_URL}"
         echo "GITNEXUS_KEYWORD_SUMMARY_MODEL=${GITNEXUS_KEYWORD_SUMMARY_MODEL}"
         echo "GITNEXUS_KEYWORD_SUMMARY_API_KEY=${GITNEXUS_KEYWORD_SUMMARY_API_KEY}"
         echo "GITNEXUS_KEYWORD_SUMMARY_MAX_TOKENS=${GITNEXUS_KEYWORD_SUMMARY_MAX_TOKENS:-512}"
+        echo "GITNEXUS_KEYWORD_SUMMARY_CONCURRENCY=${GITNEXUS_KEYWORD_SUMMARY_CONCURRENCY:-1}"
+        echo "KEYWORD_SUMMARY_PARALLEL_SLOTS=${KEYWORD_SUMMARY_PARALLEL_SLOTS:-1}"
+        echo "KEYWORD_SUMMARY_PARALLEL_REQUESTS=${KEYWORD_SUMMARY_PARALLEL_REQUESTS:-1}"
         echo "GITNEXUS_KEYWORD_SUMMARY_ENABLED=true"
         echo "GITNEXUS_WIKI_LLM_PROVIDER=${GITNEXUS_WIKI_LLM_PROVIDER}"
         echo "GITNEXUS_WIKI_LLM_URL=${GITNEXUS_WIKI_LLM_URL}"
@@ -142,7 +163,7 @@ echo "=== 步骤 3: 传输镜像和配置到远端 ==="
 write_remote_env
 ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
     set -e
-    mkdir -p "${REMOTE_PATH}/models" "${REMOTE_REPOS_PATH}" "${REMOTE_GITNEXUS_DATA_PATH}"
+    mkdir -p "${REMOTE_PATH}/models" "${REMOTE_REPOS_PATH}" "${REMOTE_GITNEXUS_DATA_PATH}" "${REMOTE_NEO4J_DATA_PATH}/data" "${REMOTE_NEO4J_DATA_PATH}/logs"
     if [ -f "${REMOTE_PATH}/repos.json" ]; then cp "${REMOTE_PATH}/repos.json" "${REMOTE_PATH}/repos.json.bak"; fi
     if [ -f "${REMOTE_REPOS_PATH}/repos.json" ]; then cp "${REMOTE_REPOS_PATH}/repos.json" "${REMOTE_REPOS_PATH}/repos.json.bak"; fi
     if [ -f "${REMOTE_GITNEXUS_DATA_PATH}/registry.json" ]; then cp "${REMOTE_GITNEXUS_DATA_PATH}/registry.json" "${REMOTE_PATH}/registry.json.bak"; fi
@@ -180,7 +201,7 @@ ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
     echo "使用远程 keyword summary 服务: ${GITNEXUS_KEYWORD_SUMMARY_URL}"
 
     echo "启动 GitNexus + Zoekt (docker compose)..."
-    docker compose --env-file .env -f docker-compose.yml up -d --force-recreate gitnexus-mcp-proxy
+    docker compose --env-file .env -f docker-compose.yml up -d --force-recreate zoekt-indexserver zoekt-webserver gitnexus-mcp-proxy
 
     echo "--- 执行自动验证 ---"
     python3 auto_verify.py

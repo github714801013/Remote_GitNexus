@@ -173,6 +173,49 @@ describe('webhook worktree helpers', () => {
     expect(await git(['rev-parse', 'HEAD'], worktree)).toBe(secondCommit);
   });
 
+  it('preserves .gitnexus metadata while resetting an existing managed worktree', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'gitnexus-worktree-index-test-'));
+    const remoteRepo = path.join(tempRoot, 'remote.git');
+    const mainRepo = path.join(tempRoot, 'main');
+    const worktree = path.join(tempRoot, 'dev-api');
+    await git(['init', '--bare', remoteRepo], tempRoot);
+    await git(['clone', remoteRepo, mainRepo], tempRoot);
+    await git(['config', 'user.email', 'gitnexus@example.com'], mainRepo);
+    await git(['config', 'user.name', 'GitNexus Test'], mainRepo);
+    await writeFile(path.join(mainRepo, 'app.txt'), 'one');
+    await git(['add', 'app.txt'], mainRepo);
+    await git(['commit', '-m', 'one'], mainRepo);
+    await git(['push', 'origin', 'HEAD:master'], mainRepo);
+
+    await ensureLocalWorktree({
+      mainRepoPath: mainRepo,
+      worktreePath: worktree,
+      branch: 'dev-api',
+      baseRef: 'origin/master',
+      resetToRef: 'origin/master',
+    });
+    await mkdir(path.join(worktree, '.gitnexus'), { recursive: true });
+    await writeFile(path.join(worktree, '.gitnexus', 'meta.json'), 'preserve-me');
+    await git(['add', '-f', '.gitnexus/meta.json'], worktree);
+    await git(['commit', '-m', 'local index'], worktree);
+
+    await writeFile(path.join(mainRepo, 'app.txt'), 'two');
+    await git(['add', 'app.txt'], mainRepo);
+    await git(['commit', '-m', 'two'], mainRepo);
+    await git(['push', 'origin', 'HEAD:master'], mainRepo);
+
+    await ensureLocalWorktree({
+      mainRepoPath: mainRepo,
+      worktreePath: worktree,
+      branch: 'dev-api',
+      baseRef: 'origin/master',
+      resetToRef: 'origin/master',
+    });
+
+    expect(await readFile(path.join(worktree, '.gitnexus', 'meta.json'), 'utf-8')).toBe('preserve-me');
+    expect(await readFile(path.join(worktree, 'app.txt'), 'utf-8')).toBe('two');
+  });
+
   it('fetches the requested remote source before adding a new branch worktree', async () => {
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'gitnexus-worktree-fetch-test-'));
     const remoteRepo = path.join(tempRoot, 'remote.git');

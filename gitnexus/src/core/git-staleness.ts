@@ -6,6 +6,7 @@
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'path';
+import { buildGitEnv } from './git-auth.js';
 import { readRegistry, type RegistryEntry, type CwdMatch } from '../storage/repo-manager.js';
 import { findGitRootByDotGit, getCurrentCommit, getRemoteUrl } from '../storage/git.js';
 
@@ -17,9 +18,82 @@ export interface StalenessInfo {
   hint?: string;
 }
 
+export interface RemoteSyncInfo {
+  checked: boolean;
+  reset: boolean;
+  localCommit?: string;
+  remoteCommit?: string;
+  upstreamRef?: string;
+  reason?: string;
+}
+
+const gitOutput = async (
+  args: string[],
+  repoPath: string,
+  url?: string,
+): Promise<string> => {
+  const { stdout } = await execFileAsync('git', args, {
+    cwd: repoPath,
+    encoding: 'utf-8',
+    windowsHide: true,
+    env: buildGitEnv(process.env, { url }),
+  });
+  return stdout.trim();
+};
+
 /**
- * Check how many commits the index is behind HEAD (synchronous; uses git CLI).
+ * 检查索引项目当前分支的 upstream，并在远端有更新时强制同步工作树。
+ * 不执行 git clean，因此未跟踪文件会被保留；失败时返回降级结果。
  */
+export async function syncWithUpstream(repoPath: string): Promise<RemoteSyncInfo> {
+  try {
+    const upstreamRef = await gitOutput(
+      ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'],
+      repoPath,
+    );
+    const separator = upstreamRef.indexOf('/');
+    if (separator <= 0 || separator === upstreamRef.length - 1) {
+      return { checked: false, reset: false, reason: 'upstream ref is unavailable' };
+    }
+
+    const remote = upstreamRef.slice(0, separator);
+    const branch = upstreamRef.slice(separator + 1);
+    const remoteUrl = await gitOutput(['remote', 'get-url', remote], repoPath);
+    const remoteCommit = await gitOutput(
+      ['ls-remote', remote, `refs/heads/${branch}`],
+      repoPath,
+      remoteUrl,
+    );
+    const remoteHash = remoteCommit.split(/\s+/)[0];
+    if (!/^[0-9a-f]{40}$/i.test(remoteHash)) {
+      return { checked: false, reset: false, upstreamRef, reason: 'remote branch was not found' };
+    }
+
+    const localCommit = await gitOutput(['rev-parse', 'HEAD'], repoPath);
+    if (localCommit === remoteHash) {
+      return { checked: true, reset: false, localCommit, remoteCommit: remoteHash, upstreamRef };
+    }
+
+    await gitOutput(['fetch', '--prune', remote], repoPath, remoteUrl);
+    await gitOutput(['reset', '--hard', upstreamRef], repoPath, remoteUrl);
+    const syncedCommit = await gitOutput(['rev-parse', 'HEAD'], repoPath);
+    return {
+      checked: true,
+      reset: syncedCommit === remoteHash,
+      localCommit,
+      remoteCommit: remoteHash,
+      upstreamRef,
+    };
+  } catch (error) {
+    return {
+      checked: false,
+      reset: false,
+      reason: error instanceof Error ? error.message : 'remote sync failed',
+    };
+  }
+}
+
+
 export function checkStaleness(repoPath: string, lastCommit: string): StalenessInfo {
   try {
     const result = execFileSync('git', ['rev-list', '--count', `${lastCommit}..HEAD`], {

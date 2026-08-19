@@ -1,39 +1,39 @@
 {
   "ruby-ambiguous/lib/user_handler.rb": {
     "captureGroups": 10,
-    "digest": "5c5588f1417a793f5b5d80ac09d6aa7fbff94dacb743b1da5395f72a91607ebf"
+    "digest": "c3ae4f9d8f9f775df240da315804e7828b5ba6c7fa9ab94aaf05519af6921a01"
   },
   "ruby-ambiguous/models/handler.rb": {
     "captureGroups": 6,
-    "digest": "4609ec03a86a4f4f2a93af9dd11437363daf1b3139ebdce366a8f49d47ea71b1"
+    "digest": "cd5df07a99f4ac3536b1b87e2578f07bb0dd89b8020ee958d72c2dfa7ddd318a"
   },
   "ruby-ambiguous/other/handler.rb": {
     "captureGroups": 6,
-    "digest": "d13c8ad253a9310d0bed45730135a947e67dec788686bd08710902eafc307237"
+    "digest": "2fd9a41fa6b90801b65d84155005ee758cc68741f28cc6c17aa5364688e93d46"
   },
   "ruby-app/lib/base_model.rb": {
     "captureGroups": 20,
-    "digest": "999f23c116bf4c0a25834e3fff1b12d5ec1bc5616a29e75716ba753dc253a62c"
+    "digest": "313d7a1ce5a3e809b278597ba026fb53431dd3e9f7be94e99c9f76a7c545a0ca"
   },
   "ruby-app/lib/concerns/cacheable.rb": {
     "captureGroups": 6,
-    "digest": "cc879f2fa31b1d50b7ba33f52c6dd68ba0ff070ffbc3c2d0293510f88643b373"
+    "digest": "50f14d74bf0093b445143d333a61d8455658865bf3530fa8e4c1e5c7176515e6"
   },
   "ruby-app/lib/concerns/loggable.rb": {
     "captureGroups": 6,
-    "digest": "049ea9beaf9c55b55bd836d31af4c8806ce24bb805261ae4d62575b4a19118bc"
+    "digest": "cfcb3113d72bace47bd07ebef70c8ce3d48a87dd7aaa7055fe7ed77bdbf45e01"
   },
   "ruby-app/lib/concerns/serializable.rb": {
     "captureGroups": 6,
-    "digest": "5a5a6e8cb7bcd32d828763152b8107e5ee824a5e6244ee55f85925f23e520b02"
+    "digest": "c8c07a3339e332b60aa6b94a46c396f89e2834e3f83746d80bf6ec6f8d4068da"
   },
   "ruby-app/lib/service.rb": {
     "captureGroups": 13,
-    "digest": "49bd37b2138dc17820351c126a7a75622cb564e8dd15a9b5f79fcc2d0844474d"
+    "digest": "46ea76de8729f3a7a723254693306bd92625e945dc51a5ffa3191eac9519c256"
   },
   "ruby-app/lib/user.rb": {
     "captureGroups": 24,
-    "digest": "6567c827276575ef3a087757b5725e381fbedb421ffecfe6c5904d7d62f6bcd4"
+    "digest": "f07d7207ef591a9a59d733c215d2a25c86dbeb8bffec805a211bf4362945baaa"
   },
   "ruby-call-result-binding/app.rb": {
     "captureGroups": 18,
@@ -41,31 +41,31 @@
   },
   "ruby-calls/lib/one_arg.rb": {
     "captureGroups": 8,
-    "digest": "61300083e7a2e6d9a116c3975ddd3b78a593a9a0e397c252bedb160d481c20b7"
+    "digest": "50c54ee4f39d18e7be28f5bebdcb04cbf8d973e2ac70235651614767a69809f9"
   },
   "ruby-calls/lib/service.rb": {
     "captureGroups": 11,
-    "digest": "7a4d964547d3ac645274c65fcbceba3f6852286537af2452c87d75bbde3495ab"
+    "digest": "5c4227c47394c287f8ed541dea31ea6d5ad3f165fce575ac35d309eca0345de1"
   },
   "ruby-calls/lib/two_args.rb": {
     "captureGroups": 9,
-    "digest": "0b781a930116eed742de7bfbc0852ecdf4056d5ccc4f49c2b779da49c5ca04e9"
+    "digest": "90aa82276cd1403b43fbc091922b69994270761f7089da91240321a8f66e27cb"
   },
   "ruby-chain-call/lib/app.rb": {
     "captureGroups": 13,
-    "digest": "ea7f8a06ec8cb89b47a3c5ebfce79211a51abf643fe9a48e480729b8323491c4"
+    "digest": "0963e395b19ab4bf499ee9923ba7d6634bf3e0ba57b9f99036fe05d374e756d3"
   },
   "ruby-chain-call/lib/repo.rb": {
     "captureGroups": 6,
-    "digest": "9effd68932555f44968ec89ea1fb0bff4719185c777e856ae167a2289fa72239"
+    "digest": "abe6f8c238d8419f9b1d89b7aa26480cfc3d5e6c80fe8465793f76d7bfce7195"
   },
   "ruby-chain-call/lib/user.rb": {
     "captureGroups": 6,
-    "digest": "5efcef8e4c0dc82ddaa88cf6ed51c8a79e86e34e06e14c4363373444da5d5292"
+    "digest": "2453b88db521eede28715b8caa64f47beb6df33ca70c188a303298dff82c9b01"
   },
   "ruby-chain-call/lib/user_service.rb": {
     "captureGroups": 11,
-    "digest": "bfd4e260c15d1e5da32af458a4304ffa21e4e6e22133fa8dd34ad14e50beb0f6"
+    "digest": "88a37bc793199385154c1511a71591ad356f3950f6d0a1497f276453f60898f5"
   },
   "ruby-child-extends-parent/lib/app.rb": {
     "captureGroups": 12,
@@ -81,35 +81,35 @@
   },
   "ruby-constant-constructor/app.rb": {
     "captureGroups": 7,
-    "digest": "cb37edd7c73b7759607850b774627ff2ad223458c611171d666cee83e4de99cd"
+    "digest": "33e4629d6529e507ea5a383378e48f3e38a114a20caa07c1055566e0a78dc197"
   },
   "ruby-constant-constructor/models.rb": {
     "captureGroups": 9,
-    "digest": "580c49087a657582485e87d528777d2b60e6e29d3d5e652e777c23ba35186f7b"
+    "digest": "6cde7048f18f5e916ff93bf842993579add48ab02165e16ae1288b6df039249e"
   },
   "ruby-constant-factory-call/admin_service.rb": {
     "captureGroups": 9,
-    "digest": "a62fbc9faded8b59e1bc529d72e6132187a493475d99ff6163cc71cd1de773f4"
+    "digest": "e148eeca0a59498b11a47c00a8d4208453e9e15a6c69a7603df63b69debeb70e"
   },
   "ruby-constant-factory-call/app.rb": {
     "captureGroups": 14,
-    "digest": "f3b9bc3394854593513e17ef3c0e37375aab959d666b4aed4df443377608eb64"
+    "digest": "3be40bcb39633fe62a024989d6a1e1e1da15c7f62a53f9cf3419ac05cb868331"
   },
   "ruby-constant-factory-call/user_service.rb": {
     "captureGroups": 9,
-    "digest": "d9d74ff4dae50c699e4f4f874c4aa75fa5c27e57ffc4fb170aafca4d333bb2a7"
+    "digest": "31db06d3dfc3217b0122b8c391d5b0766698fe1c386cbdd89ed316218d870728"
   },
   "ruby-constructor-type-inference/models/repo.rb": {
     "captureGroups": 9,
-    "digest": "b0f3b5728c603a2056613091ac75d5014d99c4cdb2d192285c2707117bb46d0c"
+    "digest": "f0c3581f0fbd9c71a0ee64d44c7e3996a8bc0900aeb4b09b76749bb74593ad0f"
   },
   "ruby-constructor-type-inference/models/user.rb": {
     "captureGroups": 9,
-    "digest": "dc7cc04f621b487fd24f417281a6a77b6b5dee234872b98c7d52ea719a991205"
+    "digest": "b6aa12ee8bf28be53e0b1e6e08ff6fd79876c2c575e0fd249a4b6f3bcce1cb66"
   },
   "ruby-constructor-type-inference/services/app.rb": {
     "captureGroups": 26,
-    "digest": "afa655d9a3c7ebea02b529d33904575692a53531a619c3fd34634f0bb43855e4"
+    "digest": "558b7b10808ff580bf86a3701f354b45754e67267810aa91a5511d3f4687d41f"
   },
   "ruby-default-params/app.rb": {
     "captureGroups": 9,
@@ -169,19 +169,19 @@
   },
   "ruby-local-shadow/lib/app.rb": {
     "captureGroups": 8,
-    "digest": "6413cadbe85841eb6f06f42e8a7dd3902cc0d2908971b61c1a1a5e0e221afec9"
+    "digest": "9c013d722ed012b5540ad0c73b613124c542d59ca0a67e744c0ae370904658b6"
   },
   "ruby-local-shadow/lib/utils.rb": {
     "captureGroups": 6,
-    "digest": "b2c5cce7a167d427de4fea1b955b9ec6401ab70f0fbd61a44fb2051332beb82d"
+    "digest": "342d67ea5d6e72c788c1ba22dfb2dd582f8eb7b2793d177b9ade8e03a471515a"
   },
   "ruby-member-calls/lib/app.rb": {
     "captureGroups": 12,
-    "digest": "78f4ec67d744302bf2827c0b61de167285fdb95794a34738898a8cb92d2529a5"
+    "digest": "4dbedb312492f3ee6eff90467d3dbe0e8911f9dc4b56449003f92be4d8d728c9"
   },
   "ruby-member-calls/lib/user.rb": {
     "captureGroups": 6,
-    "digest": "c621dd1859fe820beedf3fb98f4caa483ca262ea6936c8d6253bfabd56b5d557"
+    "digest": "68572363bdbc48595d8fef2194cf006ca09fc42e7592ae96fe544e484da08e85"
   },
   "ruby-method-chain-binding/app.rb": {
     "captureGroups": 39,
@@ -197,11 +197,11 @@
   },
   "ruby-namespaced-constructor/app.rb": {
     "captureGroups": 8,
-    "digest": "8f6555980417465c870a16742eb2d49fcb8a31e26777c11b926180674aa93e97"
+    "digest": "8fae200561959fe6788bc56261042111764d612aaa2b489fddda22a501aba171"
   },
   "ruby-namespaced-constructor/models/user_service.rb": {
     "captureGroups": 13,
-    "digest": "5e0334b33bf3971198e58d8d7637bab148381744ce3b44bb7f17846c863b690d"
+    "digest": "da83dc4830a5d79e4b85db343d82808f437775a617b5d8d8dbae99f4253c2ffa"
   },
   "ruby-namespaced/namespaced.rb": {
     "captureGroups": 16,
@@ -229,15 +229,15 @@
   },
   "ruby-parent-resolution/lib/models/base_model.rb": {
     "captureGroups": 6,
-    "digest": "e108bf68441486968cff17aabfc3489fd295f15d7ad32cac8dad9c1b56e6029b"
+    "digest": "17c03ee0894a7f6d7732d1610192bf3631ce843dcbe92bf272d79209e94f7caa"
   },
   "ruby-parent-resolution/lib/models/serializable.rb": {
     "captureGroups": 6,
-    "digest": "4b415b1bcb31b0290a01279f86305459f53e43efb388e96d6e7b4bf804bd12d8"
+    "digest": "46ad917f57e5c42c2e928402486eba885046bad4d22705a63bb7be693824e093"
   },
   "ruby-parent-resolution/lib/models/user.rb": {
     "captureGroups": 9,
-    "digest": "0e229692965ca5fd6dc5493aa69f056585912f2e4f4acf5af7915a4aee26cb09"
+    "digest": "faf68f05567adf2c2b230e24de9a0f6e5991adbe5f71746070615b2e63e55ef2"
   },
   "ruby-qualified-base/lib/derived.rb": {
     "captureGroups": 18,
@@ -261,23 +261,23 @@
   },
   "ruby-return-type/app.rb": {
     "captureGroups": 17,
-    "digest": "0db7356580a8ac5addec69a3259e5a78028e01b44f5e36316a6f76172929f829"
+    "digest": "2878ba7565cf15ac8fd8f55e66f79066ff67e45ec463439918d6285e3769248b"
   },
   "ruby-return-type/models.rb": {
     "captureGroups": 18,
-    "digest": "e176965a226cc1c84bfd10a2d22083facea402184e9907c6d7858fcd9bc459e5"
+    "digest": "84933b0aef89a2e5313fb4445bc7bc6159d69523081e52dd9dabbd2393446aa3"
   },
   "ruby-return-type/repo.rb": {
     "captureGroups": 18,
-    "digest": "c23aa57b5f96ea094dc201daa0b2d02d7a7438b53488977eadc6ab2ebe63a68b"
+    "digest": "0eac9855c336cc4de516db60979cb5b42050be645a9030f46f7ac85ac09c5544"
   },
   "ruby-self-this-resolution/lib/models/repo.rb": {
     "captureGroups": 6,
-    "digest": "9effd68932555f44968ec89ea1fb0bff4719185c777e856ae167a2289fa72239"
+    "digest": "abe6f8c238d8419f9b1d89b7aa26480cfc3d5e6c80fe8465793f76d7bfce7195"
   },
   "ruby-self-this-resolution/lib/models/user.rb": {
     "captureGroups": 10,
-    "digest": "17c3c937d7d40cffec95393e6b7f2886b44a9117f048fb72eafa88140320c45e"
+    "digest": "c33a8204d72f2abc528502ab5f66ba2987f37e09aa31c571050ad236468ae7b7"
   },
   "ruby-sequential-mixin/lib/account.rb": {
     "captureGroups": 27,
@@ -301,15 +301,15 @@
   },
   "ruby-super-resolution/lib/models/base_model.rb": {
     "captureGroups": 6,
-    "digest": "e108bf68441486968cff17aabfc3489fd295f15d7ad32cac8dad9c1b56e6029b"
+    "digest": "17c03ee0894a7f6d7732d1610192bf3631ce843dcbe92bf272d79209e94f7caa"
   },
   "ruby-super-resolution/lib/models/repo.rb": {
     "captureGroups": 6,
-    "digest": "9effd68932555f44968ec89ea1fb0bff4719185c777e856ae167a2289fa72239"
+    "digest": "abe6f8c238d8419f9b1d89b7aa26480cfc3d5e6c80fe8465793f76d7bfce7195"
   },
   "ruby-super-resolution/lib/models/user.rb": {
     "captureGroups": 9,
-    "digest": "73c8b1725670e841d01fefa807b6148017e181e6bb34d8f5110d970f4292eaff"
+    "digest": "adf5d4a94337370eceb58ab5ffd1516dd7ccdf09d807d2b1f65a8682c2acf9f4"
   },
   "ruby-tail-collision/collision.rb": {
     "captureGroups": 15,
@@ -325,19 +325,19 @@
   },
   "ruby-yard-annotations/models.rb": {
     "captureGroups": 15,
-    "digest": "47b1dc604ac3070fcb24575b06e452f9c6ba95424dd8cdc98c65a25b2a635251"
+    "digest": "daaa66374e3bb41609c2028774ea45fead3046dfd21fc1c81dd568a88d7972eb"
   },
   "ruby-yard-annotations/service.rb": {
     "captureGroups": 15,
-    "digest": "1778fe41038f4a05ecca406ad5cffb0e6b33e69b81265702611a6d498aa68b06"
+    "digest": "3fe04c31c92089988a15eef5e0d970a0f6fa5d0bc57c388eaecd319f5f0f933d"
   },
   "ruby-yard-generics/models.rb": {
     "captureGroups": 17,
-    "digest": "3a0722a48ac72ad10a492d10c4728a805990d07789e5b20a239a6c95a914d23f"
+    "digest": "ee753478dc0297c3eaa38696237e3aae11b5b90f7bda9b38442d107a01aa256d"
   },
   "ruby-yard-generics/service.rb": {
     "captureGroups": 21,
-    "digest": "f2452a20687ba8adb2ac86a23d4c6e3af51df62f65c28212dfbb0f1244643cb3"
+    "digest": "c0182bc7bca0a777c3cf3fde850b6451a9874065f63d938b76103adb1efb7d28"
   },
   "synthetic:dao-20": {
     "captureGroups": 201,

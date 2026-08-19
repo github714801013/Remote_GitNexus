@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { getAllowedEnvironments } from '../config/environment-policy.js';
 import type { LocalBackend, RepoListing } from './local/local-backend.js';
 import { parseListReposPagination } from './local/local-backend.js';
 import { scrubGroupDescription } from './read-only-policy.js';
@@ -26,17 +27,22 @@ export interface McpRequestScopeHeaders {
   env?: string | readonly string[];
 }
 
-type RequestEnvironment = 'dev' | 'pro';
-
-const REQUEST_ENVIRONMENTS: readonly RequestEnvironment[] = ['dev', 'pro'];
+type RequestEnvironment = string;
 
 function repositoryNameForEnvironment(project: string, environment: RequestEnvironment): string {
-  return environment === 'dev' ? 'dev-' + project : project;
+  return environment === 'pro' ? project : `${environment}-${project}`;
 }
 
-function repositoryMatchesEnvironment(repositoryName: string, environment: RequestEnvironment): boolean {
+function repositoryMatchesEnvironment(
+  repositoryName: string,
+  environment: RequestEnvironment,
+  configuredEnvironments: readonly RequestEnvironment[],
+): boolean {
   const normalized = repositoryName.toLowerCase();
-  return environment === 'dev' ? normalized.startsWith('dev-') : !normalized.startsWith('dev-');
+  if (environment !== 'pro') return normalized.startsWith(`${environment}-`);
+  return !configuredEnvironments
+    .filter((configuredEnvironment) => configuredEnvironment !== 'pro')
+    .some((configuredEnvironment) => normalized.startsWith(`${configuredEnvironment}-`));
 }
 
 function parseRequestHeaderList(
@@ -54,10 +60,15 @@ function parseRequestHeaderList(
 
 function validateRequestScope(
   headers: McpRequestScopeHeaders,
-): { projects?: string[]; env?: RequestEnvironment[] } | undefined {
+): {
+  projects?: string[];
+  env?: RequestEnvironment[];
+  allowedEnvironments: RequestEnvironment[];
+} | undefined {
   const projects = parseRequestHeaderList(headers.projects, 'projects');
   const env = parseRequestHeaderList(headers.env, 'env');
   if (projects === undefined && env === undefined) return undefined;
+  const allowedEnvironments = getAllowedEnvironments();
 
   for (const project of projects ?? []) {
     if (project === '*') {
@@ -68,11 +79,11 @@ function validateRequestScope(
     if (environment === '*') {
       throw new Error('MCP env header contains an invalid wildcard value.');
     }
-    if (!REQUEST_ENVIRONMENTS.includes(environment as RequestEnvironment)) {
+    if (!allowedEnvironments.includes(environment)) {
       throw new Error('MCP env header contains an unknown environment: ' + environment + '.');
     }
   }
-  return { projects, env: env as RequestEnvironment[] | undefined };
+  return { projects, env: env as RequestEnvironment[] | undefined, allowedEnvironments };
 }
 
 function configuredValue(
@@ -234,7 +245,7 @@ export class McpRepositoryPolicy {
     const scope = validateRequestScope(headers);
     if (!scope) return this;
 
-    const environments = scope.env ?? REQUEST_ENVIRONMENTS;
+    const environments = scope.env ?? scope.allowedEnvironments;
     const requestedNames = new Set<string>();
     if (scope.projects) {
       for (const project of scope.projects) {
@@ -244,7 +255,11 @@ export class McpRepositoryPolicy {
       }
     } else {
       for (const repo of this.registry) {
-        if (environments.some((environment) => repositoryMatchesEnvironment(repo.name, environment))) {
+        if (
+          environments.some((environment) =>
+            repositoryMatchesEnvironment(repo.name, environment, scope.allowedEnvironments),
+          )
+        ) {
           requestedNames.add(repo.name.toLowerCase());
         }
       }

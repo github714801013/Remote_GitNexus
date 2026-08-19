@@ -258,6 +258,7 @@ describe('LocalBackend.init', () => {
   beforeEach(() => {
     backend = new LocalBackend();
     vi.clearAllMocks();
+    neo4jMocks.isNeo4jBackendEnabled.mockReturnValue(false);
   });
 
   it('returns true when repos are available', async () => {
@@ -270,6 +271,15 @@ describe('LocalBackend.init', () => {
     setupNoRepos();
     const result = await backend.init();
     expect(result).toBe(false);
+  });
+
+  it('skips legacy Kuzu cleanup when Neo4j is the active backend', async () => {
+    setupSingleRepo();
+    neo4jMocks.isNeo4jBackendEnabled.mockReturnValue(true);
+
+    await backend.init();
+
+    expect(cleanupOldKuzuFiles).not.toHaveBeenCalled();
   });
 
   it('calls listRegisteredRepos with validate: true', async () => {

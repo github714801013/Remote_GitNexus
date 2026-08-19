@@ -14,7 +14,7 @@
 
 import type { NodeLabel } from '../../graph/types.js';
 import type { ParameterTypeClass, SymbolDefinition } from '../symbol-definition.js';
-import type { Callsite, DefId } from '../types.js';
+import type { Callsite, DefId, BindingRef, ScopeId } from '../types.js';
 import type { DefIndex } from '../def-index.js';
 import type { QualifiedNameIndex } from '../qualified-name-index.js';
 import type { ModuleScopeIndex } from '../module-scope-index.js';
@@ -113,6 +113,13 @@ export type OwnedMembersByOwnerLookup = (
   memberName: string,
 ) => readonly SymbolDefinition[];
 
+/**
+ * Reads bindings visible at one lexical scope. Callers with post-finalize
+ * language visibility channels inject this reader without coupling the shared
+ * registry to their concrete index implementation.
+ */
+export type VisibleBindingsAt = (scopeId: ScopeId, name: string) => readonly BindingRef[];
+
 // ─── Top-level context threaded through every lookup ───────────────────────
 
 export interface RegistryContext {
@@ -121,6 +128,8 @@ export interface RegistryContext {
   readonly qualifiedNames: QualifiedNameIndex;
   readonly moduleScopes: ModuleScopeIndex;
   readonly ownedMembersByOwner: OwnedMembersByOwnerLookup;
+  /** Optional post-finalize visibility reader. Defaults to the lexical scope's bindings. */
+  readonly visibleBindingsAt?: VisibleBindingsAt;
   /**
    * Method-dispatch index; required for method/field registries that
    * honor `useReceiverTypeBinding`. Omit for class-only lookups.

@@ -62,6 +62,7 @@ import {
 } from '../../core/embeddings/exact-search.js';
 import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME } from '../../core/lbug/schema.js';
 import { getExactScanLimit } from '../../core/platform/capabilities.js';
+import { isNeo4jBackendEnabled } from '../../core/neo4j/config.js';
 import { PhaseTimer } from '../../core/search/phase-timer.js';
 import { loadZoektConfig, ZoektClient } from '../../core/search/zoekt-client.js';
 import { ftsDegradedWarning } from '../../core/search/fts-indexes.js';
@@ -1183,13 +1184,15 @@ export class LocalBackend {
       const storagePath = entry.storagePath;
       const lbugPath = path.join(storagePath, 'lbug');
 
-      // Clean up any leftover KuzuDB files from before the LadybugDB migration.
-      // If kuzu exists but lbug doesn't, warn so the user knows to re-analyze.
-      const kuzu = await cleanupOldKuzuFiles(storagePath);
-      if (kuzu.found && kuzu.needsReindex) {
-        logger.error(
-          `GitNexus: "${entry.name}" has a stale KuzuDB index. Run: gitnexus analyze ${entry.path}`,
-        );
+      // Old Kuzu files belong only to the retired local graph backend. Neo4j
+      // repositories keep graph state remotely and must not touch these files.
+      if (!isNeo4jBackendEnabled()) {
+        const kuzu = await cleanupOldKuzuFiles(storagePath);
+        if (kuzu.found && kuzu.needsReindex) {
+          logger.error(
+            `GitNexus: "${entry.name}" has a stale KuzuDB index. Run: gitnexus analyze ${entry.path}`,
+          );
+        }
       }
 
       const handle: RepoHandle = {

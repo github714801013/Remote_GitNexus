@@ -35,18 +35,17 @@ describe('HTTP embedding client', () => {
     );
   });
 
-  it('lets GITNEXUS_EMBEDDING_REQUEST_TIMEOUT_MS override the shared timeout', async () => {
+  it('classifies network failures as endpoint failures without retrying the batch client-side', async () => {
     process.env.GITNEXUS_EMBEDDING_URL = 'http://embedding.local';
     process.env.GITNEXUS_EMBEDDING_MODEL = 'embedding-model';
     process.env.GITNEXUS_EMBEDDING_DIMS = '2';
-    process.env.GITNEXUS_EMBEDDING_TIMEOUT_MS = '3600000';
-    process.env.GITNEXUS_EMBEDDING_REQUEST_TIMEOUT_MS = '120000';
-    resilientFetchMock.mockRejectedValueOnce(new DOMException('timed out', 'TimeoutError'));
+    resilientFetchMock.mockRejectedValueOnce(new TypeError('fetch failed'));
 
-    const { httpEmbedQuery } = await import('../../src/core/embeddings/http-client.js');
+    const { httpEmbed } = await import('../../src/core/embeddings/http-client.js');
 
-    await expect(httpEmbedQuery('hello')).rejects.toThrow(
-      'Embedding request timed out after 120000ms (http://embedding.local/embeddings, batch 0)',
+    await expect(httpEmbed(['hello', 'world'])).rejects.toThrow(
+      'Embedding request failed (http://embedding.local/embeddings, batch 0): fetch failed',
     );
+    expect(resilientFetchMock).toHaveBeenCalledTimes(1);
   });
 });

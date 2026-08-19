@@ -472,6 +472,98 @@ describe('finalize', () => {
       expect(edge.transitiveVia![CHAIN_LEN - 1]).toBe(`chain${CHAIN_LEN}`);
     });
 
+    it('keeps complex SCC results stable across repeated finalization', () => {
+      const leaf = file('leaf', [def('def:leaf.X', 'Class', 'leaf.X')]);
+      const a = file('a', [], [reexport('X', 'X', 'b'), named('X', 'X', 'leaf')]);
+      const b = file('b', [], [reexport('X', 'X', 'c'), wildcard('leaf')]);
+      const c = file('c', [], [reexport('X', 'X', 'a')]);
+      const consumer = file('consumer', [], [named('X', 'X', 'a')]);
+      const files = [consumer, a, b, c, leaf];
+
+      const first = finalize({ files, workspaceIndex: undefined }, defaultHooks(files));
+      const second = finalize({ files, workspaceIndex: undefined }, defaultHooks(files));
+
+      expect(second).toEqual(first);
+      expect(second.sccs).toEqual(first.sccs);
+      expect(second.stats).toEqual(first.stats);
+    });
+
+    it('isolates a failed cycle from a successful root sharing its downstream target', () => {
+      const leaf = file('leaf', [def('def:leaf.X', 'Class', 'leaf.X')]);
+      const shared = file('shared', [], [reexport('X', 'X', 'leaf')]);
+      const failedA = file('failed-a', [], [reexport('Missing', 'Missing', 'failed-b')]);
+      const failedB = file('failed-b', [], [reexport('Missing', 'Missing', 'failed-a')]);
+      const successfulRoot = file('successful-root', [], [named('X', 'X', 'shared')]);
+      const files = [failedA, failedB, successfulRoot, shared, leaf];
+      const reversedFiles = [...files].reverse();
+
+      const first = finalize({ files, workspaceIndex: undefined }, defaultHooks(files));
+      const reversed = finalize(
+        { files: reversedFiles, workspaceIndex: undefined },
+        defaultHooks(reversedFiles),
+      );
+
+      const successEdge = firstImport(first, successfulRoot.moduleScope)!;
+      expect(successEdge.targetDefId).toBe('def:leaf.X');
+      expect(successEdge.linkStatus).toBeUndefined();
+      expect(first.imports.get(failedA.moduleScope)?.[0]?.linkStatus).toBe('unresolved');
+      expect(reversed).toEqual(first);
+    });
+
+    it('preserves the complete non-duplicated transitiveVia chain at larger scale', () => {
+      const chainLength = 2500;
+      const chain: FinalizeFile[] = [];
+      for (let index = 0; index <= chainLength; index++) {
+        const current = `large-chain-${index}`;
+        chain.push(
+          index === chainLength
+            ? file(current, [def(`def:${current}.X`, 'Class', `${current}.X`)] )
+            : file(current, [], [reexport('X', 'X', `large-chain-${index + 1}`)]),
+        );
+      }
+      const consumer = file('large-consumer', [], [named('X', 'X', 'large-chain-1')]);
+      const files = [consumer, ...chain];
+
+      const out = finalize({ files, workspaceIndex: undefined }, defaultHooks(files));
+      const edge = firstImport(out, consumer.moduleScope)!;
+      const via = edge.transitiveVia ?? [];
+
+      expect(edge.targetDefId).toBe(`def:large-chain-${chainLength}.X`);
+      expect(via).toHaveLength(chainLength);
+      expect(new Set(via).size).toBe(via.length);
+      expect(via).toEqual(
+        Array.from({ length: chainLength }, (_, index) => `large-chain-${index + 1}`),
+      );
+    });
+
+    it('gives named re-exports precedence over earlier wildcard re-exports', () => {
+      const wildcardSource = file('wildcard-source', [def('def:wildcard.X', 'Class', 'wildcard.X')]);
+      const namedSource = file('named-source', [def('def:named.X', 'Class', 'named.X')]);
+      const barrel = file('barrel', [], [wildcard('wildcard-source'), reexport('X', 'X', 'named-source')]);
+      const consumer = file('named-precedence-consumer', [], [named('X', 'X', 'barrel')]);
+      const files = [consumer, barrel, wildcardSource, namedSource];
+
+      const out = finalize({ files, workspaceIndex: undefined }, defaultHooks(files));
+      const edge = firstImport(out, consumer.moduleScope)!;
+
+      expect(edge.targetDefId).toBe('def:named.X');
+      expect(edge.transitiveVia).toEqual(['barrel', 'named-source']);
+    });
+
+    it('rejects repeated files in cyclic aliased re-export paths', () => {
+      const leaf = file('leaf', [def('def:leaf.X', 'Class', 'leaf.X')]);
+      const a = file('alias-a', [], [reexport('Y', 'X', 'alias-b')]);
+      const b = file('alias-b', [], [reexport('X', 'Y', 'alias-a'), reexport('X', 'X', 'leaf')]);
+      const consumer = file('alias-consumer', [], [named('Y', 'Y', 'alias-a')]);
+      const files = [consumer, a, b, leaf];
+
+      const out = finalize({ files, workspaceIndex: undefined }, defaultHooks(files));
+      const edge = firstImport(out, consumer.moduleScope)!;
+      const via = edge.transitiveVia ?? [];
+
+      expect(edge.targetDefId).toBe('def:leaf.X');
+      expect(new Set(via).size).toBe(via.length);
+    });
     it('first-match-wins when the closure encounters multiple sources for the same name', () => {
       // B re-exports X from BOTH c and d. The closure builder walks
       // re-exports in declaration order; first match wins.
@@ -490,6 +582,7 @@ describe('finalize', () => {
       // pass that mirrors typeBindings (which also uses first-wins).
       expect(edge.targetDefId).toBe('def:c.X');
     });
+
 
     it('keeps first-wins precedence stable through cyclic shadowing', () => {
       const c = file('c', [def('def:c.X', 'Class', 'c.X')]);

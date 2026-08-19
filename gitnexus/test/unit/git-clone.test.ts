@@ -23,6 +23,7 @@ import {
   buildGitEnv,
   normalizeGitUrlForCompare,
   assertRemoteMatchesRequestedUrl,
+  GITEA_TOKEN_HOSTS,
   isAzureDevOpsUrl,
   warnIfInsecureAzureConfig,
 } from '../../src/server/git-clone.js';
@@ -399,10 +400,25 @@ describe('git-clone', () => {
       expect(env.GIT_CONFIG_VALUE_0).toBe(expected);
     });
 
+    it('injects the configured Gitea token only for the Gitea host', () => {
+      const previousToken = process.env.GITEA_TOKEN;
+      process.env.GITEA_TOKEN = 'gitea-secret';
+      try {
+        const allowed = buildGitEnv({}, { url: 'https://code.9ji.com/org/repo.git' });
+        expect(allowed.GIT_CONFIG_VALUE_0).toContain('Basic ');
+        const thirdParty = buildGitEnv({}, { url: 'https://example.com/org/repo.git' });
+        expect(thirdParty.GIT_CONFIG_COUNT).toBeUndefined();
+        expect([...GITEA_TOKEN_HOSTS]).toEqual(['code.9ji.com']);
+      } finally {
+        if (previousToken === undefined) delete process.env.GITEA_TOKEN;
+        else process.env.GITEA_TOKEN = previousToken;
+      }
+    });
     it('does not inject a token for a non-github host (defense-in-depth host bind)', () => {
       const env = buildGitEnv({}, { token: 'ghp_secret123', url: 'https://gitlab.com/owner/repo' });
       expect(env.GIT_CONFIG_COUNT).toBeUndefined();
     });
+
 
     it('never includes the raw token value in any env entry', () => {
       // Defence-in-depth: token must only appear inside the base64 of the

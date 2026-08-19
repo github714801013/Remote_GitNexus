@@ -474,8 +474,22 @@ Notes:
 
 </details>
 
-<details>
-<summary><strong>Environment variables</strong></summary>
+### 模型并发降压
+
+本地模型压力较大时，可通过环境变量降低摘要与向量化并发。建议先使用以下保守配置：
+
+```env
+GITNEXUS_KEYWORD_SUMMARY_CONCURRENCY=1
+GITNEXUS_EMBEDDING_REPAIR_CONCURRENCY=1
+GITNEXUS_EMBEDDING_PARALLEL_CONCURRENCY=1
+GITNEXUS_EMBEDDING_REPAIR_BATCH_SIZE=8
+KEYWORD_SUMMARY_PARALLEL_SLOTS=1
+KEYWORD_SUMMARY_PARALLEL_REQUESTS=1
+```
+
+其中，摘要并发控制 GitNexus 发出的摘要请求；embedding repair 并发控制仓库修复任务；repair batch size 控制单批节点数；`KEYWORD_SUMMARY_PARALLEL_SLOTS` 和 `KEYWORD_SUMMARY_PARALLEL_REQUESTS` 控制本地 llama.cpp 摘要服务的并行槽位与请求并行度。
+
+
 
 Most `analyze` knobs are also CLI flags (`--workers`, `--worker-timeout`, `--max-file-size`, `--verbose`). Use the env-var form when you'd otherwise repeat the same flag every run, or when invoking GitNexus from a long-running host (MCP server, eval-server, CI shell) that already manages its own environment. CLI flags take precedence over env vars; env vars take precedence over built-in defaults.
 
@@ -505,6 +519,7 @@ Most `analyze` knobs are also CLI flags (`--workers`, `--worker-timeout`, `--max
 | `GITNEXUS_NO_GITIGNORE`                         | unset                     | When set, skips `.gitignore` parsing. `.gitnexusignore` is still honored.                                                                                                                                                                                                                                   | Indexing a repo whose `.gitignore` excludes files you actually want indexed (e.g., generated code committed for cross-repo lookup).                                                   |
 | `GITNEXUS_SKIP_OPTIONAL_GRAMMARS`               | unset                     | When `=1` strictly, skips the vendored grammar materialize for `tree-sitter-dart`, `tree-sitter-proto`, `tree-sitter-swift`, and `tree-sitter-kotlin` at install time (and the Dart/Proto source builds). Those four won't be parsed; the install still succeeds.                                           | Installing on a host without a C++ toolchain or where the vendored prebuilds don't match; willing to skip Dart/Proto/Swift/Kotlin parsing.                                            |
 | `GITNEXUS_MCP_READ_ONLY`                        | unset                     | Set to `1` to expose only proven single-repository read tools and resources; `0` disables the policy and any other value fails startup.                                                                                                                                                                     | The MCP server runs in an environment where graph mutation, raw Cypher, and cross-repository group routing must be unavailable.                                                       |
+| `GITNEXUS_WEBHOOK_ALLOWED_ENVS`                  | `dev,pro,iteng`           | Shared comma-separated environment allowlist for MCP request-header `env` scope and `/webhook/:env/index`; non-`pro` environments map to `<env>-<project>`, while `pro` maps to `<project>`.                                                                                                                                     | The MCP and webhook environment boundaries must use the same configured environment set.                                                                                              |
 | `GITNEXUS_MCP_ALLOWED_REPOS`                    | unset                     | Comma-separated allowlist of canonical indexed repository names or absolute paths. Invalid, ambiguous, or blank entries fail startup.                                                                                                                                                                       | One MCP process must expose only a bounded subset of the repositories in the global registry.                                                                                         |
 | `GITNEXUS_MCP_DEFAULT_REPO`                     | unset                     | Canonical indexed repository name or absolute path used when a tool or resource omits its repository. Must belong to the allowlist when one is set.                                                                                                                                                         | Several repositories are available but unqualified MCP calls should resolve deterministically.                                                                                        |
 | `GITNEXUS_MCP_DEFAULT_MAX_TOKENS`               | unset                     | Default positive-integer response budget for MCP `query`, `context`, and `impact`, estimated at four UTF-8 bytes per token. Explicit `maxTokens` wins.                                                                                                                                                      | Long MCP responses consume too much model context and callers cannot reliably add a per-request budget.                                                                               |
@@ -913,6 +928,17 @@ After this, attempting to deploy an unsigned image — or one signed by anything
 </details>
 
 ## Enterprise
+
+### 定时维护索引入口
+
+服务器部署后，可以通过索引健康检查接口按需触发一次索引项目检查与维护：
+
+```bash
+curl -X POST "http://127.0.0.1:1347/api/index-health-check"
+```
+
+维护流程会实时检查项目当前分支的 upstream；发现远程版本更新时，服务器上的索引项目会执行 `git fetch --prune` 和 `git reset --hard`，然后重新排队索引分析。该流程不会执行 `git clean`，因此会保留未跟踪文件。远程版本检查失败时会记录警告，并继续现有的本地索引健康检查。
+
 
 GitNexus is available as an **enterprise offering** — fully managed **SaaS** or **self-hosted** deployment. Commercial use of the OSS version is also available with proper licensing.
 

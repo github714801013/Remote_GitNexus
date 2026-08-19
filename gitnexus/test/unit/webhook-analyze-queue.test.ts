@@ -220,6 +220,41 @@ describe('WebhookAnalyzeQueue', () => {
     }
   });
 
+  it('starts embedding work immediately when structure uses a stagger gate', async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const structureStartGate = new WebhookStartStaggerGate(300_000, () => now);
+    const structureQueue = new WebhookAnalyzeQueue(2, { startGate: structureStartGate });
+    const embeddingQueue = new WebhookAnalyzeQueue(2);
+    const structure = deferred<void>();
+    const started: string[] = [];
+
+    try {
+      const structureResult = structureQueue.enqueue({
+        key: 'structure-repo',
+        run: async () => {
+          started.push('structure-repo');
+          await structure.promise;
+        },
+      });
+      const embeddingResult = embeddingQueue.enqueue({
+        key: 'embedding-repo',
+        run: async () => {
+          started.push('embedding-repo');
+        },
+      });
+
+      await Promise.resolve();
+      expect(started).toEqual(['structure-repo', 'embedding-repo']);
+
+      await embeddingResult.done;
+      structure.resolve();
+      await structureResult.done;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('shares start staggering across structure and embedding queues', async () => {
     vi.useFakeTimers();
     let now = 0;

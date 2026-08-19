@@ -58,6 +58,9 @@ export const REL_TYPES = [
   'HAS_METHOD',
   'HAS_PROPERTY',
   'ACCESSES',
+  'USES',
+  'BINDS_EVENT_HANDLER',
+  'EMITS_EVENT',
   'METHOD_OVERRIDES',
   'OVERRIDES', // Legacy compat alias — kept until all stored indexes are migrated
   'METHOD_IMPLEMENTS',
