@@ -28,8 +28,11 @@ describe('checkStaleness', () => {
     }
 
     const result = checkStaleness(process.cwd(), headCommit);
+    expect(result.status).toBe('fresh');
     expect(result.isStale).toBe(false);
     expect(result.commitsBehind).toBe(0);
+    expect(result.indexedCommit).toBe(headCommit);
+    expect(result.checkoutCommit).toBe(headCommit);
     expect(result.hint).toBeUndefined();
   });
 
@@ -48,21 +51,25 @@ describe('checkStaleness', () => {
     if (!previousCommit) return;
 
     const result = checkStaleness(process.cwd(), previousCommit);
+    expect(result.status).toBe('stale');
     expect(result.isStale).toBe(true);
     expect(result.commitsBehind).toBeGreaterThan(0);
     expect(result.hint).toContain('behind HEAD');
   });
 
-  it('fails open when git command fails (e.g., invalid path)', () => {
+  it('returns unknown when git command fails (e.g., invalid path)', () => {
     const result = checkStaleness('/nonexistent/path', 'abc123');
+    expect(result.status).toBe('unknown');
     expect(result.isStale).toBe(false);
-    expect(result.commitsBehind).toBe(0);
+    expect(result.commitsBehind).toBeNull();
+    expect(result.reason).toBe('checkout_unavailable');
   });
 
-  it('fails open with invalid commit hash', () => {
+  it('returns unknown with an invalid commit hash', () => {
     const result = checkStaleness(process.cwd(), 'not-a-real-commit-hash');
+    expect(result.status).toBe('unknown');
     expect(result.isStale).toBe(false);
-    expect(result.commitsBehind).toBe(0);
+    expect(result.commitsBehind).toBeNull();
   });
 });
 
@@ -79,8 +86,11 @@ describe('checkStalenessAsync', () => {
     }
 
     const result = await checkStalenessAsync(process.cwd(), headCommit);
+    expect(result.status).toBe('fresh');
     expect(result.isStale).toBe(false);
     expect(result.commitsBehind).toBe(0);
+    expect(result.indexedCommit).toBe(headCommit);
+    expect(result.checkoutCommit).toBe(headCommit);
     expect(result.hint).toBeUndefined();
   });
 
@@ -98,21 +108,25 @@ describe('checkStalenessAsync', () => {
     if (!previousCommit) return;
 
     const result = await checkStalenessAsync(process.cwd(), previousCommit);
+    expect(result.status).toBe('stale');
     expect(result.isStale).toBe(true);
     expect(result.commitsBehind).toBeGreaterThan(0);
     expect(result.hint).toContain('behind HEAD');
   });
 
-  it('fails open when git command fails (e.g., invalid path)', async () => {
+  it('returns unknown when git command fails (e.g., invalid path)', async () => {
     const result = await checkStalenessAsync('/nonexistent/path', 'abc123');
+    expect(result.status).toBe('unknown');
     expect(result.isStale).toBe(false);
-    expect(result.commitsBehind).toBe(0);
+    expect(result.commitsBehind).toBeNull();
+    expect(result.reason).toBe('checkout_unavailable');
   });
 
-  it('fails open with invalid commit hash', async () => {
+  it('returns unknown with an invalid commit hash', async () => {
     const result = await checkStalenessAsync(process.cwd(), 'not-a-real-commit-hash');
+    expect(result.status).toBe('unknown');
     expect(result.isStale).toBe(false);
-    expect(result.commitsBehind).toBe(0);
+    expect(result.commitsBehind).toBeNull();
   });
 
   it('parallel calls complete faster than sequential', async () => {

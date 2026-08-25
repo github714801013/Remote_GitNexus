@@ -70,6 +70,7 @@ import {
   GITHUB_TOKEN_HOSTS,
 } from './git-clone.js';
 import { WebhookAnalyzeQueue, WebhookStartStaggerGate } from './webhook-analyze-queue.js';
+import { WikiQueue } from './wiki-queue.js';
 import { ResourceAwareConcurrencyController } from './resource-aware-concurrency.js';
 import { waitForJobManagerIdle } from './analyze-job-wait.js';
 import {
@@ -84,7 +85,12 @@ export {
   isJsonBodyParseError,
   isRepoAlreadyActiveError,
 } from './error-classification.js';
-import { checkStaleness, syncWithUpstream, type StalenessInfo } from '../core/git-staleness.js';
+import {
+  checkStaleness,
+  checkStalenessAsync,
+  syncWithUpstream,
+  type StalenessInfo,
+} from '../core/git-staleness.js';
 import {
   WebhookWorktreeError,
   assertEnvAllowed,
@@ -1193,6 +1199,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   const webhookEmbeddingRepairQueue = new WebhookAnalyzeQueue(
     () => resourceController.getConcurrency('embedding'),
   );
+  // ponytail: global lock, add per-provider capacity only when real throughput requires it.
+  const wikiQueue = new WikiQueue();
 
   const startAnalyzeForPath = (
     repoPath: string,
@@ -1448,7 +1456,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   };
 
   onAnalysisFinalized = (result: AnalyzeResultIpc, context: { jobId: string; repoPath: string }): void => {
-    if (!result.embeddingRepairDeferred || !isNeo4jBackendEnabled()) return;
     void (async () => {
       try {
         const entry = (await listRegisteredRepos()).find((candidate) =>
@@ -1456,12 +1463,19 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         );
         if (!entry) return;
         const meta = await loadMeta(entry.storagePath);
+        if (meta?.lastCommit) {
+          wikiQueue.enqueue(entry, meta.lastCommit).done.catch((err) => {
+            logger.warn({ err, repo: entry.name }, 'post-analysis wiki generation failed');
+          });
+        }
+
+        if (!result.embeddingRepairDeferred || !isNeo4jBackendEnabled()) return;
         const { countEmbeddings } = await import('../core/neo4j/embedding-adapter.js');
         const actualEmbeddings = await countEmbeddings(entry.name).catch(() => undefined);
         if ((meta?.stats?.nodes ?? 0) <= 0 && actualEmbeddings === 0) return;
         startEmbeddingRepairForEntry(entry, { source: 'finalization', registryBranch: entry.branch });
       } catch (err) {
-        logger.error({ err, repoPath: context.repoPath }, 'post-analysis embedding repair scheduling failed');
+        logger.error({ err, repoPath: context.repoPath }, 'post-analysis background scheduling failed');
       }
     })();
   };
@@ -1842,16 +1856,40 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   app.get('/api/repos', async (_req, res) => {
     try {
       const repos = await listRegisteredRepos();
-      res.json(
-        repos.map((r) => ({
-          name: r.name,
-          path: r.path,
-          repoPath: r.path,
-          indexedAt: r.indexedAt,
-          lastCommit: r.lastCommit,
-          stats: r.stats,
-        })),
+      const responses = await Promise.all(
+        repos.map(async (r) => {
+          const [staleness, wiki] = await Promise.all([
+            checkStalenessAsync(r.path, r.lastCommit).catch(() => ({
+              status: 'unknown' as const,
+              isStale: false,
+              commitsBehind: null,
+              indexedCommit: r.lastCommit,
+              reason: 'unknown' as const,
+            })),
+            wikiQueue.refreshLifecycle(r).catch((err) => {
+              logger.warn({ err, repo: r.name }, 'wiki lifecycle refresh failed');
+              return {
+                enabled: true as const,
+                sourceCommit: null,
+                status: 'failed' as const,
+                queue: 'idle' as const,
+                lastError: 'generation_failed' as const,
+              };
+            }),
+          ]);
+          return {
+            name: r.name,
+            path: r.path,
+            repoPath: r.path,
+            indexedAt: r.indexedAt,
+            lastCommit: r.lastCommit,
+            stats: r.stats,
+            staleness,
+            wiki,
+          };
+        }),
       );
+      res.json(responses);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to list repos' });
     }

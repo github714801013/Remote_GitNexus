@@ -12,9 +12,19 @@ import { findGitRootByDotGit, getCurrentCommit, getRemoteUrl } from '../storage/
 
 const execFileAsync = promisify(execFile);
 
+export type StalenessStatus = 'fresh' | 'stale' | 'unknown';
+
 export interface StalenessInfo {
+  /** `unknown` means the indexed commit could not be compared safely. */
+  status: StalenessStatus;
+  /** Backward-compatible field. Consumers must use `status` to distinguish unknown from fresh. */
   isStale: boolean;
-  commitsBehind: number;
+  commitsBehind: number | null;
+  indexedCommit: string;
+  checkoutCommit?: string;
+  branch?: string;
+  upstreamRef?: string;
+  reason?: 'git_unavailable' | 'indexed_commit_unreachable' | 'checkout_unavailable' | 'unknown';
   hint?: string;
 }
 
@@ -40,6 +50,69 @@ const gitOutput = async (
   });
   return stdout.trim();
 };
+
+const inspectCheckout = (
+  repoPath: string,
+): Pick<StalenessInfo, 'checkoutCommit' | 'branch' | 'upstreamRef'> => {
+  const read = (args: string[]): string | undefined => {
+    try {
+      const value = execFileSync('git', args, {
+        cwd: repoPath,
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      }).trim();
+      return value || undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const checkoutCommit = read(['rev-parse', 'HEAD']);
+  const branch = read(['branch', '--show-current']);
+  const upstreamRef = read(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']);
+  return {
+    ...(checkoutCommit ? { checkoutCommit } : {}),
+    ...(branch ? { branch } : {}),
+    ...(upstreamRef ? { upstreamRef } : {}),
+  };
+};
+
+const unknownStaleness = (
+  indexedCommit: string,
+  reason: StalenessInfo['reason'],
+  checkout?: Pick<StalenessInfo, 'checkoutCommit' | 'branch' | 'upstreamRef'>,
+): StalenessInfo => ({
+  status: 'unknown',
+  isStale: false,
+  commitsBehind: null,
+  indexedCommit,
+  ...checkout,
+  reason,
+  hint: 'Unable to compare the indexed commit with the current checkout. Check the branch, shallow clone, or repository path.',
+});
+
+const resolvedStaleness = (
+  indexedCommit: string,
+  checkout: Required<Pick<StalenessInfo, 'checkoutCommit'>> &
+    Pick<StalenessInfo, 'branch' | 'upstreamRef'>,
+  commitsBehind: number,
+): StalenessInfo =>
+  commitsBehind > 0
+    ? {
+        status: 'stale',
+        isStale: true,
+        commitsBehind,
+        indexedCommit,
+        ...checkout,
+        hint: `⚠️ Index is ${commitsBehind} commit${commitsBehind > 1 ? 's' : ''} behind HEAD. Run analyze tool to update.`,
+      }
+    : {
+        status: 'fresh',
+        isStale: false,
+        commitsBehind: 0,
+        indexedCommit,
+        ...checkout,
+      };
 
 /**
  * 检查索引项目当前分支的 upstream，并在远端有更新时强制同步工作树。
@@ -95,6 +168,8 @@ export async function syncWithUpstream(repoPath: string): Promise<RemoteSyncInfo
 
 
 export function checkStaleness(repoPath: string, lastCommit: string): StalenessInfo {
+  const checkout = inspectCheckout(repoPath);
+  if (!checkout.checkoutCommit) return unknownStaleness(lastCommit, 'checkout_unavailable', checkout);
   try {
     const result = execFileSync('git', ['rev-list', '--count', `${lastCommit}..HEAD`], {
       cwd: repoPath,
@@ -103,19 +178,14 @@ export function checkStaleness(repoPath: string, lastCommit: string): StalenessI
       windowsHide: true,
     }).trim();
 
-    const commitsBehind = parseInt(result, 10) || 0;
-
-    if (commitsBehind > 0) {
-      return {
-        isStale: true,
-        commitsBehind,
-        hint: `⚠️ Index is ${commitsBehind} commit${commitsBehind > 1 ? 's' : ''} behind HEAD. Run analyze tool to update.`,
-      };
+    const commitsBehind = Number.parseInt(result, 10);
+    if (!Number.isFinite(commitsBehind) || commitsBehind < 0) {
+      return unknownStaleness(lastCommit, 'unknown', checkout);
     }
 
-    return { isStale: false, commitsBehind: 0 };
+    return resolvedStaleness(lastCommit, checkout as Required<Pick<StalenessInfo, 'checkoutCommit'>>, commitsBehind);
   } catch {
-    return { isStale: false, commitsBehind: 0 };
+    return unknownStaleness(lastCommit, 'indexed_commit_unreachable', checkout);
   }
 }
 
@@ -129,27 +199,46 @@ export async function checkStalenessAsync(
   lastCommit: string,
 ): Promise<StalenessInfo> {
   try {
-    // Note: promisified execFile captures stdout/stderr by default (no stdio option needed,
-    // unlike the sync variant which requires explicit stdio: ['pipe','pipe','pipe']).
-    const { stdout } = await execFileAsync('git', ['rev-list', '--count', `${lastCommit}..HEAD`], {
-      cwd: repoPath,
-      encoding: 'utf-8',
-      windowsHide: true,
-    });
-
-    const commitsBehind = parseInt(stdout.trim(), 10) || 0;
-
-    if (commitsBehind > 0) {
-      return {
-        isStale: true,
-        commitsBehind,
-        hint: `⚠️ Index is ${commitsBehind} commit${commitsBehind > 1 ? 's' : ''} behind HEAD. Run analyze tool to update.`,
-      };
+    const [head, branch, upstream, count] = await Promise.all([
+      execFileAsync('git', ['rev-parse', 'HEAD'], {
+        cwd: repoPath,
+        encoding: 'utf-8',
+        windowsHide: true,
+      }),
+      execFileAsync('git', ['branch', '--show-current'], {
+        cwd: repoPath,
+        encoding: 'utf-8',
+        windowsHide: true,
+      }).catch(() => ({ stdout: '' })),
+      execFileAsync('git', ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], {
+        cwd: repoPath,
+        encoding: 'utf-8',
+        windowsHide: true,
+      }).catch(() => ({ stdout: '' })),
+      execFileAsync('git', ['rev-list', '--count', `${lastCommit}..HEAD`], {
+        cwd: repoPath,
+        encoding: 'utf-8',
+        windowsHide: true,
+      }),
+    ]);
+    const checkoutCommit = head.stdout.trim();
+    const checkout = {
+      ...(checkoutCommit ? { checkoutCommit } : {}),
+      ...(branch.stdout.trim() ? { branch: branch.stdout.trim() } : {}),
+      ...(upstream.stdout.trim() ? { upstreamRef: upstream.stdout.trim() } : {}),
+    };
+    const commitsBehind = Number.parseInt(count.stdout.trim(), 10);
+    if (!checkoutCommit) return unknownStaleness(lastCommit, 'checkout_unavailable', checkout);
+    if (!Number.isFinite(commitsBehind) || commitsBehind < 0) {
+      return unknownStaleness(lastCommit, 'unknown', checkout);
     }
-
-    return { isStale: false, commitsBehind: 0 };
+    return resolvedStaleness(
+      lastCommit,
+      checkout as Required<Pick<StalenessInfo, 'checkoutCommit'>>,
+      commitsBehind,
+    );
   } catch {
-    return { isStale: false, commitsBehind: 0 };
+    return unknownStaleness(lastCommit, 'checkout_unavailable');
   }
 }
 

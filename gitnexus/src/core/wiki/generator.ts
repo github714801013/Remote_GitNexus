@@ -75,6 +75,10 @@ export interface WikiOptions {
   reviewOnly?: boolean;
   /** Output language for generated documentation (e.g. 'english', 'chinese', 'spanish') */
   lang?: string;
+  /** Server-owned staging directory used before publishing a generated wiki. */
+  outputDir?: string;
+  /** Stable index commit supplied by the server-owned Wiki queue. */
+  sourceCommit?: string;
 }
 
 export interface WikiMeta {
@@ -132,7 +136,7 @@ export class WikiGenerator {
   ) {
     this.repoPath = repoPath;
     this.storagePath = storagePath;
-    this.wikiDir = path.join(storagePath, WIKI_DIR);
+    this.wikiDir = options.outputDir ?? path.join(storagePath, WIKI_DIR);
     this.lbugPath = lbugPath;
     this.options = options;
     this.llmConfig = llmConfig;
@@ -255,7 +259,7 @@ export class WikiGenerator {
     await fs.mkdir(this.wikiDir, { recursive: true });
 
     const existingMeta = await this.loadWikiMeta();
-    const currentCommit = this.getCurrentCommit();
+    const currentCommit = this.options.sourceCommit ?? this.getCurrentCommit();
     const forceMode = this.options.force;
 
     // Up-to-date check (skip if --force)

@@ -327,7 +327,14 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   const lastCommit = freshMeta?.lastCommit ?? repo.lastCommit ?? 'HEAD';
   const staleness = repoPath
     ? checkStaleness(repoPath, lastCommit)
-    : { isStale: false, commitsBehind: 0 };
+    : {
+        status: 'unknown' as const,
+        isStale: false,
+        commitsBehind: null,
+        indexedCommit: lastCommit,
+        reason: 'checkout_unavailable' as const,
+        hint: undefined,
+      };
 
   const lines: string[] = [`project: ${context.projectName}`];
 
