@@ -106,6 +106,7 @@ write_remote_env() {
         echo "GITNEXUS_ANALYZE_MAX_OLD_SPACE_MB=${GITNEXUS_ANALYZE_MAX_OLD_SPACE_MB:-32768}"
         echo "GITNEXUS_SERVER_ANALYZE_HEAP_MB=${GITNEXUS_SERVER_ANALYZE_HEAP_MB:-16384}"
         echo "GITNEXUS_LOCAL_DIAGNOSTICS_ENABLED=${GITNEXUS_LOCAL_DIAGNOSTICS_ENABLED:-false}"
+        echo "GITNEXUS_MCP_READ_ONLY=1"
         echo "GITNEXUS_MAX_FILE_SIZE=${GITNEXUS_MAX_FILE_SIZE:-5120}"
         echo "GITNEXUS_WEBHOOK_ALLOWED_ENVS=${GITNEXUS_WEBHOOK_ALLOWED_ENVS:-dev,pro,iteng}"
         echo "GITNEXUS_KEYWORD_SUMMARY_URL=${GITNEXUS_KEYWORD_SUMMARY_URL}"
@@ -201,7 +202,7 @@ ssh "${REMOTE_USER}@${REMOTE_HOST}" -T << EOF
     echo "使用远程 keyword summary 服务: ${GITNEXUS_KEYWORD_SUMMARY_URL}"
 
     echo "启动 GitNexus + Zoekt (docker compose)..."
-    docker compose --env-file .env -f docker-compose.yml up -d --force-recreate zoekt-indexserver zoekt-webserver gitnexus-mcp-proxy
+    GITNEXUS_MCP_READ_ONLY=1 docker compose --env-file .env -f docker-compose.yml up -d --force-recreate zoekt-indexserver zoekt-webserver gitnexus-mcp-proxy
 
     echo "--- 执行自动验证 ---"
     python3 auto_verify.py

@@ -397,15 +397,23 @@ export async function callLLM(
   // Non-streaming path
   const json = (await response.json()) as any;
   const choice = json.choices?.[0];
-  if (!choice?.message?.content) {
-    throw new Error('LLM returned empty response');
+  const message = choice?.message;
+  if (typeof message?.content === 'string' && message.content.length > 0) {
+    return {
+      content: message.content,
+      promptTokens: json.usage?.prompt_tokens,
+      completionTokens: json.usage?.completion_tokens,
+    };
   }
 
-  return {
-    content: choice.message.content,
-    promptTokens: json.usage?.prompt_tokens,
-    completionTokens: json.usage?.completion_tokens,
-  };
+  if (
+    (typeof message?.reasoning === 'string' && message.reasoning.length > 0) ||
+    (typeof message?.reasoning_content === 'string' && message.reasoning_content.length > 0)
+  ) {
+    throw new Error('LLM returned reasoning-only response; reasoning is not included in Wiki output');
+  }
+
+  throw new Error('LLM returned empty response');
 }
 
 /**
@@ -420,6 +428,39 @@ async function readSSEStream(
   let content = '';
   let buffer = '';
   let contentFilterTriggered = false;
+  let sawReasoning = false;
+  let sawMalformedEofEvent = false;
+
+  const processLine = (line: string, atEof = false): void => {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.startsWith('data: ')) return;
+    const data = trimmed.slice(6);
+    if (data === '[DONE]') return;
+
+    try {
+      const parsed = JSON.parse(data);
+      const choice = parsed.choices?.[0];
+
+      if (choice?.finish_reason === 'content_filter') {
+        contentFilterTriggered = true;
+        return;
+      }
+
+      const delta = choice?.delta;
+      if (typeof delta?.reasoning === 'string' && delta.reasoning.length > 0) {
+        sawReasoning = true;
+      }
+      if (typeof delta?.reasoning_content === 'string' && delta.reasoning_content.length > 0) {
+        sawReasoning = true;
+      }
+      if (typeof delta?.content === 'string' && delta.content.length > 0) {
+        content += delta.content;
+        onChunk(content.length);
+      }
+    } catch {
+      if (atEof) sawMalformedEofEvent = true;
+    }
+  };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -428,33 +469,11 @@ async function readSSEStream(
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith('data: ')) continue;
-      const data = trimmed.slice(6);
-      if (data === '[DONE]') continue;
-
-      try {
-        const parsed = JSON.parse(data);
-        const choice = parsed.choices?.[0];
-
-        // Detect content filter finish reason — skip delta from this chunk
-        if (choice?.finish_reason === 'content_filter') {
-          contentFilterTriggered = true;
-          continue;
-        }
-
-        const delta = choice?.delta?.content;
-        if (delta) {
-          content += delta;
-          onChunk(content.length);
-        }
-      } catch {
-        // Skip malformed SSE chunks
-      }
-    }
+    for (const line of lines) processLine(line);
   }
+
+  buffer += decoder.decode();
+  if (buffer) processLine(buffer, true);
 
   if (contentFilterTriggered) {
     throw new Error(
@@ -462,9 +481,15 @@ async function readSSEStream(
     );
   }
 
-  if (!content) {
-    throw new Error('LLM returned empty streaming response');
+  if (sawMalformedEofEvent) {
+    throw new Error('LLM stream ended with an incomplete or unprocessed SSE event at EOF');
   }
 
-  return { content };
+  if (content) return { content };
+
+  if (sawReasoning) {
+    throw new Error('LLM returned reasoning-only response; reasoning is not included in Wiki output');
+  }
+
+  throw new Error('LLM returned empty streaming response');
 }
