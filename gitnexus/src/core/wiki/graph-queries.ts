@@ -7,13 +7,53 @@
 
 import { initLbug, executeQuery, closeLbug, touchRepo, pinRepo } from '../lbug/pool-adapter.js';
 import { escapeCypherString } from '../lbug/cypher-escape.js';
+import { isNeo4jBackendEnabled } from '../neo4j/config.js';
+import { executeReadCypher } from '../neo4j/read-adapter.js';
 
 const REPO_ID = '__wiki__';
 
+// Dual-backend dispatch state (Ticket 01). The single dispatch basis is
+// isNeo4jBackendEnabled(); `wikiRepoId` is written only by initWikiDb and
+// gates every Neo4j read so unfiltered whole-graph queries are impossible.
+let wikiRepoId: string | undefined;
+
+/** Normalize Neo4j row values: Integer → number, everything else untouched.
+ *  The local LadybugDB path never passes through here. */
+const normalizeNeo4jRow = (row: Record<string, any>): Record<string, any> => {
+  const out: Record<string, any> = {};
+  for (const [key, value] of Object.entries(row)) {
+    out[key] = value && typeof value.toNumber === 'function' ? value.toNumber() : value;
+  }
+  return out;
+};
+
+/**
+ * Run a read query on the active backend: local goes through the lbug pool
+ * (existing semantics unchanged); Neo4j goes through executeReadCypher and
+ * always attaches the $repoId filter.
+ */
+const runRead = async (
+  localCypher: string,
+  neo4jCypher: string,
+  params: Record<string, any> = {},
+): Promise<Record<string, any>[]> => {
+  if (isNeo4jBackendEnabled()) {
+    if (!wikiRepoId) {
+      throw new Error('Neo4j wiki queries require repoId; call initWikiDb first.');
+    }
+    const rows = await executeReadCypher(neo4jCypher, { repoId: wikiRepoId, ...params });
+    return rows.map(normalizeNeo4jRow);
+  }
+  return executeQuery(REPO_ID, localCypher);
+};
+
 /**
  * Touch the wiki DB connection to prevent idle timeout during long LLM calls.
+ * Neo4j mode is a no-op (the driver owns its connection pool; there is no
+ * local connection to keep alive).
  */
 export function touchWikiDb(): void {
+  if (isNeo4jBackendEnabled()) return;
   touchRepo(REPO_ID);
 }
 
@@ -21,8 +61,10 @@ export function touchWikiDb(): void {
  * Keep the wiki DB resident for a full generation run. Wiki generation can spend
  * minutes inside LLM calls, and the pooled DB must survive both idle cleanup and
  * unrelated LRU pressure until the run reaches its final graph queries.
+ * Neo4j mode returns a no-op releaser that is safe to call repeatedly.
  */
 export function pinWikiDb(): () => void {
+  if (isNeo4jBackendEnabled()) return () => {};
   return pinRepo(REPO_ID);
 }
 
@@ -52,16 +94,33 @@ export interface ProcessInfo {
 }
 
 /**
- * Initialize the LadybugDB connection for wiki generation.
+ * Initialize the wiki graph data source.
+ * Local mode: opens LadybugDB (existing semantics unchanged).
+ * Neo4j mode: never touches the local lbug file; repoId is required and a
+ * missing one fails fast (surfacing as generation_failed) rather than
+ * degrading into an unfiltered whole-graph query.
  */
-export async function initWikiDb(lbugPath: string): Promise<void> {
+export async function initWikiDb(lbugPath: string, repoId?: string): Promise<void> {
+  if (isNeo4jBackendEnabled()) {
+    if (!repoId || !repoId.trim()) {
+      throw new Error('Neo4j wiki generation requires the repository id (repoId).');
+    }
+    wikiRepoId = repoId;
+    return;
+  }
+  wikiRepoId = undefined;
   await initLbug(REPO_ID, lbugPath);
 }
 
 /**
- * Close the LadybugDB connection.
+ * Close the wiki graph data source. Neo4j mode is a no-op (sessions open and
+ * close per call).
  */
 export async function closeWikiDb(): Promise<void> {
+  if (isNeo4jBackendEnabled()) {
+    wikiRepoId = undefined;
+    return;
+  }
   await closeLbug(REPO_ID);
 }
 
@@ -72,8 +131,7 @@ export async function closeWikiDb(): Promise<void> {
  * longer have a direct File→DEFINES edge.
  */
 export async function getFilesWithExports(): Promise<FileWithExports[]> {
-  const rows = await executeQuery(
-    REPO_ID,
+  const rows = await runRead(
     `
     MATCH (f:File)-[:CodeRelation {type: 'DEFINES'}]->(n)
     WHERE n.isExported = true
@@ -82,6 +140,17 @@ export async function getFilesWithExports(): Promise<FileWithExports[]> {
     MATCH (f:File)-[:CodeRelation {type: 'DEFINES'}]->(c)
           -[mr:CodeRelation]->(n)
     WHERE mr.type IN ['HAS_METHOD', 'HAS_PROPERTY'] AND n.isExported = true
+    RETURN f.filePath AS filePath, n.name AS name, labels(n)[0] AS type
+    ORDER BY filePath
+  `,
+    `
+    MATCH (f:File {repoId: $repoId})-[:DEFINES]->(n {repoId: $repoId})
+    WHERE n.isExported = true
+    RETURN f.filePath AS filePath, n.name AS name, labels(n)[0] AS type
+    UNION
+    MATCH (f:File {repoId: $repoId})-[:DEFINES]->(c {repoId: $repoId})
+          -[mr:HAS_METHOD|HAS_PROPERTY]->(n {repoId: $repoId})
+    WHERE n.isExported = true
     RETURN f.filePath AS filePath, n.name AS name, labels(n)[0] AS type
     ORDER BY filePath
   `,
@@ -108,10 +177,14 @@ export async function getFilesWithExports(): Promise<FileWithExports[]> {
  * Get all files tracked in the graph (including those with no exports).
  */
 export async function getAllFiles(): Promise<string[]> {
-  const rows = await executeQuery(
-    REPO_ID,
+  const rows = await runRead(
     `
     MATCH (f:File)
+    RETURN f.filePath AS filePath
+    ORDER BY f.filePath
+  `,
+    `
+    MATCH (f:File {repoId: $repoId})
     RETURN f.filePath AS filePath
     ORDER BY f.filePath
   `,
@@ -123,10 +196,15 @@ export async function getAllFiles(): Promise<string[]> {
  * Get inter-file call edges (calls between different files).
  */
 export async function getInterFileCallEdges(): Promise<CallEdge[]> {
-  const rows = await executeQuery(
-    REPO_ID,
+  const rows = await runRead(
     `
     MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b)
+    WHERE a.filePath <> b.filePath
+    RETURN DISTINCT a.filePath AS fromFile, a.name AS fromName,
+           b.filePath AS toFile, b.name AS toName
+  `,
+    `
+    MATCH (a {repoId: $repoId})-[:CALLS]->(b {repoId: $repoId})
     WHERE a.filePath <> b.filePath
     RETURN DISTINCT a.filePath AS fromFile, a.name AS fromName,
            b.filePath AS toFile, b.name AS toName
@@ -148,14 +226,20 @@ export async function getIntraModuleCallEdges(filePaths: string[]): Promise<Call
   if (filePaths.length === 0) return [];
 
   const fileList = filePaths.map((f) => `'${escapeCypherString(f)}'`).join(', ');
-  const rows = await executeQuery(
-    REPO_ID,
+  const rows = await runRead(
     `
     MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b)
     WHERE a.filePath IN [${fileList}] AND b.filePath IN [${fileList}]
     RETURN DISTINCT a.filePath AS fromFile, a.name AS fromName,
            b.filePath AS toFile, b.name AS toName
   `,
+    `
+    MATCH (a {repoId: $repoId})-[:CALLS]->(b {repoId: $repoId})
+    WHERE a.filePath IN $filePaths AND b.filePath IN $filePaths
+    RETURN DISTINCT a.filePath AS fromFile, a.name AS fromName,
+           b.filePath AS toFile, b.name AS toName
+  `,
+    { filePaths },
   );
 
   return rows.map((r) => ({
@@ -177,8 +261,7 @@ export async function getInterModuleCallEdges(filePaths: string[]): Promise<{
 
   const fileList = filePaths.map((f) => `'${escapeCypherString(f)}'`).join(', ');
 
-  const outRows = await executeQuery(
-    REPO_ID,
+  const outRows = await runRead(
     `
     MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b)
     WHERE a.filePath IN [${fileList}] AND NOT b.filePath IN [${fileList}]
@@ -186,10 +269,17 @@ export async function getInterModuleCallEdges(filePaths: string[]): Promise<{
            b.filePath AS toFile, b.name AS toName
     LIMIT 30
   `,
+    `
+    MATCH (a {repoId: $repoId})-[:CALLS]->(b {repoId: $repoId})
+    WHERE a.filePath IN $filePaths AND NOT b.filePath IN $filePaths
+    RETURN DISTINCT a.filePath AS fromFile, a.name AS fromName,
+           b.filePath AS toFile, b.name AS toName
+    LIMIT 30
+  `,
+    { filePaths },
   );
 
-  const inRows = await executeQuery(
-    REPO_ID,
+  const inRows = await runRead(
     `
     MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b)
     WHERE NOT a.filePath IN [${fileList}] AND b.filePath IN [${fileList}]
@@ -197,6 +287,14 @@ export async function getInterModuleCallEdges(filePaths: string[]): Promise<{
            b.filePath AS toFile, b.name AS toName
     LIMIT 30
   `,
+    `
+    MATCH (a {repoId: $repoId})-[:CALLS]->(b {repoId: $repoId})
+    WHERE NOT a.filePath IN $filePaths AND b.filePath IN $filePaths
+    RETURN DISTINCT a.filePath AS fromFile, a.name AS fromName,
+           b.filePath AS toFile, b.name AS toName
+    LIMIT 30
+  `,
+    { filePaths },
   );
 
   return {
@@ -225,8 +323,7 @@ export async function getProcessesForFiles(filePaths: string[], limit = 5): Prom
   const fileList = filePaths.map((f) => `'${escapeCypherString(f)}'`).join(', ');
 
   // Find processes that have steps in the given files
-  const procRows = await executeQuery(
-    REPO_ID,
+  const procRows = await runRead(
     `
     MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
     WHERE s.filePath IN [${fileList}]
@@ -235,6 +332,15 @@ export async function getProcessesForFiles(filePaths: string[], limit = 5): Prom
     ORDER BY stepCount DESC
     LIMIT ${limit}
   `,
+    `
+    MATCH (s {repoId: $repoId})-[:STEP_IN_PROCESS]->(p:Process {repoId: $repoId})
+    WHERE s.filePath IN $filePaths
+    RETURN DISTINCT p.id AS id, p.heuristicLabel AS label,
+           p.processType AS type, p.stepCount AS stepCount
+    ORDER BY stepCount DESC
+    LIMIT $limit
+  `,
+    { filePaths, limit },
   );
 
   const processes: ProcessInfo[] = [];
@@ -245,13 +351,18 @@ export async function getProcessesForFiles(filePaths: string[], limit = 5): Prom
     const stepCount = row.stepCount || row[3] || 0;
 
     // Get the full step trace for this process
-    const stepRows = await executeQuery(
-      REPO_ID,
+    const stepRows = await runRead(
       `
       MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${escapeCypherString(procId)}'})
       RETURN s.name AS name, s.filePath AS filePath, labels(s)[0] AS type, r.step AS step
       ORDER BY r.step
     `,
+      `
+      MATCH (s {repoId: $repoId})-[r:STEP_IN_PROCESS]->(p:Process {repoId: $repoId, id: $procId})
+      RETURN s.name AS name, s.filePath AS filePath, labels(s)[0] AS type, r.step AS step
+      ORDER BY r.step
+    `,
+      { procId },
     );
 
     processes.push({
@@ -275,8 +386,7 @@ export async function getProcessesForFiles(filePaths: string[], limit = 5): Prom
  * Get all processes in the graph (for overview page).
  */
 export async function getAllProcesses(limit = 20): Promise<ProcessInfo[]> {
-  const procRows = await executeQuery(
-    REPO_ID,
+  const procRows = await runRead(
     `
     MATCH (p:Process)
     RETURN p.id AS id, p.heuristicLabel AS label,
@@ -284,6 +394,14 @@ export async function getAllProcesses(limit = 20): Promise<ProcessInfo[]> {
     ORDER BY stepCount DESC
     LIMIT ${limit}
   `,
+    `
+    MATCH (p:Process {repoId: $repoId})
+    RETURN p.id AS id, p.heuristicLabel AS label,
+           p.processType AS type, p.stepCount AS stepCount
+    ORDER BY stepCount DESC
+    LIMIT $limit
+  `,
+    { limit },
   );
 
   const processes: ProcessInfo[] = [];
@@ -293,13 +411,18 @@ export async function getAllProcesses(limit = 20): Promise<ProcessInfo[]> {
     const type = row.type || row[2] || 'unknown';
     const stepCount = row.stepCount || row[3] || 0;
 
-    const stepRows = await executeQuery(
-      REPO_ID,
+    const stepRows = await runRead(
       `
       MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${escapeCypherString(procId)}'})
       RETURN s.name AS name, s.filePath AS filePath, labels(s)[0] AS type, r.step AS step
       ORDER BY r.step
     `,
+      `
+      MATCH (s {repoId: $repoId})-[r:STEP_IN_PROCESS]->(p:Process {repoId: $repoId, id: $procId})
+      RETURN s.name AS name, s.filePath AS filePath, labels(s)[0] AS type, r.step AS step
+      ORDER BY r.step
+    `,
+      { procId },
     );
 
     processes.push({

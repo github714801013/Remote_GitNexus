@@ -3,6 +3,7 @@ import path from 'path';
 import { canonicalizePath, loadMeta, type RegistryEntry } from '../storage/repo-manager.js';
 import { WikiGenerator, type WikiOptions } from '../core/wiki/generator.js';
 import { resolveLLMConfig } from '../core/wiki/llm-client.js';
+import { isNeo4jBackendEnabled } from '../core/neo4j/config.js';
 import { logger } from '../core/logger.js';
 
 export type WikiStatus = 'never_generated' | 'queued' | 'running' | 'ready' | 'failed';
@@ -161,6 +162,9 @@ export class WikiQueue {
     let result: 'ready' | 'up-to-date' | undefined;
     try {
       result = await this.run(pending.task);
+      if (result === 'ready' || result === 'up-to-date') {
+        this.markReady(pending.task, (await readWikiMeta(pending.task.storagePath))?.generatedAt);
+      }
       pending.resolve();
     } catch (error) {
       const code = errorCode(error);
@@ -177,9 +181,6 @@ export class WikiQueue {
       });
       pending.reject(error);
     } finally {
-      if (result === 'ready' || result === 'up-to-date') {
-        this.markReady(pending.task, (await readWikiMeta(pending.task.storagePath))?.generatedAt);
-      }
       this.active.delete(pending.task.key);
       this.doneByKey.delete(pending.task.key);
       this.running = false;
@@ -206,12 +207,19 @@ export class WikiQueue {
     await remove(stage);
     await fs.mkdir(stage, { recursive: true });
     try {
+      // 后端分派（Ticket 06）：Neo4j 模式不拼接/传递本地 lbug 路径，改传 repoName；
+      // 本地模式保持原构造参数（storagePath/lbug），既有行为不变。
+      const lbugPath = isNeo4jBackendEnabled() ? '' : path.join(task.storagePath, 'lbug');
       const generator = new WikiGenerator(
         task.repoPath,
         task.storagePath,
-        path.join(task.storagePath, 'lbug'),
+        lbugPath,
         llmConfig,
-        { outputDir: stage, sourceCommit: task.sourceCommit } satisfies WikiOptions,
+        {
+          outputDir: stage,
+          sourceCommit: task.sourceCommit,
+          ...(isNeo4jBackendEnabled() ? { repoName: task.repoName } : {}),
+        } satisfies WikiOptions,
       );
       await generator.run();
       await this.publish(task, stage);
