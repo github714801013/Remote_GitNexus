@@ -1631,7 +1631,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
         const staleness = remoteSync.reset
           ? { isStale: true, commitsBehind: 1 }
-          : checkStaleness(entry.path, entry.lastCommit);
+          : await checkStalenessAsync(entry.path, entry.lastCommit);
 
         if (shouldRunStartupLbugHealthCheck()) {
           try {

@@ -780,7 +780,11 @@ export interface RepoListing {
   lastCommit: string;
   remoteUrl?: string;
   stats?: any;
-  staleness?: { commitsBehind: number; hint?: string };
+  staleness?: {
+    status: StalenessInfo['status'];
+    commitsBehind: number | null;
+    hint?: string;
+  };
   siblings?: Array<{ name: string; path: string; lastCommit: string }>;
   /** Primary/flat branch name, when known (#2106). */
   branch?: string;
@@ -1789,9 +1793,11 @@ export class LocalBackend {
         lastCommit: h.lastCommit,
         remoteUrl: h.remoteUrl,
         stats: h.stats,
-        staleness: stale.isStale
-          ? { commitsBehind: stale.commitsBehind, hint: stale.hint }
-          : undefined,
+        staleness: {
+          status: stale.status,
+          commitsBehind: stale.commitsBehind,
+          ...(stale.hint ? { hint: stale.hint } : {}),
+        },
         siblings:
           siblings.length > 0
             ? siblings.map((s) => ({

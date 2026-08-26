@@ -338,7 +338,10 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
 
   const lines: string[] = [`project: ${context.projectName}`];
 
-  if (staleness.isStale && staleness.hint) {
+  if (staleness.status === 'unknown') {
+    lines.push('');
+    lines.push('staleness: "unknown — unable to compare indexed commit with checkout"');
+  } else if (staleness.isStale && staleness.hint) {
     lines.push('');
     lines.push(`staleness: "${staleness.hint}"`);
   }
