@@ -41,8 +41,11 @@ export interface WikiLifecycle {
 }
 
 const WIKI_DIR = 'wiki';
-const publishTempDir = (storagePath: string): string => path.join(storagePath, '.wiki-staging');
+const STAGING_DIR = '.wiki-staging';
+const PREVIOUS_DIR = '.wiki-previous';
+const publishTempDir = (storagePath: string): string => path.join(storagePath, STAGING_DIR);
 const currentWikiDir = (storagePath: string): string => path.join(storagePath, WIKI_DIR);
+const previousWikiDir = (storagePath: string): string => path.join(storagePath, PREVIOUS_DIR);
 
 const isCommit = (value: string): boolean => /^[0-9a-f]{40}$/i.test(value);
 
@@ -128,6 +131,7 @@ export class WikiQueue {
     const repoIdentity = canonicalizePath(path.resolve(entry.path));
     const tracked = this.lifecycleByIdentity.get(repoIdentity);
     if (tracked) return tracked;
+    await this.restorePreviousWiki(entry.storagePath);
     const meta = await readWikiMeta(entry.storagePath);
     const ready = meta?.fromCommit === entry.lastCommit;
     return {
@@ -229,9 +233,8 @@ export class WikiQueue {
     }
 
     const live = currentWikiDir(task.storagePath);
-    const parent = path.dirname(live);
-    const previous = path.join(parent, '.wiki-previous');
-    await fs.mkdir(parent, { recursive: true });
+    const previous = previousWikiDir(task.storagePath);
+    await fs.mkdir(path.dirname(live), { recursive: true });
     await remove(previous);
     try {
       await fs.rename(live, previous);
@@ -245,6 +248,16 @@ export class WikiQueue {
       throw error;
     }
     await remove(previous);
+  }
+
+  private async restorePreviousWiki(storagePath: string): Promise<void> {
+    const live = currentWikiDir(storagePath);
+    const previous = previousWikiDir(storagePath);
+    try {
+      await fs.access(live);
+    } catch {
+      await fs.rename(previous, live).catch(() => {});
+    }
   }
 
   private markReady(task: WikiTask, generatedAt?: string): void {

@@ -119,7 +119,7 @@ describe('checkStalenessAsync', () => {
     expect(result.status).toBe('unknown');
     expect(result.isStale).toBe(false);
     expect(result.commitsBehind).toBeNull();
-    expect(result.reason).toBe('checkout_unavailable');
+    expect(result.reason).toBe('indexed_commit_unreachable');
   });
 
   it('returns unknown with an invalid commit hash', async () => {

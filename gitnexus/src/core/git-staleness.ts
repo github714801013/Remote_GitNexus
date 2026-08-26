@@ -171,6 +171,11 @@ export function checkStaleness(repoPath: string, lastCommit: string): StalenessI
   const checkout = inspectCheckout(repoPath);
   if (!checkout.checkoutCommit) return unknownStaleness(lastCommit, 'checkout_unavailable', checkout);
   try {
+    execFileSync('git', ['merge-base', '--is-ancestor', lastCommit, 'HEAD'], {
+      cwd: repoPath,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
     const result = execFileSync('git', ['rev-list', '--count', `${lastCommit}..HEAD`], {
       cwd: repoPath,
       encoding: 'utf-8',
@@ -199,7 +204,7 @@ export async function checkStalenessAsync(
   lastCommit: string,
 ): Promise<StalenessInfo> {
   try {
-    const [head, branch, upstream, count] = await Promise.all([
+    const [head, branch, upstream] = await Promise.all([
       execFileAsync('git', ['rev-parse', 'HEAD'], {
         cwd: repoPath,
         encoding: 'utf-8',
@@ -215,11 +220,6 @@ export async function checkStalenessAsync(
         encoding: 'utf-8',
         windowsHide: true,
       }).catch(() => ({ stdout: '' })),
-      execFileAsync('git', ['rev-list', '--count', `${lastCommit}..HEAD`], {
-        cwd: repoPath,
-        encoding: 'utf-8',
-        windowsHide: true,
-      }),
     ]);
     const checkoutCommit = head.stdout.trim();
     const checkout = {
@@ -227,8 +227,19 @@ export async function checkStalenessAsync(
       ...(branch.stdout.trim() ? { branch: branch.stdout.trim() } : {}),
       ...(upstream.stdout.trim() ? { upstreamRef: upstream.stdout.trim() } : {}),
     };
-    const commitsBehind = Number.parseInt(count.stdout.trim(), 10);
     if (!checkoutCommit) return unknownStaleness(lastCommit, 'checkout_unavailable', checkout);
+
+    await execFileAsync('git', ['merge-base', '--is-ancestor', lastCommit, 'HEAD'], {
+      cwd: repoPath,
+      encoding: 'utf-8',
+      windowsHide: true,
+    });
+    const count = await execFileAsync('git', ['rev-list', '--count', `${lastCommit}..HEAD`], {
+      cwd: repoPath,
+      encoding: 'utf-8',
+      windowsHide: true,
+    });
+    const commitsBehind = Number.parseInt(count.stdout.trim(), 10);
     if (!Number.isFinite(commitsBehind) || commitsBehind < 0) {
       return unknownStaleness(lastCommit, 'unknown', checkout);
     }
@@ -238,7 +249,7 @@ export async function checkStalenessAsync(
       commitsBehind,
     );
   } catch {
-    return unknownStaleness(lastCommit, 'checkout_unavailable');
+    return unknownStaleness(lastCommit, 'indexed_commit_unreachable');
   }
 }
 
