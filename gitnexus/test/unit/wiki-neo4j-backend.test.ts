@@ -215,8 +215,9 @@ describe('wiki graph-queries 双后端分派', () => {
       expect(mocks.executeReadCypher.mock.calls[0][1]).toMatchObject({
         repoId: 'repo-a',
         filePaths: ['a.ts'],
-        limit: 5,
       });
+      // LIMIT 参数必须是 Neo4j Integer(回归:浮点 5.0 会被 Neo4j 拒绝)
+      expect(mocks.executeReadCypher.mock.calls[0][1].limit.toNumber()).toBe(5);
       expect(mocks.executeReadCypher.mock.calls[1][1]).toMatchObject({ repoId: 'repo-a', procId: 'p1' });
     });
 
@@ -244,7 +245,9 @@ describe('wiki graph-queries 双后端分派', () => {
         { step: 1, name: 'one', filePath: 'x.ts', type: 'Function' },
         { step: 2, name: 'two', filePath: 'y.ts', type: 'Method' },
       ]);
-      expect(mocks.executeReadCypher.mock.calls[0][1]).toMatchObject({ repoId: 'repo-a', limit: 20 });
+      expect(mocks.executeReadCypher.mock.calls[0][1]).toMatchObject({ repoId: 'repo-a' });
+      // LIMIT 参数必须是 Neo4j Integer(回归:浮点 20.0 会被 Neo4j 拒绝)
+      expect(mocks.executeReadCypher.mock.calls[0][1].limit.toNumber()).toBe(20);
       expect(mocks.executeReadCypher.mock.calls[1][1]).toMatchObject({ repoId: 'repo-a', procId: 'p2' });
     });
   });

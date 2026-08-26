@@ -5,6 +5,7 @@
  * Uses the MCP-style pooled lbug-adapter for connection management.
  */
 
+import neo4j from 'neo4j-driver';
 import { initLbug, executeQuery, closeLbug, touchRepo, pinRepo } from '../lbug/pool-adapter.js';
 import { escapeCypherString } from '../lbug/cypher-escape.js';
 import { isNeo4jBackendEnabled } from '../neo4j/config.js';
@@ -340,7 +341,7 @@ export async function getProcessesForFiles(filePaths: string[], limit = 5): Prom
     ORDER BY stepCount DESC
     LIMIT $limit
   `,
-    { filePaths, limit },
+    { filePaths, limit: neo4j.int(limit) },
   );
 
   const processes: ProcessInfo[] = [];
@@ -401,7 +402,7 @@ export async function getAllProcesses(limit = 20): Promise<ProcessInfo[]> {
     ORDER BY stepCount DESC
     LIMIT $limit
   `,
-    { limit },
+    { limit: neo4j.int(limit) },
   );
 
   const processes: ProcessInfo[] = [];
