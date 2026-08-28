@@ -7,9 +7,11 @@ import type { LocalBackend } from '../../src/mcp/local/local-backend.js';
 const READ_ONLY_TOOLS = [
   'api_impact',
   'check',
+  'code_snippet',
   'context',
   'detect_changes',
   'explain',
+  'git_author_trace',
   'impact',
   'list_repos',
   'pdg_query',

@@ -16,6 +16,8 @@ export const MCP_READ_ONLY_TOOLS = new Set([
   'shape_check',
   'api_impact',
   'trace',
+  'code_snippet',
+  'git_author_trace',
 ]);
 
 const MCP_READ_ONLY_ALIASES = new Set(['search', 'explore', 'overview']);
