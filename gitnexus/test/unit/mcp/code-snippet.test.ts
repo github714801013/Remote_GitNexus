@@ -3,11 +3,15 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 
-const { repoManagerMocks } = vi.hoisted(() => ({
+const { repoManagerMocks, neo4jMocks } = vi.hoisted(() => ({
   repoManagerMocks: {
     listRegisteredRepos: vi.fn(),
     cleanupOldKuzuFiles: vi.fn().mockResolvedValue({ found: false, needsReindex: false }),
     loadMeta: vi.fn().mockResolvedValue(undefined),
+  },
+  neo4jMocks: {
+    isNeo4jBackendEnabled: vi.fn().mockReturnValue(false),
+    executeReadCypher: vi.fn().mockResolvedValue([]),
   },
 }));
 
@@ -16,6 +20,14 @@ vi.mock('@ladybugdb/core', () => ({
 }));
 
 vi.mock('../../../src/storage/repo-manager.js', () => repoManagerMocks);
+
+vi.mock('../../../src/core/neo4j/config.js', () => ({
+  isNeo4jBackendEnabled: neo4jMocks.isNeo4jBackendEnabled,
+}));
+
+vi.mock('../../../src/core/neo4j/read-adapter.js', () => ({
+  executeReadCypher: neo4jMocks.executeReadCypher,
+}));
 
 vi.mock('../../../src/core/lbug/pool-adapter.js', () => ({
   initLbug: vi.fn().mockResolvedValue(undefined),
@@ -63,7 +75,12 @@ describe('LocalBackend code_snippet tool', () => {
     ]);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    const { executeParameterized } = await import('../../../src/core/lbug/pool-adapter.js');
+    (executeParameterized as unknown as ReturnType<typeof vi.fn>).mockReset();
+    (executeParameterized as unknown as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    neo4jMocks.executeReadCypher.mockReset();
+    neo4jMocks.executeReadCypher.mockResolvedValue([]);
     vi.restoreAllMocks();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -116,5 +133,104 @@ describe('LocalBackend code_snippet tool', () => {
         endLine: 1000,
       }),
     ).rejects.toThrow(/line range/i);
+  });
+
+  it('explains a missing file that the index still lists (stale index)', async () => {
+    const { executeParameterized } = await import('../../../src/core/lbug/pool-adapter.js');
+    (executeParameterized as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { found: 1 },
+    ]);
+    const backend = new LocalBackend();
+
+    await expect(
+      backend.callTool('code_snippet', {
+        repo: 'sample',
+        filePath: 'src/moved-away.ts',
+        startLine: 1,
+        endLine: 1,
+      }),
+    ).rejects.toThrow(/index may be stale/i);
+  });
+
+  it('never leaks a raw ENOENT when the path is not part of the repository', async () => {
+    const backend = new LocalBackend();
+
+    const error = await backend
+      .callTool('code_snippet', {
+        repo: 'sample',
+        filePath: 'src/only-in-another-repo.ts',
+        startLine: 1,
+        endLine: 1,
+      })
+      .catch((err: unknown) => err as Error);
+
+    expect(error.message).not.toMatch(/ENOENT/);
+    expect(error.message).toMatch(/not present on disk in repository "sample"/i);
+    expect(error.message).toMatch(/not listed in its index/i);
+    expect(error.message).toMatch(/context\/query results/i);
+  });
+
+  it('never leaks a raw ENOENT when the index lookup itself fails', async () => {
+    const { executeParameterized } = await import('../../../src/core/lbug/pool-adapter.js');
+    (executeParameterized as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('LadybugDB not initialized'),
+    );
+    const backend = new LocalBackend();
+
+    const error = await backend
+      .callTool('code_snippet', {
+        repo: 'sample',
+        filePath: 'src/gone.ts',
+        startLine: 1,
+        endLine: 1,
+      })
+      .catch((err: unknown) => err as Error);
+
+    expect(error.message).not.toMatch(/ENOENT/);
+    expect(error.message).toMatch(/context\/query results/i);
+  });
+
+  describe('Neo4j backend', () => {
+    beforeEach(() => {
+      neo4jMocks.isNeo4jBackendEnabled.mockReturnValue(true);
+    });
+
+    afterEach(() => {
+      neo4jMocks.isNeo4jBackendEnabled.mockReturnValue(false);
+    });
+
+    it('points at the repositories that really index the path', async () => {
+      neo4jMocks.executeReadCypher.mockResolvedValueOnce([
+        { repoId: 'oanew' },
+        { repoId: 'dev-oanew' },
+      ]);
+      const backend = new LocalBackend();
+
+      const error = await backend
+        .callTool('code_snippet', {
+          repo: 'sample',
+          filePath: 'printerServices/Task/Impl/AreaTransfer.cs',
+          startLine: 1,
+          endLine: 1,
+        })
+        .catch((err: unknown) => err as Error);
+
+      expect(error.message).toMatch(/indexed in: oanew, dev-oanew/i);
+      expect(error.message).toMatch(/check the "repo" argument/i);
+    });
+
+    it('reports a stale index when this repository still lists the file', async () => {
+      neo4jMocks.executeReadCypher.mockResolvedValueOnce([{ repoId: 'sample' }]);
+      const backend = new LocalBackend();
+
+      await expect(
+        backend.callTool('code_snippet', {
+          repo: 'sample',
+          filePath: 'src/moved-away.ts',
+          startLine: 1,
+          endLine: 1,
+        }),
+      ).rejects.toThrow(/index may be stale/i);
+    });
   });
 });

@@ -2710,7 +2710,13 @@ export class LocalBackend {
     }
     const contextLines = Math.max(0, Math.min(50, Math.trunc(Number(params?.contextLines ?? 0))));
     const fullPath = this.resolveSourcePath(repo, filePath);
-    const content = await fs.readFile(fullPath, 'utf-8');
+    let content: string;
+    try {
+      content = await fs.readFile(fullPath, 'utf-8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+      throw new Error(await this.describeMissingSnippetFile(repo, fullPath));
+    }
     const lines = content.split(/\r?\n/);
     const from = Math.max(1, startLine - contextLines);
     const to = Math.min(lines.length, endLine + contextLines);
@@ -2729,6 +2735,43 @@ export class LocalBackend {
       content: contentLines.join('\n'),
       snippet,
     };
+  }
+
+  /**
+   * Explain a code_snippet ENOENT instead of leaking the raw filesystem error:
+   * the path either belongs to another indexed repository (the caller mixed
+   * repositories up) or this repository's index predates a move/delete.
+   */
+  private async describeMissingSnippetFile(repo: RepoHandle, fullPath: string): Promise<string> {
+    const rel = path.relative(repo.repoPath, fullPath).replace(/\\/g, '/');
+    const base = `File "${rel}" is not present on disk in repository "${repo.name}"`;
+    const stale = `${base}, but its index still lists this file; the index may be stale (file moved or deleted after indexing). Re-run indexing for "${repo.name}".`;
+    const fallback = `${base}. Verify the path comes from this repository's own context/query results.`;
+    try {
+      if (isNeo4jBackendEnabled()) {
+        const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+        const rows = await executeReadCypher(
+          'MATCH (f:File {filePath: $filePath}) RETURN DISTINCT f.repoId AS repoId LIMIT 50',
+          { filePath: rel },
+        );
+        const owners = rows.map((row) => String(row.repoId ?? row[0] ?? '')).filter(Boolean);
+        if (owners.includes(repo.name)) return stale;
+        const others = owners.filter((name) => name !== repo.name);
+        if (others.length > 0) {
+          return `${base}. This path is indexed in: ${others.join(', ')} — check the "repo" argument.`;
+        }
+        return `${base} and it is not listed in any repository's index. Verify the path comes from this repository's own context/query results.`;
+      }
+      const rows = await executeParameterized(
+        repo.lbugPath,
+        'MATCH (f:File) WHERE f.filePath = $filePath RETURN 1 AS found LIMIT 1',
+        { filePath: rel },
+      );
+      if (rows.length > 0) return stale;
+      return `${base} and it is not listed in its index. Verify the path comes from this repository's own context/query results.`;
+    } catch {
+      return fallback;
+    }
   }
 
   private async gitAuthorTrace(
