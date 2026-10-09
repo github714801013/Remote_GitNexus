@@ -249,6 +249,33 @@ export function createStreamableHttpHandler(
   const cleanupTimer = startIdleSweep(sessions, SESSION_TTL_MS, CLEANUP_INTERVAL_MS);
 
   const handler = async (req: Request, res: Response): Promise<void> => {
+    // MCP clients that only parse JSON (e.g. a Go executor) may omit
+    // text/event-stream from Accept, and some send `*/*`; the SDK's POST
+    // validation still requires both media types, even in JSON response mode.
+    // Normalize here so every client style works. Hono's node server adapter
+    // rebuilds the Web headers from `rawHeaders`, so that array has to be
+    // updated alongside `headers`.
+    if (req.method === 'POST') {
+      const accept = String(req.headers.accept ?? '');
+      const missing = ['application/json', 'text/event-stream'].filter(
+        (type) => !accept.includes(type),
+      );
+      if (missing.length > 0) {
+        const merged = accept ? `${accept}, ${missing.join(', ')}` : missing.join(', ');
+        req.headers.accept = merged;
+        const raw = req.rawHeaders;
+        if (Array.isArray(raw)) {
+          let replaced = false;
+          for (let i = 0; i < raw.length; i += 2) {
+            if (String(raw[i]).toLowerCase() === 'accept' && !replaced) {
+              raw[i + 1] = merged;
+              replaced = true;
+            }
+          }
+          if (!replaced) raw.push('Accept', merged);
+        }
+      }
+    }
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
     if (sessionId && sessions.has(sessionId)) {
@@ -304,6 +331,9 @@ export function createStreamableHttpHandler(
       });
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
+        // Answer POST requests with a single JSON body instead of an SSE stream:
+        // JSON-only clients (e.g. the AutoWonder executor) cannot parse SSE.
+        enableJsonResponse: true,
         ...dnsRebinding,
       });
       const server = opts.createServer

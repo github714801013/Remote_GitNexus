@@ -76,13 +76,6 @@ function request(
   });
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
-  const start = Date.now();
-  while (!predicate() && Date.now() - start < timeoutMs) {
-    await new Promise((r) => setTimeout(r, 10));
-  }
-}
-
 /** A schema-complete JSON-RPC initialize request (passes the SDK isInitializeRequest). */
 function validInitialize(id = 1): Record<string, unknown> {
   return {
@@ -541,7 +534,7 @@ describe('createStreamableHttpHandler', () => {
     await cleanup();
   });
 
-  it('U1: closes the orphaned Server when the SDK rejects an initialize before a session id', async () => {
+  it('U1: accepts a JSON-only Accept header (no SSE) and answers with JSON', async () => {
     const backend = createMockBackend();
     let closed = 0;
     // Inject createServer so we can observe the per-session Server's close().
@@ -562,8 +555,9 @@ describe('createStreamableHttpHandler', () => {
     app.all('/mcp', (req, res) => void handler(req, res).catch(() => {}));
     const { port, close } = await listen(app);
 
-    // POST initialize but with Accept: application/json ONLY (no text/event-stream):
-    // the SDK returns 406 BEFORE assigning transport.sessionId, exercising the orphan path.
+    // A JSON-only client (e.g. the AutoWonder Go executor) omits text/event-stream:
+    // the handler normalizes Accept, and enableJsonResponse answers with a JSON body
+    // instead of an SSE stream.
     const res = await request(
       port,
       'POST',
@@ -572,9 +566,61 @@ describe('createStreamableHttpHandler', () => {
       JSON.stringify(validInitialize()),
     );
 
-    expect(res.status).toBe(406);
-    await waitFor(() => closed > 0);
-    expect(closed).toBeGreaterThan(0); // the connected Server was closed, not leaked
+    expect(res.status).toBe(200);
+    expect(String(res.headers['content-type'] ?? '')).toMatch(/application\/json/);
+    expect(typeof res.headers['mcp-session-id']).toBe('string');
+    expect(JSON.parse(res.body)).toMatchObject({ jsonrpc: '2.0', id: 1 });
+    expect(closed).toBe(0); // session established; the Server is kept alive
+
+    await close();
+    await cleanup();
+  });
+
+  it('U12: accepts a wildcard Accept header (curl default) and answers with JSON', async () => {
+    const backend = createMockBackend();
+    const { handler, cleanup } = createStreamableHttpHandler(backend as never);
+    const app = express();
+    app.use(express.json());
+    app.all('/mcp', (req, res) => void handler(req, res).catch(() => {}));
+    const { port, close } = await listen(app);
+
+    const res = await request(
+      port,
+      'POST',
+      '/mcp',
+      { 'Content-Type': 'application/json', Accept: '*/*' },
+      JSON.stringify(validInitialize()),
+    );
+
+    expect(res.status).toBe(200);
+    expect(String(res.headers['content-type'] ?? '')).toMatch(/^application\/json/);
+
+    await close();
+    await cleanup();
+  });
+
+  it('U11: POST initialize answers application/json for standard MCP clients too', async () => {
+    const backend = createMockBackend();
+    const { handler, cleanup } = createStreamableHttpHandler(backend as never);
+    const app = express();
+    app.use(express.json());
+    app.all('/mcp', (req, res) => void handler(req, res).catch(() => {}));
+    const { port, close } = await listen(app);
+
+    const res = await request(
+      port,
+      'POST',
+      '/mcp',
+      {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+      },
+      JSON.stringify(validInitialize()),
+    );
+
+    expect(res.status).toBe(200);
+    expect(String(res.headers['content-type'] ?? '')).toMatch(/^application\/json/);
+    expect(JSON.parse(res.body)).toMatchObject({ jsonrpc: '2.0', id: 1 });
 
     await close();
     await cleanup();
