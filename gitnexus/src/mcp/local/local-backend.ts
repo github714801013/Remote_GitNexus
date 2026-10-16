@@ -600,11 +600,15 @@ interface RepoHandle {
   branches?: BranchSummary[];
 }
 
-/** Git `--name-status` letter → the `change_type` repo_changes reports. */
+/**
+ * Git `--name-status` letter → the `change_type` repo_changes reports. `T`
+ * (file ↔ symlink/submodule) is a content change with no better fit.
+ */
 const REPO_CHANGES_TYPES: Record<string, string> = {
   A: 'added',
   M: 'modified',
   D: 'deleted',
+  T: 'modified',
 };
 
 /** Hard cap on the returned change list; callers treat a truncated list as "re-read". */
@@ -2832,8 +2836,9 @@ export class LocalBackend {
     };
 
     // Only a commit hash is understood — ISO times, tags and branch names have
-    // no single obvious meaning as a baseline here.
-    if (!/^[0-9a-f]{7,64}$/i.test(since)) {
+    // no single obvious meaning as a baseline here. Four is git's own shortest
+    // unambiguous abbreviation.
+    if (!/^[0-9a-f]{4,64}$/i.test(since)) {
       return unknownAnswer('query_failed', `since must be a commit hash; got "${since}"`);
     }
 
@@ -2868,15 +2873,23 @@ export class LocalBackend {
     // Per commit, oldest first, so a path's entry ends up describing its LAST
     // operation in the window — a file changed and later reverted still shows.
     // --no-renames keeps renames as a plain delete + add, which needs no special
-    // path handling.
+    // path handling. --diff-merges=first-parent is required for a merge to
+    // report its own changes at all (the default prints none), which is where a
+    // conflict resolution's edits live.
     let output: string;
     try {
       output = execFileSync(
         'git',
         [
+          // Paths must come back as written: git's default quoting octal-escapes
+          // every non-ASCII path, which would match neither the caller's own
+          // `paths` filter nor a readable file name.
+          '-c',
+          'core.quotePath=false',
           'log',
           '--reverse',
           '--no-renames',
+          '--diff-merges=first-parent',
           '--name-status',
           '--format=@%H',
           `${since}..${currentCommit}`,
@@ -2891,8 +2904,12 @@ export class LocalBackend {
     }
 
     // Path-scope match is on segment boundaries: `src/nested` covers its own
-    // files but never the sibling directory `src/nestedOther`.
-    const scopes = (params.paths ?? []).map((entry) => String(entry).replace(/\/+$/, ''));
+    // files but never the sibling directory `src/nestedOther`. A `paths` that is
+    // not a list is treated as no scope — over-reporting beats a false "no
+    // changes".
+    const scopes = (Array.isArray(params.paths) ? params.paths : []).map((entry) =>
+      String(entry).replace(/\/+$/, ''),
+    );
     const inScope = (filePath: string): boolean =>
       scopes.length === 0 || scopes.some((s) => filePath === s || filePath.startsWith(`${s}/`));
 

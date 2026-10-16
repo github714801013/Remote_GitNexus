@@ -307,6 +307,35 @@ describe('LocalBackend repo_changes tool', () => {
     expect(failed.message).toMatch(/git/i);
   });
 
+  it('treats a non-array paths argument as no scope rather than failing', async () => {
+    const backend = new LocalBackend();
+
+    const out = await backend.callTool('repo_changes', {
+      repo: 'sample',
+      branch: BRANCH,
+      since: baseCommit,
+      paths: 'src/nested' as unknown as string[],
+    });
+
+    // Over-reporting is the safe direction: an unusable scope must not shrink
+    // the answer to "no changes".
+    expect(out.state).toBe('ok');
+    expect(out.files).toHaveLength(9);
+  });
+
+  it('accepts an unambiguous short commit hash as the baseline', async () => {
+    const backend = new LocalBackend();
+
+    const out = await backend.callTool('repo_changes', {
+      repo: 'sample',
+      branch: BRANCH,
+      since: baseCommit.slice(0, 6),
+    });
+
+    expect(out.state).toBe('ok');
+    expect(out.files).toHaveLength(9);
+  });
+
   it('answers against the indexed version even when the branch has moved ahead of it', async () => {
     // The index still points at `outsideOnlyCommit`; the branch tip is newer.
     repoManagerMocks.loadMeta.mockResolvedValue({
@@ -332,6 +361,140 @@ describe('LocalBackend repo_changes tool', () => {
       path: 'src/nestedOther/outside.ts',
       change_type: 'modified',
     });
+  });
+});
+
+describe('LocalBackend repo_changes non-ASCII paths', () => {
+  const UTF8_REPO = 'utf8';
+  const UTF8_PATH = 'src/中文模块.ts';
+  let tmpDir: string;
+  let repoPath: string;
+  let baseCommit: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-repo-changes-utf8-'));
+    repoPath = path.join(tmpDir, 'repo');
+    fs.mkdirSync(repoPath, { recursive: true });
+    git(['init', '-b', BRANCH], repoPath);
+
+    writeFile(repoPath, UTF8_PATH, 'export const a = 1;\n');
+    baseCommit = commit(repoPath, 'base');
+
+    writeFile(repoPath, UTF8_PATH, 'export const a = 2;\n');
+    const indexedCommit = commit(repoPath, 'change');
+
+    repoManagerMocks.listRegisteredRepos.mockResolvedValue([
+      {
+        name: UTF8_REPO,
+        path: repoPath,
+        storagePath: path.join(tmpDir, 'storage'),
+        indexedAt: INDEXED_AT,
+        lastCommit: indexedCommit,
+        stats: { files: 1, nodes: 1, communities: 0, processes: 0 },
+      },
+    ]);
+    repoManagerMocks.loadMeta.mockResolvedValue({
+      branch: BRANCH,
+      indexedAt: INDEXED_AT,
+      lastCommit: indexedCommit,
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('reports non-ASCII paths in the form the caller can filter by', async () => {
+    const backend = new LocalBackend();
+
+    const unscoped = await backend.callTool('repo_changes', {
+      repo: UTF8_REPO,
+      branch: BRANCH,
+      since: baseCommit,
+    });
+    expect(unscoped.files).toEqual([{ path: UTF8_PATH, change_type: 'modified' }]);
+
+    const scoped = await backend.callTool('repo_changes', {
+      repo: UTF8_REPO,
+      branch: BRANCH,
+      since: baseCommit,
+      paths: [UTF8_PATH],
+    });
+    expect(scoped.files).toEqual([{ path: UTF8_PATH, change_type: 'modified' }]);
+  });
+});
+
+describe('LocalBackend repo_changes merge commits', () => {
+  const MERGE_REPO = 'merge';
+  let tmpDir: string;
+  let repoPath: string;
+  let baseCommit: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-repo-changes-merge-'));
+    repoPath = path.join(tmpDir, 'repo');
+    fs.mkdirSync(repoPath, { recursive: true });
+    git(['init', '-b', BRANCH], repoPath);
+
+    writeFile(repoPath, 'src/conflict.ts', 'a\nb\n');
+    writeFile(repoPath, 'src/mergeOnly.ts', 'export const m = 1;\n');
+    baseCommit = commit(repoPath, 'base');
+
+    git(['checkout', '-q', '-b', 'side'], repoPath);
+    writeFile(repoPath, 'src/conflict.ts', 'side-a\nb\n');
+    commit(repoPath, 'side change');
+
+    git(['checkout', '-q', BRANCH], repoPath);
+    writeFile(repoPath, 'src/conflict.ts', 'a\nmain-b\n');
+    commit(repoPath, 'main change');
+
+    // A conflicting merge whose resolution also edits a file neither parent
+    // touched — that edit exists only in the merge commit itself.
+    try {
+      git(['merge', 'side'], repoPath);
+    } catch {
+      // Expected: the merge conflicts and stops.
+    }
+    writeFile(repoPath, 'src/conflict.ts', 'resolved\n');
+    writeFile(repoPath, 'src/mergeOnly.ts', 'export const m = 2;\n');
+    const indexedCommit = commit(repoPath, 'merge side');
+
+    repoManagerMocks.listRegisteredRepos.mockResolvedValue([
+      {
+        name: MERGE_REPO,
+        path: repoPath,
+        storagePath: path.join(tmpDir, 'storage'),
+        indexedAt: INDEXED_AT,
+        lastCommit: indexedCommit,
+        stats: { files: 2, nodes: 2, communities: 0, processes: 0 },
+      },
+    ]);
+    repoManagerMocks.loadMeta.mockResolvedValue({
+      branch: BRANCH,
+      indexedAt: INDEXED_AT,
+      lastCommit: indexedCommit,
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('counts what a merge commit changed relative to its first parent', async () => {
+    const backend = new LocalBackend();
+
+    const out = await backend.callTool('repo_changes', {
+      repo: MERGE_REPO,
+      branch: BRANCH,
+      since: baseCommit,
+    });
+
+    expect(out.state).toBe('ok');
+    expect(out.files).toContainEqual({ path: 'src/conflict.ts', change_type: 'modified' });
+    // Only reachable through the merge commit's own diff.
+    expect(out.files).toContainEqual({ path: 'src/mergeOnly.ts', change_type: 'modified' });
   });
 });
 
