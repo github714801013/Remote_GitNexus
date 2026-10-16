@@ -960,6 +960,39 @@ WHEN TO USE: After code location is known, identify who last changed the lines a
       required: ['filePath', 'startLine'],
     },
   },
+  {
+    name: 'repo_changes',
+    description: `List the files changed between a caller-recorded baseline commit and a branch's indexed version.
+
+WHEN TO USE: Before reusing a cached understanding of a module, to learn whether the files it was built from have changed since — and what kind of change each one saw.
+
+The answer is computed from the local Git history, so a file that was modified and later reverted still counts as changed. Pass the \`current_commit\` recorded earlier as \`since\`, and the files the cached understanding depends on as \`paths\`. The end point is the branch's INDEXED version, not its live tip: read \`index_freshness\` to judge how old the answer is.
+
+Returns: \`state\` (ok/unknown), \`current_commit\`, \`index_freshness\`, \`files\` (path + change_type), \`truncated\`. \`state=ok\` with an empty \`files\` array means nothing changed; \`state=unknown\` carries a \`reason\` and OMITS \`files\` — never read that as "no changes".`,
+    annotations: READ_ONLY_TOOL_ANNOTATIONS,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'Repository name or path.' },
+        branch: {
+          type: 'string',
+          description: 'Branch whose indexed version is the end point of the query.',
+        },
+        since: {
+          type: 'string',
+          description:
+            'Baseline commit hash (full, or a short hash Git resolves unambiguously). ISO times, tags and branch names are not accepted.',
+        },
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Optional file or directory prefixes of interest, matched on path-segment boundaries. Omit for the whole repository.',
+        },
+      },
+      required: ['repo', 'branch', 'since'],
+    },
+  },
 ];
 
 /**

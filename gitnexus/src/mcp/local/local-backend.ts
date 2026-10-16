@@ -600,6 +600,16 @@ interface RepoHandle {
   branches?: BranchSummary[];
 }
 
+/** Git `--name-status` letter → the `change_type` repo_changes reports. */
+const REPO_CHANGES_TYPES: Record<string, string> = {
+  A: 'added',
+  M: 'modified',
+  D: 'deleted',
+};
+
+/** Hard cap on the returned change list; callers treat a truncated list as "re-read". */
+const REPO_CHANGES_MAX_FILES = 1000;
+
 /** Resolve symlinks for path comparison; falls back to path.resolve on error.
  * Uses `realpathSync.native` (not the pure-JS `realpathSync`) so that Windows
  * 8.3 short names (e.g. RUNNER~1 → runneradmin) are expanded to long form,
@@ -2619,10 +2629,24 @@ export class LocalBackend {
       );
       return this.mergeQueryResults(results);
     }
-    const repo = await this.resolveRepo(
-      p.repo as string | undefined,
-      p.branch as string | undefined,
-    );
+    let repo: RepoHandle;
+    try {
+      repo = await this.resolveRepo(p.repo as string | undefined, p.branch as string | undefined);
+    } catch (error) {
+      // repo_changes answers "unknown" instead of failing the call: a caller
+      // that cached against an unindexed branch must be able to tell that apart
+      // from "nothing changed".
+      if (method === 'repo_changes') {
+        return {
+          state: 'unknown',
+          reason: 'repo_not_indexed',
+          current_commit: null,
+          index_freshness: null,
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
+      throw error;
+    }
 
     switch (method) {
       case 'query': {
@@ -2676,6 +2700,8 @@ export class LocalBackend {
         return this.codeSnippet(repo, p);
       case 'git_author_trace':
         return this.gitAuthorTrace(repo, p);
+      case 'repo_changes':
+        return this.repoChanges(repo, p);
       default:
         throw new Error(`Unknown tool: ${method}`);
     }
@@ -2772,6 +2798,128 @@ export class LocalBackend {
     } catch {
       return fallback;
     }
+  }
+
+  /**
+   * Repo changes — files changed between a caller-recorded baseline commit and
+   * this branch's indexed version, read from the local Git history. The end
+   * point is deliberately the indexed commit, not the branch's live tip.
+   */
+  private async repoChanges(
+    repo: RepoHandle,
+    params: { since?: string; paths?: string[] },
+  ): Promise<any> {
+    const since = String(params.since ?? '').trim();
+    const currentCommit = repo.lastCommit;
+    const { execFileSync, spawnSync } = await import('child_process');
+
+    // Baseline-rebuilding fields, present on every answer (null only when there
+    // is no index to report). `files` is deliberately NOT part of this base: an
+    // unknown answer must carry no change list for a caller to misread.
+    const unknownAnswer = (reason: string, message: string) => ({
+      current_commit: currentCommit,
+      index_freshness: repo.indexedAt,
+      state: 'unknown',
+      reason,
+      message,
+    });
+
+    const gitOptions = {
+      cwd: repo.repoPath,
+      encoding: 'utf-8' as const,
+      windowsHide: true,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    };
+
+    // Only a commit hash is understood — ISO times, tags and branch names have
+    // no single obvious meaning as a baseline here.
+    if (!/^[0-9a-f]{7,64}$/i.test(since)) {
+      return unknownAnswer('query_failed', `since must be a commit hash; got "${since}"`);
+    }
+
+    // Exit code 1 means "both commits exist, but unrelated" — a baseline from
+    // another line of history is not one we can diff against.
+    const ancestry = spawnSync(
+      'git',
+      ['merge-base', '--is-ancestor', since, currentCommit],
+      gitOptions,
+    );
+    if (ancestry.status === 1) {
+      return unknownAnswer(
+        'baseline_not_found',
+        `baseline commit "${since}" is not an ancestor of the indexed version`,
+      );
+    }
+    if (ancestry.status !== 0) {
+      const resolved = spawnSync(
+        'git',
+        ['rev-parse', '--verify', '--quiet', `${since}^{commit}`],
+        gitOptions,
+      );
+      if (resolved.status !== 0) {
+        return unknownAnswer(
+          'baseline_not_found',
+          `baseline commit "${since}" is not in this repository`,
+        );
+      }
+      return unknownAnswer('query_failed', `git ancestry check failed: ${ancestry.stderr.trim()}`);
+    }
+
+    // Per commit, oldest first, so a path's entry ends up describing its LAST
+    // operation in the window — a file changed and later reverted still shows.
+    // --no-renames keeps renames as a plain delete + add, which needs no special
+    // path handling.
+    let output: string;
+    try {
+      output = execFileSync(
+        'git',
+        [
+          'log',
+          '--reverse',
+          '--no-renames',
+          '--name-status',
+          '--format=@%H',
+          `${since}..${currentCommit}`,
+        ],
+        { ...gitOptions, maxBuffer: 16 * 1024 * 1024 },
+      );
+    } catch (error) {
+      return unknownAnswer(
+        'query_failed',
+        `git log failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    // Path-scope match is on segment boundaries: `src/nested` covers its own
+    // files but never the sibling directory `src/nestedOther`.
+    const scopes = (params.paths ?? []).map((entry) => String(entry).replace(/\/+$/, ''));
+    const inScope = (filePath: string): boolean =>
+      scopes.length === 0 || scopes.some((s) => filePath === s || filePath.startsWith(`${s}/`));
+
+    const changes = new Map<string, string>();
+    for (const line of output.split('\n')) {
+      // Commit headers are prefixed with '@' so they can never be mistaken for
+      // a `--name-status` record, whose first field is a status letter.
+      if (line === '' || line.startsWith('@')) continue;
+      const [status, filePath] = line.split('\t');
+      const changeType = REPO_CHANGES_TYPES[status.charAt(0)];
+      if (filePath && changeType && inScope(filePath)) changes.set(filePath, changeType);
+    }
+
+    const matched = [...changes].map(([filePath, changeType]) => ({
+      path: filePath,
+      change_type: changeType,
+    }));
+    const truncated = matched.length > REPO_CHANGES_MAX_FILES;
+    const files = truncated ? matched.slice(0, REPO_CHANGES_MAX_FILES) : matched;
+
+    return {
+      state: 'ok',
+      current_commit: currentCommit,
+      index_freshness: repo.indexedAt,
+      files,
+      truncated,
+    };
   }
 
   private async gitAuthorTrace(

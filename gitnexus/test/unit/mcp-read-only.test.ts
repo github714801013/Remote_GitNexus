@@ -16,6 +16,7 @@ const READ_ONLY_TOOLS = [
   'list_repos',
   'pdg_query',
   'query',
+  'repo_changes',
   'route_map',
   'shape_check',
   'tool_map',

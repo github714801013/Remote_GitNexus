@@ -2,7 +2,7 @@
  * Unit Tests: MCP Tool Definitions
  *
  * Tests: GITNEXUS_TOOLS from tools.ts
- * - All 19 tools are defined (per-repo + group_list/group_sync + code_snippet/git_author_trace)
+ * - All 20 tools are defined (per-repo + group_list/group_sync + code_snippet/git_author_trace/repo_changes)
  * - Each tool has valid name, description, inputSchema
  * - Required fields are correct
  * - Optional repo parameter is present on tools that need it
@@ -21,8 +21,8 @@ const MUTATING_TOOLS = new Set(['rename', 'group_sync']);
 const OPEN_WORLD_READ_ONLY_TOOLS = new Set(['query']);
 
 describe('GITNEXUS_TOOLS', () => {
-  it('exports all tools (8 base + 1 explain + 1 pdg_query + 3 route/tool/shape + 1 api_impact + 1 trace + 2 group + 2 source)', () => {
-    expect(GITNEXUS_TOOLS).toHaveLength(19);
+  it('exports all tools (8 base + 1 explain + 1 pdg_query + 3 route/tool/shape + 1 api_impact + 1 trace + 2 group + 3 source)', () => {
+    expect(GITNEXUS_TOOLS).toHaveLength(20);
   });
 
   it('contains all expected tool names', () => {
@@ -41,6 +41,7 @@ describe('GITNEXUS_TOOLS', () => {
         'pdg_query',
         'api_impact',
         'trace',
+        'repo_changes',
       ]),
     );
   });
@@ -257,6 +258,9 @@ describe('GITNEXUS_TOOLS', () => {
     for (const tool of GITNEXUS_TOOLS) {
       if (tool.name === 'list_repos') continue;
       if (GROUP_TOOLS.has(tool.name)) continue;
+      // repo_changes answers about ONE branch of ONE repo, so both the repo and
+      // the branch are required inputs rather than defaulted ones.
+      if (tool.name === 'repo_changes') continue;
       expect(tool.inputSchema.properties.repo).toBeDefined();
       expect(tool.inputSchema.properties.repo.type).toBe('string');
       expect(tool.inputSchema.required).not.toContain('repo');
@@ -271,6 +275,8 @@ describe('GITNEXUS_TOOLS', () => {
       }
       expect(tool.inputSchema.properties.branch, tool.name).toBeDefined();
       expect(tool.inputSchema.properties.branch.type).toBe('string');
+      // repo_changes is exempt: its whole answer is scoped to the named branch.
+      if (tool.name === 'repo_changes') continue;
       // Optional — omitting it keeps the default/primary-branch behavior.
       expect(tool.inputSchema.required).not.toContain('branch');
     }
@@ -373,6 +379,22 @@ describe('GITNEXUS_TOOLS', () => {
     // The tool-level description must mention the mode so an LLM discovers it.
     expect(impactTool.description.toLowerCase()).toContain('mode');
     expect(impactTool.description).toContain('pdg');
+  });
+
+  it('repo_changes requires repo, branch, and since; paths stays optional', () => {
+    const tool = GITNEXUS_TOOLS.find((t) => t.name === 'repo_changes')!;
+    expect(tool).toBeDefined();
+    expect(tool.inputSchema.required).toEqual(['repo', 'branch', 'since']);
+    expect(tool.inputSchema.properties.repo.type).toBe('string');
+    expect(tool.inputSchema.properties.branch.type).toBe('string');
+    expect(tool.inputSchema.properties.since.type).toBe('string');
+    expect(tool.inputSchema.properties.paths).toMatchObject({ type: 'array' });
+    expect(tool.annotations).toEqual({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
   });
 
   it('route_map description defers to api_impact for pre-change analysis', () => {
