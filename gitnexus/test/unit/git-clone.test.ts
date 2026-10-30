@@ -26,6 +26,7 @@ import {
   GITEA_TOKEN_HOSTS,
   isAzureDevOpsUrl,
   warnIfInsecureAzureConfig,
+  restoreGitNexusMetadata,
 } from '../../src/server/git-clone.js';
 import path from 'node:path';
 import os from 'node:os';
@@ -837,6 +838,56 @@ describe('git-clone', () => {
         expect(result).toBeNull();
       } finally {
         await fs.rm(tmp, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('restoreGitNexusMetadata', () => {
+    it('restores the backup and removes it', async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-restore-'));
+      try {
+        const metadataDir = path.join(root, 'backup', '.gitnexus');
+        await fs.mkdir(metadataDir, { recursive: true });
+        await fs.writeFile(path.join(metadataDir, 'meta.json'), '{"ok":true}');
+        const targetDir = path.join(root, 'repo');
+        await fs.mkdir(targetDir, { recursive: true });
+
+        await restoreGitNexusMetadata(metadataDir, targetDir);
+
+        await expect(
+          fs.readFile(path.join(targetDir, '.gitnexus', 'meta.json'), 'utf8'),
+        ).resolves.toBe('{"ok":true}');
+        await expect(fs.access(path.dirname(metadataDir))).rejects.toThrow();
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it('retries once when a concurrent process recreates the destination (EEXIST)', async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-restore-race-'));
+      try {
+        const metadataDir = path.join(root, 'backup', '.gitnexus');
+        await fs.mkdir(metadataDir, { recursive: true });
+        await fs.writeFile(path.join(metadataDir, 'meta.json'), '{"ok":true}');
+        const targetDir = path.join(root, 'repo');
+        await fs.mkdir(targetDir, { recursive: true });
+
+        const eexist = Object.assign(new Error('EEXIST: file already exists, mkdir'), {
+          code: 'EEXIST',
+        });
+        const cpSpy = vi.spyOn(fs, 'cp').mockRejectedValueOnce(eexist);
+        try {
+          await restoreGitNexusMetadata(metadataDir, targetDir);
+        } finally {
+          cpSpy.mockRestore();
+        }
+
+        await expect(
+          fs.readFile(path.join(targetDir, '.gitnexus', 'meta.json'), 'utf8'),
+        ).resolves.toBe('{"ok":true}');
+        await expect(fs.access(path.dirname(metadataDir))).rejects.toThrow();
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
       }
     });
   });

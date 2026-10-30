@@ -571,17 +571,34 @@ async function preserveGitNexusMetadata(targetDir: string): Promise<string | und
   return dest;
 }
 
-async function restoreGitNexusMetadata(
+export async function restoreGitNexusMetadata(
   metadataDir: string | undefined,
   targetDir: string,
 ): Promise<void> {
   if (!metadataDir) return;
+  const destination = path.join(targetDir, '.gitnexus');
   try {
     await fs.mkdir(targetDir, { recursive: true });
-    await fs.rm(path.join(targetDir, '.gitnexus'), { recursive: true, force: true });
-    await fs.cp(metadataDir, path.join(targetDir, '.gitnexus'), { recursive: true, force: true });
+    await fs.rm(destination, { recursive: true, force: true });
+    // 预创建目标目录：fs.cp 在目标目录已存在时走合并复制，避免并发进程抢先 mkdir 导致 EEXIST
+    await fs.mkdir(destination, { recursive: true });
+    await fs.cp(metadataDir, destination, { recursive: true, force: true });
     await fs.rm(path.dirname(metadataDir), { recursive: true, force: true });
   } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+      // 并发进程在复制期间重建了目标目录时，清空后重试一次
+      try {
+        await fs.rm(destination, { recursive: true, force: true });
+        await fs.cp(metadataDir, destination, { recursive: true, force: true });
+        await fs.rm(path.dirname(metadataDir), { recursive: true, force: true });
+        return;
+      } catch (retryErr) {
+        logger.error(
+          `[git] GitNexus metadata backup retained after restore retry failure backupDir=${path.dirname(metadataDir)}`,
+        );
+        throw retryErr;
+      }
+    }
     logger.error(
       `[git] GitNexus metadata backup retained after restore failure backupDir=${path.dirname(metadataDir)}`,
     );
