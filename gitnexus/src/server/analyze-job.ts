@@ -87,7 +87,15 @@ export interface AnalyzeJob {
 
 const JOB_TTL_MS = 60 * 60 * 1000; // 1 hour
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const JOB_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+/**
+ * 分析任务超时毫秒数；`GITNEXUS_ANALYZE_TIMEOUT_MS` 未设置或非法时为 0（不限制）。
+ * 官方默认曾为 30 分钟，大仓库（Neo4j 后端）分析远超该时长，故默认关闭，
+ * 需要时由部署方显式配置。
+ */
+function analyzeTimeoutMs(): number {
+  const raw = Number(process.env.GITNEXUS_ANALYZE_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
 /** How long a cancelled worker gets to exit via IPC before a signal is sent. */
 const CANCEL_GRACE_MS = 15_000;
 
@@ -206,18 +214,21 @@ export class JobManager {
     }
   }
 
-  /** Register a child process for a job — enables cancellation and timeout. */
+  /** Register a child process for a job — enables explicit cancellation. */
   registerChild(jobId: string, child: ChildProcess) {
     this.children.set(jobId, child);
 
-    // 30-minute timeout
-    const timer = setTimeout(() => {
-      const job = this.jobs.get(jobId);
-      if (job && !this.isTerminal(job.status)) {
-        this.cancelJob(jobId, 'Analysis timed out (30 minute limit)');
-      }
-    }, JOB_TIMEOUT_MS);
-    this.timeouts.set(jobId, timer);
+    // 可配置超时；默认 0 不限制（见 analyzeTimeoutMs）
+    const timeoutMs = analyzeTimeoutMs();
+    if (timeoutMs > 0) {
+      const timer = setTimeout(() => {
+        const job = this.jobs.get(jobId);
+        if (job && !this.isTerminal(job.status)) {
+          this.cancelJob(jobId, `Analysis timed out (${Math.round(timeoutMs / 60_000)} minute limit)`);
+        }
+      }, timeoutMs);
+      this.timeouts.set(jobId, timer);
+    }
 
     // Apply a pending cancel BEFORE other `exit` listeners (analyze-launch's
     // crash-retry) see a still-non-terminal job and fork a replacement worker.

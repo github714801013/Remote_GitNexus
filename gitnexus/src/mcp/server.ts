@@ -117,6 +117,8 @@ export function getNextStepHint(
 
     case 'cypher':
       return `\n\n---\n**Next:** To explore a result symbol, use context({name: "<name>"${repoParam}}). For schema reference, READ gitnexus://repo/${repoPath}/schema.`;
+    case 'git_author_trace':
+      return `\n\n---\n**Next:** Use context() or impact() on the related symbol if you need dependency or blast-radius context.`;
 
     case 'read_file':
       return `\n\n---\n**Next:** To pin a symbol seen in the file, use context({name: "<symbol>"${repoParam}}). To find other occurrences, use grep({pattern: "<token>"${repoParam}}).`;

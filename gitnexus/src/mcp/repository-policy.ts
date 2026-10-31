@@ -1,5 +1,6 @@
 import path from 'node:path';
 import type { LocalBackend, McpToolCallContext, RepoListing } from './local/local-backend.js';
+import { getAllowedEnvironments } from '../config/environment-policy.js';
 import { parseListReposPagination } from './local/local-backend.js';
 import { scrubGroupDescription } from './read-only-policy.js';
 import { LIST_REPOS_DEFAULT_LIMIT, LIST_REPOS_MAX_LIMIT } from './tools.js';
@@ -19,6 +20,70 @@ interface ResolvedRepository {
   name: string;
   path: string;
   pathKey: string;
+}
+
+export interface McpRequestScopeHeaders {
+  projects?: string | readonly string[];
+  env?: string | readonly string[];
+}
+
+type RequestEnvironment = string;
+
+function repositoryNameForEnvironment(project: string, environment: RequestEnvironment): string {
+  return environment === 'pro' ? project : `${environment}-${project}`;
+}
+
+function repositoryMatchesEnvironment(
+  repositoryName: string,
+  environment: RequestEnvironment,
+  configuredEnvironments: readonly RequestEnvironment[],
+): boolean {
+  const normalized = repositoryName.toLowerCase();
+  if (environment !== 'pro') return normalized.startsWith(`${environment}-`);
+  return !configuredEnvironments
+    .filter((configuredEnvironment) => configuredEnvironment !== 'pro')
+    .some((configuredEnvironment) => normalized.startsWith(`${configuredEnvironment}-`));
+}
+
+function parseRequestHeaderList(
+  value: string | readonly string[] | undefined,
+  headerName: 'projects' | 'env',
+): string[] | undefined {
+  if (value === undefined) return undefined;
+  const rawValues = Array.isArray(value) ? value : [value];
+  const entries = rawValues.flatMap((item) => item.split(','));
+  if (entries.length === 0 || entries.some((entry) => entry.trim() === '')) {
+    throw new Error(`MCP ${headerName} header contains an empty value.`);
+  }
+  return entries.map((entry) => entry.trim().toLowerCase());
+}
+
+function validateRequestScope(
+  headers: McpRequestScopeHeaders,
+): {
+  projects?: string[];
+  env?: RequestEnvironment[];
+  allowedEnvironments: RequestEnvironment[];
+} | undefined {
+  const projects = parseRequestHeaderList(headers.projects, 'projects');
+  const env = parseRequestHeaderList(headers.env, 'env');
+  if (projects === undefined && env === undefined) return undefined;
+  const allowedEnvironments = getAllowedEnvironments();
+
+  for (const project of projects ?? []) {
+    if (project === '*') {
+      throw new Error('MCP projects header contains an invalid wildcard value.');
+    }
+  }
+  for (const environment of env ?? []) {
+    if (environment === '*') {
+      throw new Error('MCP env header contains an invalid wildcard value.');
+    }
+    if (!allowedEnvironments.includes(environment)) {
+      throw new Error('MCP env header contains an unknown environment: ' + environment + '.');
+    }
+  }
+  return { projects, env: env as RequestEnvironment[] | undefined, allowedEnvironments };
 }
 
 function configuredValue(
@@ -86,6 +151,58 @@ function unavailableRepositoryError(): Error {
   return new Error('Repository is not available through this MCP server.');
 }
 
+function mergeScopedQueryResults(
+  results: Array<{ repo: ResolvedRepository; result: any }>,
+): any {
+  const merged = {
+    processes: [] as any[],
+    process_symbols: [] as any[],
+    definitions: [] as any[],
+    matches: [] as any[],
+    matched_repos: [] as string[],
+    errors: [] as Array<{ repo: string; error: string }>,
+  };
+  const seen = {
+    processes: new Set<string>(),
+    process_symbols: new Set<string>(),
+    definitions: new Set<string>(),
+    matches: new Set<string>(),
+  };
+
+  for (const { repo, result } of results) {
+    if (result?.error) {
+      merged.errors.push({ repo: repo.name, error: String(result.error) });
+      continue;
+    }
+    if (Array.isArray(result?.errors)) {
+      merged.errors.push(
+        ...result.errors.map((error: any) => ({
+          repo: repo.name,
+          error: String(error?.error ?? error),
+        })),
+      );
+    }
+
+    for (const field of ['processes', 'process_symbols', 'definitions', 'matches'] as const) {
+      for (const item of Array.isArray(result?.[field]) ? result[field] : []) {
+        const normalized = { ...item, repo: item.repo ?? repo.name };
+        const key = `${normalized.repo}:${normalized.id ?? normalized.nodeId ?? normalized.filePath ?? normalized.name ?? JSON.stringify(normalized)}`;
+        if (seen[field].has(key)) continue;
+        seen[field].add(key);
+        merged[field].push(normalized);
+      }
+    }
+  }
+
+  merged.matched_repos = [
+    ...new Set(
+      merged.matches
+        .map((match) => match.repo)
+        .filter((repo): repo is string => typeof repo === 'string'),
+    ),
+  ];
+  return merged;
+}
 export class McpRepositoryPolicy {
   readonly restricted: boolean;
   readonly configured: boolean;
@@ -122,6 +239,49 @@ export class McpRepositoryPolicy {
         .map((repo) => repo.name.toLowerCase())
         .filter((name) => registryNameCounts.get(name) === 1),
     );
+  }
+
+  forRequestScope(headers: McpRequestScopeHeaders): McpRepositoryPolicy {
+    const scope = validateRequestScope(headers);
+    if (!scope) return this;
+
+    const environments = scope.env ?? scope.allowedEnvironments;
+    const requestedNames = new Set<string>();
+    if (scope.projects) {
+      for (const project of scope.projects) {
+        for (const environment of environments) {
+          requestedNames.add(repositoryNameForEnvironment(project, environment));
+        }
+      }
+    } else {
+      for (const repo of this.registry) {
+        if (
+          environments.some((environment) =>
+            repositoryMatchesEnvironment(repo.name, environment, scope.allowedEnvironments),
+          )
+        ) {
+          requestedNames.add(repo.name.toLowerCase());
+        }
+      }
+    }
+
+    const registeredNames = new Set(this.registry.map((repo) => repo.name.toLowerCase()));
+    if (scope.projects && ![...requestedNames].some((name) => registeredNames.has(name))) {
+      throw new Error('MCP projects header contains an unknown project: ' + scope.projects.join(', ') + '.');
+    }
+
+    const allowed = this.registry.filter(
+      (repo) =>
+        requestedNames.has(repo.name.toLowerCase()) && this.allowedPathKeys.has(repo.pathKey),
+    );
+    if (allowed.length === 0) {
+      throw new Error('No repositories match the MCP request scope available through this server.');
+    }
+
+    const defaultRepo = this.defaultRepo && allowed.some((repo) => repo.pathKey === this.defaultRepo?.pathKey)
+      ? this.defaultRepo
+      : undefined;
+    return new McpRepositoryPolicy(this.registry, allowed, defaultRepo);
   }
 
   private resolveRuntimeRepo(specifier: string): ResolvedRepository {
@@ -229,7 +389,12 @@ export class McpRepositoryPolicy {
       defaultLimit: LIST_REPOS_DEFAULT_LIMIT,
       maxLimit: LIST_REPOS_MAX_LIMIT,
     });
-    const repositories = await this.listAllowedRepos(backend);
+    if (params?.isAll !== undefined && typeof params.isAll !== 'boolean') {
+      throw new Error("list_repos: \"isAll\" must be a boolean.");
+    }
+    const repositories = params?.isAll === true
+      ? await backend.listRepos()
+      : await this.listAllowedRepos(backend);
     repositories.sort((a, b) => {
       const an = a.name.toLowerCase();
       const bn = b.name.toLowerCase();
@@ -264,6 +429,19 @@ export class McpRepositoryPolicy {
     if (method === 'list_repos') return this.listReposPage(backend, params);
     if (this.restricted && method.startsWith('group_')) {
       throw new Error('Group tools are unavailable when an MCP repository allowlist is set.');
+    }
+    if (method === 'query' && this.restricted && params?.repo === undefined && this.allowed.length > 1) {
+      const results = await Promise.all(
+        this.allowed.map(async (repo) => {
+          try {
+            const result = await backend.callTool(method, { ...(params ?? {}), repo: repo.path });
+            return { repo, result };
+          } catch (error) {
+            return { repo, result: { error: error instanceof Error ? error.message : String(error) } };
+          }
+        }),
+      );
+      return mergeScopedQueryResults(results);
     }
     return backend.callTool(method, this.normalizeToolArgs(params), ...context);
   }
@@ -442,10 +620,6 @@ export async function createMcpRepositoryPolicy(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<McpRepositoryPolicy> {
   const raw = parseRepositoryPolicy(env);
-  if (!raw.allowed && !raw.defaultRepo) {
-    return McpRepositoryPolicy.unrestricted();
-  }
-
   const registry = (await backend.listRepos()).map((repo) => ({
     name: repo.name,
     path: repo.path,

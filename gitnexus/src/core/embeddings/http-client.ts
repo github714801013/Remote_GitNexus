@@ -199,11 +199,9 @@ const readConfig = (): HttpConfig | null => {
       300_000,
     ),
     minIntervalMs: parseNonNegativeIntegerEnv('GITNEXUS_EMBEDDING_MIN_INTERVAL_MS', 0, 300_000),
-    timeoutMs: parsePositiveIntegerEnv(
-      HTTP_TIMEOUT_ENV,
-      DEFAULT_HTTP_TIMEOUT_MS,
-      MAX_HTTP_TIMEOUT_MS,
-    ),
+    timeoutMs:
+      readLegacyHttpTimeoutMs() ??
+      parsePositiveIntegerEnv(HTTP_TIMEOUT_ENV, DEFAULT_HTTP_TIMEOUT_MS, MAX_HTTP_TIMEOUT_MS),
     // A boolean toggle, so it takes the repo's truthy convention (`1`/`true`/
     // `yes`) and falls back to the documented default on anything else. The
     // integer parser this used throws on a non-digit, which turned the
@@ -212,6 +210,20 @@ const readConfig = (): HttpConfig | null => {
     retryTimeouts: parseTruthyEnv(process.env.GITNEXUS_EMBEDDING_RETRY_TIMEOUTS),
     requestDimensions,
   };
+};
+
+/**
+ * 个性化兼容：部署脚本历史使用 `GITNEXUS_EMBEDDING_TIMEOUT_MS`（或
+ * `GITNEXUS_EMBEDDING_REQUEST_TIMEOUT_MS`）配置单次请求超时，优先于官方
+ * `GITNEXUS_EMBEDDING_HTTP_TIMEOUT_MS`，且不受官方 300000ms 上限约束。
+ * 未设置或非法时返回 undefined，回落到官方配置。
+ */
+const readLegacyHttpTimeoutMs = (): number | undefined => {
+  const raw =
+    process.env.GITNEXUS_EMBEDDING_REQUEST_TIMEOUT_MS ?? process.env.GITNEXUS_EMBEDDING_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 };
 
 /**
@@ -534,7 +546,6 @@ const httpEmbedBatch = async (
           maxAttempts,
           baseDelayMs: HTTP_RETRY_BACKOFF_MS,
           capDelayMs: retryCapMs,
-          retryAfterCapMs: retryCapMs,
           sleep: (ms) => abortableSleep(ms, requestOptions.signal),
         },
       },

@@ -161,7 +161,8 @@ export const formatHybridResults = (results: HybridSearchResult[]): string => {
  * When FTS is unavailable (e.g. read-only MCP connection, missing indexes) or
  * explicitly disabled for this index (`disabledReason`, #3091), falls back to
  * semantic-only results instead of crashing (#1489). In the disabled case no
- * BM25 query is issued at all.
+ * BM25 query is issued at all. A failing semantic lane similarly degrades to
+ * BM25-only results instead of failing the query.
  */
 export const hybridSearch = async (
   query: string,
@@ -180,6 +181,7 @@ export const hybridSearch = async (
   // semantic-only search instead of crashing with "bm25Results is not iterable".
   // Both lanes share the caller's database session. Drain the sibling before
   // propagating corruption so it cannot query after that session is released.
+  // A rejected lane is degraded (not retried) so the other lane still answers.
   const [keyword, semantic] = await Promise.allSettled([
     (async (): Promise<BM25SearchResult[]> => {
       try {

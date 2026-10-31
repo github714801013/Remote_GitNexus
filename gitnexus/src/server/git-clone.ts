@@ -802,13 +802,17 @@ async function assertNoSymlinkPath(
  */
 export const GITHUB_TOKEN_HOSTS: ReadonlySet<string> = new Set(['github.com', 'www.github.com']);
 
+/** 自建 Gitea 主机：使用服务端配置的 GITEA_TOKEN 作为凭据。 */
+export const GITEA_TOKEN_HOSTS: ReadonlySet<string> = new Set(['code.9ji.com']);
+
 /**
  * Resolve at most ONE git credential for a clone/pull, by server-side policy
  * keyed on the clone host against a fixed allowlist (never a free-form user
  * toggle):
  *   1. a per-request GitHub PAT — only for hosts in GITHUB_TOKEN_HOSTS;
- *   2. else the server's AZURE_DEVOPS_PAT — only for Azure DevOps hosts;
- *   3. else none.
+ *   2. else the server's GITEA_TOKEN — only for hosts in GITEA_TOKEN_HOSTS;
+ *   3. else the server's AZURE_DEVOPS_PAT — only for Azure DevOps hosts;
+ *   4. else none.
  * The two host sets are disjoint, so at most one credential ever applies; the
  * GitHub token taking precedence is deterministic for the pathological case
  * where AZURE_DEVOPS_URL is itself configured to a github.com host. Returns
@@ -841,7 +845,13 @@ function resolveGitCredential(options?: { token?: string; url?: string }): strin
     return Buffer.from(`x-access-token:${options.token}`).toString('base64');
   }
 
-  // 2. Server-configured Azure DevOps PAT — Azure hosts only.
+  // 2. 自建 Gitea 服务端令牌 — 仅限 GITEA_TOKEN_HOSTS。
+  const giteaToken = process.env.GITEA_TOKEN;
+  if (giteaToken && GITEA_TOKEN_HOSTS.has(host)) {
+    return Buffer.from(`${giteaToken}:`).toString('base64');
+  }
+
+  // 3. Server-configured Azure DevOps PAT — Azure hosts only.
   const azurePat = process.env.AZURE_DEVOPS_PAT;
   if (azurePat && isAzureDevOpsUrl(url)) {
     return Buffer.from(`:${azurePat}`).toString('base64');
@@ -996,7 +1006,8 @@ export function runGit(args: string[], cwd?: string, options?: RunGitOptions): P
       if (code === 0) finish(() => resolve(stdout));
       else {
         // Log full stderr internally but don't expose it to API callers (SSRF mitigation)
-        if (stderr.trim()) logger.error(`git ${args[0]} stderr: ${stderr.trim()}`);
+        const sanitized = sanitizeGitStderr(stderr);
+        if (sanitized) logger.error(`git ${args[0]} stderr: ${sanitized}`);
         finish(() => reject(new Error(`git ${args[0]} failed (exit code ${code})`)));
       }
     });
@@ -1008,3 +1019,164 @@ export function runGit(args: string[], cwd?: string, options?: RunGitOptions): P
 }
 
 export const runGitForTest = runGit;
+
+
+// ---------------------------------------------------------------------------
+// 个性化扩展：webhook 镜像同步与元数据备份恢复（官方版本尚无对应能力）
+// ---------------------------------------------------------------------------
+
+export function isGitObjectDatabaseCorruption(err: unknown): boolean {
+  const text = err instanceof Error ? err.message : String(err);
+  return (
+    /object file .* is empty/i.test(text) ||
+    /cannot read existing object info/i.test(text) ||
+    /invalid index-pack output/i.test(text) ||
+    /loose object .* is corrupt/i.test(text) ||
+    /fatal: bad object/i.test(text)
+  );
+}
+
+export async function cloneOrResetToBranch(
+  url: string,
+  targetDir: string,
+  branch: string,
+  onProgress?: (progress: CloneProgress) => void,
+): Promise<string> {
+  assertSafeGitRef(branch, 'branch');
+  validateGitUrl(url);
+  const safeTarget = path.resolve(targetDir);
+  const exists = await fs.access(path.join(safeTarget, '.git')).then(
+    () => true,
+    () => false,
+  );
+
+  if (exists) {
+    onProgress?.({ phase: 'pulling', message: `Synchronizing ${branch}...` });
+    const metadataDir = await preserveGitNexusMetadata(safeTarget);
+    await fs.rm(path.join(safeTarget, '.git', 'index.lock'), { force: true });
+    try {
+      try {
+        await ensureFullHistory(safeTarget, url);
+        for (const args of buildWebhookBranchSyncCommands(url, branch)) {
+          await runGit(args, safeTarget, { url });
+        }
+      } catch (err) {
+        if (!isGitObjectDatabaseCorruption(err)) throw err;
+        logger.warn(
+          `[git] detected corrupt object database; deleting and re-cloning webhook mirror targetDir=${safeTarget}`,
+        );
+        await rebuildCorruptWebhookMirror(url, safeTarget, branch, onProgress);
+      }
+    } finally {
+      await restoreGitNexusMetadata(metadataDir, safeTarget);
+    }
+  } else {
+    await fs.mkdir(path.dirname(safeTarget), { recursive: true });
+    onProgress?.({ phase: 'cloning', message: `Cloning ${url}...` });
+    await runGit(['clone', '--branch', branch, '--', url, safeTarget], undefined, { url });
+  }
+
+  return safeTarget;
+}
+
+export function buildWebhookBranchSyncCommands(url: string, branch: string): string[][] {
+  assertSafeGitRef(branch, 'branch');
+  const remoteRef = `refs/remotes/origin/${branch}`;
+  return [
+    ['remote', 'set-url', 'origin', url],
+    ['fetch', 'origin', `+refs/heads/${branch}:${remoteRef}`],
+    ['reset', '--hard', remoteRef],
+    ['clean', '-fd', '-e', '.gitnexus', '-e', '.gitnexus/'],
+    ['checkout', '-B', branch, remoteRef],
+    ['reset', '--hard', remoteRef],
+    ['clean', '-fd', '-e', '.gitnexus', '-e', '.gitnexus/'],
+  ];
+}
+
+function assertSafeGitRef(value: string, fieldName: string): void {
+  if (
+    !value ||
+    value.startsWith('-') ||
+    value.startsWith('/') ||
+    value.endsWith('/') ||
+    value.includes('..') ||
+    /[\s\~^:?*[\]\x00-\x1F\x7F]/.test(value)
+  ) {
+    throw new Error(`Invalid ${fieldName}`);
+  }
+}
+
+async function ensureFullHistory(targetDir: string, url: string): Promise<void> {
+  const shallow = (
+    await runGit(['rev-parse', '--is-shallow-repository'], targetDir, { url })
+  ).trim();
+  if (shallow === 'true') {
+    await runGit(['fetch', '--unshallow', 'origin'], targetDir, { url });
+  }
+}
+
+async function rebuildCorruptWebhookMirror(
+  url: string,
+  targetDir: string,
+  branch: string,
+  onProgress?: (progress: CloneProgress) => void,
+): Promise<void> {
+  await fs.rm(targetDir, { recursive: true, force: true });
+  await fs.mkdir(path.dirname(targetDir), { recursive: true });
+  onProgress?.({ phase: 'cloning', message: `Re-cloning ${branch} after git corruption...` });
+  await runGit(['clone', '--branch', branch, '--', url, targetDir], undefined, { url });
+}
+
+async function preserveGitNexusMetadata(targetDir: string): Promise<string | undefined> {
+  const source = path.join(targetDir, '.gitnexus');
+  const exists = await fs.access(source).then(
+    () => true,
+    () => false,
+  );
+  if (!exists) return undefined;
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-meta-'));
+  const dest = path.join(tempDir, '.gitnexus');
+  await fs.cp(source, dest, { recursive: true, force: true });
+  return dest;
+}
+
+export async function restoreGitNexusMetadata(
+  metadataDir: string | undefined,
+  targetDir: string,
+): Promise<void> {
+  if (!metadataDir) return;
+  const destination = path.join(targetDir, '.gitnexus');
+  try {
+    await fs.mkdir(targetDir, { recursive: true });
+    await fs.rm(destination, { recursive: true, force: true });
+    // 预创建目标目录：fs.cp 在目标目录已存在时走合并复制，避免并发进程抢先 mkdir 导致 EEXIST
+    await fs.mkdir(destination, { recursive: true });
+    await fs.cp(metadataDir, destination, { recursive: true, force: true });
+    await fs.rm(path.dirname(metadataDir), { recursive: true, force: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+      // 并发进程在复制期间重建了目标目录时，清空后重试一次
+      try {
+        await fs.rm(destination, { recursive: true, force: true });
+        await fs.cp(metadataDir, destination, { recursive: true, force: true });
+        await fs.rm(path.dirname(metadataDir), { recursive: true, force: true });
+        return;
+      } catch (retryErr) {
+        logger.error(
+          `[git] GitNexus metadata backup retained after restore retry failure backupDir=${path.dirname(metadataDir)}`,
+        );
+        throw retryErr;
+      }
+    }
+    logger.error(
+      `[git] GitNexus metadata backup retained after restore failure backupDir=${path.dirname(metadataDir)}`,
+    );
+    throw err;
+  }
+}
+
+/** 从 git stderr 中抹去服务端令牌，避免写日志时泄露。 */
+function sanitizeGitStderr(stderr: string): string {
+  const token = process.env.GITEA_TOKEN;
+  return token ? stderr.trim().replaceAll(token, '****') : stderr.trim();
+}

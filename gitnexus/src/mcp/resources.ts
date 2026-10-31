@@ -354,11 +354,21 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   const lastCommit = freshMeta?.lastCommit ?? repo.lastCommit ?? '';
   const staleness = repoPath
     ? checkStaleness(repoPath, lastCommit)
-    : { isStale: false, commitsBehind: 0 };
+    : {
+        status: 'unknown' as const,
+        isStale: false,
+        commitsBehind: null,
+        indexedCommit: lastCommit,
+        reason: 'checkout_unavailable' as const,
+        hint: undefined,
+      };
 
   const lines: string[] = [`project: ${context.projectName}`];
 
-  if (staleness.isStale && staleness.hint) {
+  if (staleness.status === 'unknown') {
+    lines.push('');
+    lines.push('staleness: "unknown — unable to compare indexed commit with checkout"');
+  } else if (staleness.isStale && staleness.hint) {
     lines.push('');
     lines.push(`staleness: "${staleness.hint}"`);
   }

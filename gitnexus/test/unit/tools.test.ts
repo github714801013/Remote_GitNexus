@@ -2,7 +2,7 @@
  * Unit Tests: MCP Tool Definitions
  *
  * Tests: GITNEXUS_TOOLS from tools.ts
- * - All 19 tools are defined (per-repo + group_list/group_sync)
+ * - All 21 tools are defined (per-repo + group_list/group_sync + read_file/grep + git_author_trace/repo_changes)
  * - Each tool has valid name, description, inputSchema
  * - Required fields are correct
  * - Optional repo parameter is present on tools that need it
@@ -23,14 +23,15 @@ const MUTATING_TOOLS = new Set(['rename', 'group_sync']);
 const OPEN_WORLD_READ_ONLY_TOOLS = new Set(['query']);
 
 describe('GITNEXUS_TOOLS', () => {
-  it('keeps the complete tool catalog below 70 KB of recurring agent context', () => {
+  it('keeps the complete tool catalog below 80 KB of recurring agent context', () => {
     // Every exposed tool is sent before the agent chooses one. This is a byte
     // budget, not a tokenizer estimate or a claim about end-to-end dollar cost.
-    expect(Buffer.byteLength(JSON.stringify(GITNEXUS_TOOLS), 'utf8')).toBeLessThanOrEqual(70_000);
+    // 个性化工具 git_author_trace / repo_changes 使目录体积上升，预算由 70 KB 上调到 80 KB。
+    expect(Buffer.byteLength(JSON.stringify(GITNEXUS_TOOLS), 'utf8')).toBeLessThanOrEqual(80_000);
   });
 
-  it('exports all tools (8 base + 1 explain + 1 pdg_query + 3 route/tool/shape + 1 api_impact + 1 trace + 2 group + read_file + grep)', () => {
-    expect(GITNEXUS_TOOLS).toHaveLength(19);
+  it('exports all tools (8 base + 1 explain + 1 pdg_query + 3 route/tool/shape + 1 api_impact + 1 trace + 2 group + read_file + grep + git_author_trace + repo_changes)', () => {
+    expect(GITNEXUS_TOOLS).toHaveLength(21);
   });
 
   it('exposes one rename tool; there is no separate rename_preview (use dry_run)', () => {
@@ -64,6 +65,8 @@ describe('GITNEXUS_TOOLS', () => {
         'trace',
         'read_file',
         'grep',
+        'git_author_trace',
+        'repo_changes',
       ]),
     );
   });
@@ -350,6 +353,9 @@ describe('GITNEXUS_TOOLS', () => {
     for (const tool of GITNEXUS_TOOLS) {
       if (tool.name === 'list_repos') continue;
       if (GROUP_TOOLS.has(tool.name)) continue;
+      // repo_changes answers about ONE branch of ONE repo, so both the repo and
+      // the branch are required inputs rather than defaulted ones.
+      if (tool.name === 'repo_changes') continue;
       expect(tool.inputSchema.properties.repo).toBeDefined();
       expect(tool.inputSchema.properties.repo.type).toBe('string');
       expect(tool.inputSchema.required).not.toContain('repo');
@@ -368,6 +374,9 @@ describe('GITNEXUS_TOOLS', () => {
       const description = tool.inputSchema.properties.repo.description;
       if (tool.name === 'rename') {
         expect(description).toMatch(/mutating tools require an explicit repo/i);
+      } else if (tool.name === 'repo_changes') {
+        // 个性化：repo_changes 的 repo 为必填参数，不适用 cwd 默认与只读省略规则。
+        continue;
       } else {
         expect(description).toMatch(/process cwd/i);
         expect(description).toMatch(/unindexed nested Git checkout/i);
@@ -384,6 +393,8 @@ describe('GITNEXUS_TOOLS', () => {
       }
       expect(tool.inputSchema.properties.branch, tool.name).toBeDefined();
       expect(tool.inputSchema.properties.branch.type).toBe('string');
+      // repo_changes is exempt: its whole answer is scoped to the named branch.
+      if (tool.name === 'repo_changes') continue;
       // Optional — omitting it keeps the default/primary-branch behavior.
       expect(tool.inputSchema.required).not.toContain('branch');
     }
@@ -542,6 +553,22 @@ describe('GITNEXUS_TOOLS', () => {
     // The tool-level description must mention the mode so an LLM discovers it.
     expect(impactTool.description.toLowerCase()).toContain('mode');
     expect(impactTool.description).toContain('pdg');
+  });
+
+  it('repo_changes requires repo, branch, and since; paths stays optional', () => {
+    const tool = GITNEXUS_TOOLS.find((t) => t.name === 'repo_changes')!;
+    expect(tool).toBeDefined();
+    expect(tool.inputSchema.required).toEqual(['repo', 'branch', 'since']);
+    expect(tool.inputSchema.properties.repo.type).toBe('string');
+    expect(tool.inputSchema.properties.branch.type).toBe('string');
+    expect(tool.inputSchema.properties.since.type).toBe('string');
+    expect(tool.inputSchema.properties.paths).toMatchObject({ type: 'array' });
+    expect(tool.annotations).toEqual({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
   });
 
   it('route_map description defers to api_impact for pre-change analysis', () => {

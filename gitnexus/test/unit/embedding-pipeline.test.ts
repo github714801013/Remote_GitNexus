@@ -6,6 +6,7 @@ import {
   resolveEmbeddingInstallPolicy,
 } from '../../src/core/embeddings/embedding-pipeline.js';
 import { generateEmbeddingText } from '../../src/core/embeddings/text-generator.js';
+import { getKeywordSummaryHashSalt } from '../../src/core/embeddings/keyword-summary.js';
 import type { EmbeddableNode, EmbeddingProgress } from '../../src/core/embeddings/types.js';
 import {
   DEFAULT_EMBEDDING_CONFIG,
@@ -111,6 +112,8 @@ describe('contentHashForNode', () => {
     const expected = createHash('sha1')
       .update(EMBEDDING_TEXT_VERSION)
       .update(`\n${DEFAULT_EMBEDDING_CONFIG.maxInputChars}\n`)
+      .update(getKeywordSummaryHashSalt())
+      .update('\n')
       .update(generateEmbeddingText(node, node.content))
       .digest('hex');
     expect(contentHashForNode(node)).toBe(expected);

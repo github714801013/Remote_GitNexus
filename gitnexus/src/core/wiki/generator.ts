@@ -65,6 +65,8 @@ import {
 } from './prompts.js';
 
 import { shouldIgnorePath } from '../../config/ignore-service.js';
+import { logger } from '../logger.js';
+import { isNeo4jBackendEnabled } from '../neo4j/config.js';
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -76,6 +78,12 @@ export interface WikiOptions {
   reviewOnly?: boolean;
   /** Output language for generated documentation (e.g. 'english', 'chinese', 'spanish') */
   lang?: string;
+  /** Server-owned staging directory used before publishing a generated wiki. */
+  outputDir?: string;
+  /** Stable index commit supplied by the server-owned Wiki queue. */
+  sourceCommit?: string;
+  /** Repository name used as Neo4j repoId filter. Ignored by the local LadybugDB backend. */
+  repoName?: string;
 }
 
 export interface WikiMeta {
@@ -135,7 +143,7 @@ export class WikiGenerator {
   ) {
     this.repoPath = repoPath;
     this.storagePath = storagePath;
-    this.wikiDir = path.join(storagePath, WIKI_DIR);
+    this.wikiDir = options.outputDir ?? path.join(storagePath, WIKI_DIR);
     this.lbugPath = lbugPath;
     this.options = options;
     this.llmConfig = llmConfig;
@@ -266,7 +274,7 @@ export class WikiGenerator {
     await fs.mkdir(this.wikiDir, { recursive: true });
 
     const existingMeta = await this.loadWikiMeta();
-    const currentCommit = this.getCurrentCommit();
+    const currentCommit = this.options.sourceCommit ?? this.getCurrentCommit();
     const forceMode = this.options.force;
 
     // Up-to-date check (skip if --force)
@@ -311,7 +319,18 @@ export class WikiGenerator {
     // Init graph
     this.onProgress('init', 2, 'Connecting to knowledge graph...');
     const releaseWikiDbPin = pinWikiDb();
-    await initWikiDb(this.lbugPath);
+    if (this.options.repoName) {
+      await initWikiDb(this.lbugPath, this.options.repoName);
+    } else {
+      await initWikiDb(this.lbugPath);
+    }
+    logger.info(
+      {
+        backend: isNeo4jBackendEnabled() ? 'neo4j' : 'lbug',
+        ...(this.options.repoName ? { repoId: this.options.repoName } : {}),
+      },
+      'Wiki graph backend initialized',
+    );
 
     let result: WikiRunResult;
     try {

@@ -115,9 +115,14 @@ import {
   embeddingDimsMismatch,
 } from '../../core/lbug/schema.js';
 import { getExactScanLimit } from '../../core/platform/capabilities.js';
+import { isNeo4jBackendEnabled } from '../../core/neo4j/config.js';
 import { PhaseTimer } from '../../core/search/phase-timer.js';
-import { ftsDegradedWarning, ftsQueryFailedWarning } from '../../core/search/fts-indexes.js';
+import {
+  ftsDegradedWarning,
+  ftsQueryFailedWarning,
+} from '../../core/search/fts-indexes.js';
 import { getFtsDisabledReason, type FtsDisabledReason } from '../../core/search/fts-policy.js';
+import { loadZoektConfig, ZoektClient } from '../../core/search/zoekt-client.js';
 import {
   cjkSegmentationModeMismatch,
   containsSegmentableCjkRun,
@@ -163,6 +168,7 @@ import {
 import { renameSymbol } from './rename/rename-plan.js';
 import { foldNumericToolArgumentAliases } from '../tool-arguments.js';
 import { findImportCycles, IMPORT_CYCLE_LIMIT } from '../../core/graph/import-cycles.js';
+import { FTS_INDEXES } from '../../core/search/fts-schema.js';
 import { decodeTaintPath } from '../../core/ingestion/taint/path-codec.js';
 import { decodeReachingDefReason } from '../../core/ingestion/cfg/reaching-def-reason-codec.js';
 import { compareCodeUnits } from '../../lib/utils.js';
@@ -409,6 +415,14 @@ function assertResponseIdentities(value: unknown): void {
   }
 }
 
+function semanticQueryFromZoekt(query: string): string {
+  return query
+    .replace(/[()\"']/g, ' ')
+    .replace(/\b(?:AND|OR|NOT)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 interface StringAliasDefinition {
   canonical: string;
   aliases: readonly string[];
@@ -469,6 +483,129 @@ function normalizeToolParams(
     return { error: 'MCP impact requires target, name, symbol, or target_uid.' };
   }
   return { params: folded.params };
+}
+
+const DEFAULT_QUERY_SEMANTIC_TIMEOUT_MS = 5_000;
+const MAX_QUERY_SEMANTIC_TIMEOUT_MS = 60_000;
+
+function getQuerySemanticTimeoutMs(): number | undefined {
+  const raw = process.env.GITNEXUS_QUERY_SEMANTIC_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_QUERY_SEMANTIC_TIMEOUT_MS;
+  if (['0', 'false', 'no', 'off', 'none', 'never'].includes(raw.trim().toLowerCase())) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_QUERY_SEMANTIC_TIMEOUT_MS;
+  return Math.min(parsed, MAX_QUERY_SEMANTIC_TIMEOUT_MS);
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+const RRF_K = 60;
+const SEARCH_SOURCE_WEIGHTS = {
+  bm25: 1,
+  vector: 0.8,
+  zoekt: 1.2,
+} as const;
+const CROSS_REPO_ZOEKT_DISCOVERY_LIMIT = 200;
+const CROSS_REPO_VECTOR_MATCHES_PER_REPO = 5;
+const CROSS_REPO_VECTOR_DISCOVERY_CONCURRENCY = 4;
+const MATCH_SNIPPET_MAX_CHARS = 240;
+const PATH_MATCH_LIMIT = 10;
+const PATH_HINT_MAX_COUNT = 5;
+
+type QueryMatchSource = 'zoekt' | 'vector';
+type FileMatchSource = 'bm25' | 'zoekt' | 'path';
+
+interface Neo4jFileSearchRow {
+  id?: string;
+  name?: string;
+  type?: string;
+  filePath?: string;
+  score?: number;
+}
+
+interface FileMatchSummary {
+  repo: string;
+  name: string;
+  type: 'File';
+  filePath: string;
+  score: number;
+  source: FileMatchSource;
+  matchKind: 'exact_path' | 'suffix_path' | 'basename' | 'content';
+}
+
+interface PathDiagnostics {
+  backend: 'neo4j' | 'ladybugdb';
+  searchedHints: string[];
+  exactPathFound: boolean;
+  nearest: FileMatchSummary[];
+  ftsAvailable?: boolean;
+}
+
+interface QueryMatchSummary {
+  repo: string;
+  filePath: string;
+  source: QueryMatchSource;
+  id?: string;
+  type?: string;
+  score: number;
+  name?: string;
+  startLine?: number;
+  endLine?: number;
+  snippet?: string;
+}
+
+interface QueryRepoCandidate {
+  repo: RepoHandle;
+  score: number;
+  matches: QueryMatchSummary[];
+}
+
+type QueryDiscoveryInput =
+  | string
+  | {
+      keywordQuery: string;
+      semanticQuery: string;
+    };
+
+function positiveEnvInt(name: string, fallback: number): number {
+  const value = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+async function mapWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) return;
+  const limit = Math.max(1, Math.min(concurrency, items.length));
+  let nextIndex = 0;
+  await Promise.all(
+    Array.from({ length: limit }, async () => {
+      while (nextIndex < items.length) {
+        const item = items[nextIndex++];
+        await worker(item);
+      }
+    }),
+  );
 }
 
 // AI context generation is CLI-only (gitnexus analyze)
@@ -1239,6 +1376,20 @@ interface RepoHandle {
   generationUnknown?: boolean;
 }
 
+/**
+ * Git `--name-status` letter → the `change_type` repo_changes reports. `T`
+ * (file ↔ symlink/submodule) is a content change with no better fit.
+ */
+const REPO_CHANGES_TYPES: Record<string, string> = {
+  A: 'added',
+  M: 'modified',
+  D: 'deleted',
+  T: 'modified',
+};
+
+/** Hard cap on the returned change list; callers treat a truncated list as "re-read". */
+const REPO_CHANGES_MAX_FILES = 1000;
+
 /** Resolve symlinks for path comparison; falls back to path.resolve on error.
  * Uses `realpathSync.native` (not the pure-JS `realpathSync`) so that Windows
  * 8.3 short names (e.g. RUNNER~1 → runneradmin) are expanded to long form,
@@ -1816,6 +1967,8 @@ export class LocalBackend {
   private contextCache: Map<string, CodebaseContext> = new Map();
   private initializedRepos: Set<string> = new Set();
   private reinitPromises: Map<string, Promise<void>> = new Map();
+  /** 跨仓库查询按仓库串行化的尾指针（个性化跨仓库 fan-out）。 */
+  private crossRepoOperationTails: Map<string, Promise<void>> = new Map();
   // #2655: commit-behind freshness for the hot read tools. Stores the IN-FLIGHT
   // promise (not just a timestamp) so N concurrent tool calls arriving before
   // the first `git rev-list` resolves share one subprocess instead of each
@@ -2684,6 +2837,9 @@ export class LocalBackend {
    * a pool entry even when their name-derived id transiently collides (#2067).
    */
   private async ensureInitialized(repo: RepoHandle): Promise<void> {
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) return;
+
     const poolKey = repo.lbugPath;
     const bindSnapshot = (): void => {
       const state = this.lastObservedPoolState.get(poolKey);
@@ -3126,6 +3282,533 @@ export class LocalBackend {
     return entry.value;
   }
 
+  private compactMatchSnippet(value: unknown): string | undefined {
+    if (typeof value !== 'string') return undefined;
+    const compacted = value.replace(/\s+/g, ' ').trim();
+    if (!compacted) return undefined;
+    return compacted.length > MATCH_SNIPPET_MAX_CHARS
+      ? `${compacted.slice(0, MATCH_SNIPPET_MAX_CHARS)}...`
+      : compacted;
+  }
+
+  private pushQueryCandidateMatch(
+    candidates: Map<string, QueryRepoCandidate>,
+    repo: RepoHandle,
+    match: QueryMatchSummary,
+  ): void {
+    const existing = candidates.get(repo.id);
+    if (existing) {
+      existing.score += match.score;
+      existing.matches.push(match);
+      return;
+    }
+    candidates.set(repo.id, { repo, score: match.score, matches: [match] });
+  }
+
+  private async runCrossRepoOperationForRepo<T>(
+    repoId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.crossRepoOperationTails.get(repoId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.catch(() => {}).then(() => gate);
+    this.crossRepoOperationTails.set(repoId, tail);
+
+    await previous.catch(() => {});
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.crossRepoOperationTails.get(repoId) === tail) {
+        this.crossRepoOperationTails.delete(repoId);
+      }
+    }
+  }
+
+  private async discoverQueryCandidates(
+    input: QueryDiscoveryInput,
+    repos: RepoHandle[],
+  ): Promise<QueryRepoCandidate[]> {
+    const keywordQuery = typeof input === 'string' ? input : input.keywordQuery;
+    const semanticQuery = typeof input === 'string' ? input : input.semanticQuery;
+    const candidates = new Map<string, QueryRepoCandidate>();
+    const scopedRepoIds = new Set(repos.map((repo) => repo.id));
+
+    const zoektTask = (async () => {
+      try {
+        const { ZoektClient, loadZoektConfig } = await import('../../core/search/zoekt-client.js');
+        const config = loadZoektConfig();
+        if (!config.enabled) return;
+
+        const result = await new ZoektClient(config).search(keywordQuery, {
+          maxDocDisplayCount: CROSS_REPO_ZOEKT_DISCOVERY_LIMIT,
+        });
+        result.matches.forEach((match, index) => {
+          const repo = this.resolveRepoFromZoektRepository(match.repository);
+          if (!repo || !scopedRepoIds.has(repo.id)) return;
+          const hitLine = this.getZoektHitLine(match);
+          this.pushQueryCandidateMatch(candidates, repo, {
+            repo: repo.name,
+            filePath: match.fileName,
+            source: 'zoekt',
+            score: SEARCH_SOURCE_WEIGHTS.zoekt / (RRF_K + index + 1),
+            startLine: hitLine ?? undefined,
+            endLine: hitLine ?? undefined,
+            snippet: this.compactMatchSnippet(
+              match.lineMatches?.find((line: any) => !line.isContext)?.line ??
+                match.lineMatches?.[0]?.line,
+            ),
+          });
+        });
+      } catch (e) {
+        console.error(`GitNexus: Zoekt discovery failed: ${e}`);
+      }
+    })();
+
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const vectorTask = isNeo4jBackendEnabled()
+      ? (async () => {
+          try {
+            const repoById = new Map(repos.map((repo) => [repo.name, repo]));
+            const { embedQuery } = await import('../core/embedder.js');
+            const queryVec = await embedQuery(semanticQuery);
+            const { semanticSearchMany } = await import('../../core/neo4j/embedding-adapter.js');
+            const matches = await semanticSearchMany(
+              repos.map((repo) => repo.name),
+              queryVec,
+              CROSS_REPO_VECTOR_MATCHES_PER_REPO * repos.length,
+            );
+            matches.forEach((match, index) => {
+              const repo = repoById.get(match.repoId ?? '');
+              if (!repo) return;
+              this.pushQueryCandidateMatch(candidates, repo, {
+                repo: repo.name,
+                filePath: match.filePath,
+                source: 'vector',
+                score: SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + index + 1),
+                id: match.nodeId,
+                name: match.name,
+                type: match.type,
+                startLine: match.startLine,
+                endLine: match.endLine,
+              });
+            });
+          } catch (e) {
+            logQueryError('query:vector-discovery:neo4j', e);
+          }
+        })()
+      : mapWithConcurrency(
+          repos,
+          positiveEnvInt(
+            'GITNEXUS_CROSS_REPO_VECTOR_CONCURRENCY',
+            CROSS_REPO_VECTOR_DISCOVERY_CONCURRENCY,
+          ),
+          async (repo) => {
+            try {
+              const matches = await this.runCrossRepoOperationForRepo(repo.id, async () => {
+                await this.ensureInitialized(repo);
+                return this.semanticSearch(repo, semanticQuery, CROSS_REPO_VECTOR_MATCHES_PER_REPO);
+              });
+              matches.forEach((match, index) => {
+                this.pushQueryCandidateMatch(candidates, repo, {
+                  repo: repo.name,
+                  filePath: match.filePath,
+                  source: 'vector',
+                  score: SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + index + 1),
+                  id: match.nodeId,
+                  name: match.name,
+                  type: match.type,
+                  startLine: match.startLine,
+                  endLine: match.endLine,
+                });
+              });
+            } catch (e) {
+              logQueryError(`query:vector-discovery:${repo.name}`, e);
+            }
+          },
+        );
+
+    await Promise.all([zoektTask, vectorTask]);
+
+    return [...candidates.values()]
+      .map((candidate) => ({
+        ...candidate,
+        matches: candidate.matches.sort((a, b) => b.score - a.score).slice(0, 10),
+      }))
+      .sort((a, b) => b.score - a.score);
+  }
+
+  private extractPathLikeHints(...texts: Array<string | undefined>): string[] {
+    const hints = new Set<string>();
+    const addHint = (raw: string) => {
+      const hint = raw
+        .trim()
+        .replace(/^["'`({\[]+/, '')
+        .replace(/["'`)}\]]+$/, '')
+        .replace(/\\/g, '/')
+        .replace(/^\/+/, '');
+      if (!hint) return;
+      const looksLikePath = hint.includes('/') || /\.[A-Za-z0-9]{2,8}$/.test(hint);
+      if (!looksLikePath) return;
+      hints.add(hint);
+      const basename = hint.split('/').pop();
+      if (basename && basename !== hint && /\.[A-Za-z0-9]{2,8}$/.test(basename)) {
+        hints.add(basename);
+      }
+    };
+
+    for (const text of texts) {
+      if (!text) continue;
+      const normalized = text.replace(/\\/g, '/');
+      for (const part of normalized.match(/"([^"]+)"/g) ?? []) addHint(part);
+      for (const token of normalized.split(/\s+|\b(?:AND|OR|NOT)\b|[(),]+/)) addHint(token);
+    }
+
+    return [...hints].slice(0, PATH_HINT_MAX_COUNT);
+  }
+
+  private getFileMatchKind(filePath: string, hints: string[]): FileMatchSummary['matchKind'] {
+    const normalizedPath = filePath.replace(/\\/g, '/').toLowerCase();
+    const basename = normalizedPath.split('/').pop() || normalizedPath;
+    for (const hint of hints) {
+      const normalizedHint = hint.replace(/\\/g, '/').toLowerCase();
+      if (normalizedPath === normalizedHint) return 'exact_path';
+      if (basename === normalizedHint) return 'basename';
+      if (normalizedPath.endsWith(`/${normalizedHint}`)) return 'suffix_path';
+    }
+    return 'content';
+  }
+
+  private fileMatchRank(kind: FileMatchSummary['matchKind']): number {
+    switch (kind) {
+      case 'exact_path':
+        return 0;
+      case 'suffix_path':
+        return 1;
+      case 'basename':
+        return 2;
+      case 'content':
+        return 3;
+    }
+  }
+
+  private fileMatchSourceRank(source: FileMatchSource): number {
+    switch (source) {
+      case 'path':
+        return 0;
+      case 'bm25':
+        return 1;
+      case 'zoekt':
+        return 2;
+    }
+  }
+
+  private shouldReplaceFileMatch(existing: FileMatchSummary, next: FileMatchSummary): boolean {
+    const kindDiff = this.fileMatchRank(next.matchKind) - this.fileMatchRank(existing.matchKind);
+    if (kindDiff !== 0) return kindDiff < 0;
+    const sourceDiff =
+      this.fileMatchSourceRank(next.source) - this.fileMatchSourceRank(existing.source);
+    if (sourceDiff !== 0) return sourceDiff < 0;
+    return next.score > existing.score;
+  }
+
+  private buildFileMatchesFromResults(
+    repo: RepoHandle,
+    results: any[],
+    hints: string[],
+  ): FileMatchSummary[] {
+    const byPath = new Map<string, FileMatchSummary>();
+    for (const result of results) {
+      const filePath = result.filePath;
+      if (!filePath || result.type !== 'File') continue;
+      const match: FileMatchSummary = {
+        repo: repo.name,
+        name: result.name || filePath.split('/').pop() || filePath,
+        type: 'File',
+        filePath,
+        score: result.bm25Score ?? result.zoektScore ?? 0,
+        source: result.fileMatchSource ?? (result.bm25Score !== undefined ? 'bm25' : 'zoekt'),
+        matchKind: this.getFileMatchKind(filePath, hints),
+      };
+      const existing = byPath.get(filePath);
+      if (!existing || this.shouldReplaceFileMatch(existing, match)) byPath.set(filePath, match);
+    }
+    return [...byPath.values()]
+      .sort((a, b) => {
+        const kindDiff = this.fileMatchRank(a.matchKind) - this.fileMatchRank(b.matchKind);
+        if (kindDiff !== 0) return kindDiff;
+        const sourceDiff = this.fileMatchSourceRank(a.source) - this.fileMatchSourceRank(b.source);
+        if (sourceDiff !== 0) return sourceDiff;
+        return b.score - a.score;
+      })
+      .slice(0, PATH_MATCH_LIMIT);
+  }
+
+  private buildPathDiagnostics(
+    hints: string[],
+    fileMatches: FileMatchSummary[],
+    backend: PathDiagnostics['backend'],
+    ftsAvailable?: boolean,
+  ): PathDiagnostics {
+    const normalizedHints = hints.map((hint) => hint.replace(/\\/g, '/').toLowerCase());
+    const exactPathFound = fileMatches.some((match) => {
+      const filePath = match.filePath.replace(/\\/g, '/').toLowerCase();
+      return normalizedHints.some((hint) => filePath === hint);
+    });
+    return {
+      backend,
+      searchedHints: hints,
+      exactPathFound,
+      nearest: fileMatches.slice(0, PATH_MATCH_LIMIT),
+      ...(ftsAvailable !== undefined ? { ftsAvailable } : {}),
+    };
+  }
+
+  private resolveRepoFromZoektRepository(rawName: string): RepoHandle | null {
+    let handle = this.resolveRepoFromCache(rawName);
+    if (handle) return handle;
+
+    const segments = rawName.split('/');
+    for (let i = 0; i < segments.length; i++) {
+      const suffix = segments.slice(i).join('/');
+      handle = this.resolveRepoFromCache(suffix);
+      if (handle) return handle;
+    }
+    return null;
+  }
+  private selectTopMatchesWithRepoCoverage(
+    matches: QueryMatchSummary[],
+    limit: number,
+  ): QueryMatchSummary[] {
+    const sorted = [...matches].sort((a, b) => b.score - a.score);
+    const selected: QueryMatchSummary[] = [];
+    const selectedMatches = new Set<QueryMatchSummary>();
+    const coveredRepos = new Set<string>();
+
+    for (const match of sorted) {
+      if (selected.length >= limit) break;
+      if (coveredRepos.has(match.repo)) continue;
+      selected.push(match);
+      selectedMatches.add(match);
+      coveredRepos.add(match.repo);
+    }
+
+    for (const match of sorted) {
+      if (selected.length >= limit) break;
+      if (selectedMatches.has(match)) continue;
+      selected.push(match);
+    }
+
+    return selected.sort((a, b) => b.score - a.score);
+  }
+
+  /**
+   * Merge results from multiple single-repo query calls into one unified response.
+   */
+  private mergeQueryResults(results: any[]): any {
+    if (results.length === 0) return { processes: [], process_symbols: [], definitions: [] };
+    if (results.length === 1 && !results[0]?.error && !Array.isArray(results[0]?.errors)) {
+      return results[0];
+    }
+
+    const merged = {
+      processes: [] as any[],
+      process_symbols: [] as any[],
+      definitions: [] as any[],
+      matches: [] as QueryMatchSummary[],
+      matched_repos: [] as string[],
+      timing: { wall: 0 } as Record<string, number>,
+      warning: undefined as string | undefined,
+      errors: [] as Array<{ repo?: string; error: string }>,
+    };
+
+    const seenSymbolIds = new Set<string>();
+    const seenProcessIds = new Set<string>();
+    const matchIndexByKey = new Map<string, number>();
+
+    const getMatchKey = (match: QueryMatchSummary): string =>
+      match.id
+        ? `${match.repo}:${match.id}`
+        : `${match.repo}:${match.filePath}:${match.source}`;
+
+    for (const res of results) {
+      if (res?.error) {
+        merged.errors.push({ repo: res.repo, error: String(res.error) });
+        continue;
+      }
+      if (Array.isArray(res?.errors)) {
+        merged.errors.push(
+          ...res.errors.map((error: any) => ({
+            repo: error?.repo,
+            error: String(error?.error ?? error),
+          })),
+        );
+      }
+      if (res.processes) {
+        for (const p of res.processes) {
+          const key = `${p.repo ?? ''}:${p.id}`;
+          if (!seenProcessIds.has(key)) {
+            merged.processes.push(p);
+            seenProcessIds.add(key);
+          }
+        }
+      }
+      if (res.process_symbols) {
+        for (const s of res.process_symbols) {
+          const key = `${s.repo ?? ''}:${s.id}`;
+          if (!seenSymbolIds.has(key)) {
+            merged.process_symbols.push(s);
+            seenSymbolIds.add(key);
+          }
+        }
+      }
+      if (res.definitions) {
+        for (const d of res.definitions) {
+          const fallbackKey = `${d.repo ?? ''}:${d.filePath}:${d.name}`;
+          const key = d.id ? `${d.repo ?? ''}:${d.id}` : fallbackKey;
+          if (!seenSymbolIds.has(key)) {
+            merged.definitions.push(d);
+            seenSymbolIds.add(key);
+          }
+        }
+      }
+      if (res.matches) {
+        for (const match of res.matches) {
+          const normalizedMatch = { ...match };
+          const key = getMatchKey(normalizedMatch);
+          const existingIndex = matchIndexByKey.get(key);
+          if (existingIndex === undefined) {
+            merged.matches.push(match);
+            matchIndexByKey.set(key, merged.matches.length - 1);
+          } else if (
+            (normalizedMatch.score ?? 0) >
+            (merged.matches[existingIndex]?.score ?? 0)
+          ) {
+            merged.matches[existingIndex] = normalizedMatch;
+          }
+        }
+      }
+      if (res.timing) {
+        merged.timing.wall = Math.max(merged.timing.wall, res.timing.wall || 0);
+        // Accumulate other phases if helpful, but wall is primary
+      }
+      if (res.warning) merged.warning = res.warning;
+    }
+
+    // Re-sort processes by priority across all repos
+    merged.processes = merged.processes.sort((a, b) => b.priority - a.priority).slice(0, 10);
+    merged.definitions = merged.definitions.slice(0, 30);
+    merged.matches = this.selectTopMatchesWithRepoCoverage(merged.matches, 50);
+    merged.matched_repos = [...new Set(merged.matches.map((match) => match.repo))];
+    if (merged.errors.length === 0) delete (merged as any).errors;
+    if (merged.matches.length === 0) {
+      delete (merged as any).matches;
+      delete (merged as any).matched_repos;
+    }
+
+    return merged;
+  }
+  private getZoektHitLine(match: any): number | null {
+    const hitLine =
+      match.lineMatches?.find((line: any) => !line.isContext && Number.isFinite(line.lineNumber))
+        ?.lineNumber ??
+      match.lineMatches?.find((line: any) => Number.isFinite(line.lineNumber))?.lineNumber;
+
+    return Number.isFinite(hitLine) ? hitLine : null;
+  }
+
+  private toZoektSymbol(row: any, match: any): any {
+    const nodeId = row.id ?? row.nodeId ?? row[0];
+    if (!nodeId) return null;
+    return {
+      nodeId,
+      name: row.name ?? row[1] ?? match.fileName.split('/').pop() ?? match.fileName,
+      type: row.type ?? row[2],
+      filePath: row.filePath ?? row[3] ?? match.fileName,
+      startLine: row.startLine ?? row[4],
+      endLine: row.endLine ?? row[5],
+      zoektScore: match.score,
+    };
+  }
+
+  private async resolveZoektMatchSymbols(
+    repo: RepoHandle,
+    matches: any[],
+  ): Promise<Map<number, any>> {
+    const hits = matches
+      .map((match, index) => ({ match, index, lineNumber: this.getZoektHitLine(match) }))
+      .filter(
+        (hit): hit is { match: any; index: number; lineNumber: number } => hit.lineNumber !== null,
+      );
+
+    const resolved = new Map<number, any>();
+    if (hits.length === 0) return resolved;
+
+    const queryParams: Record<string, string | number> = {};
+    const clauses = hits.map((hit, i) => {
+      queryParams[`filePath${i}`] = hit.match.fileName;
+      queryParams[`lineNumber${i}`] = hit.lineNumber;
+      return `(n.filePath = $filePath${i} AND n.startLine <= $lineNumber${i} AND n.endLine >= $lineNumber${i})`;
+    });
+
+    try {
+      const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+      const rows = isNeo4jBackendEnabled()
+        ? await (async () => {
+            const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+            return await executeReadCypher(
+              `
+        MATCH (n {repoId: $repoId})
+        WHERE labels(n)[0] IN ['Function', 'Method', 'Class', 'Interface', 'Constructor', 'Route', 'Tool']
+          AND (${clauses.join(' OR ')})
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+        ORDER BY (n.endLine - n.startLine) ASC
+      `,
+              { repoId: repo.name, ...queryParams },
+            );
+          })()
+        : await executeParameterized(
+            repo.id,
+            `
+        MATCH (n)
+        WHERE labels(n)[0] IN ['Function', 'Method', 'Class', 'Interface', 'Constructor', 'Route', 'Tool']
+          AND (${clauses.join(' OR ')})
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+        ORDER BY (n.endLine - n.startLine) ASC
+      `,
+            queryParams,
+          );
+      for (const hit of hits) {
+        const row = rows
+          .filter((candidate: any) => {
+            const filePath = candidate.filePath ?? candidate[3];
+            const startLine = candidate.startLine ?? candidate[4];
+            const endLine = candidate.endLine ?? candidate[5];
+            return (
+              filePath === hit.match.fileName &&
+              startLine <= hit.lineNumber &&
+              endLine >= hit.lineNumber
+            );
+          })
+          .sort((a: any, b: any) => {
+            const aWidth = (a.endLine ?? a[5] ?? 0) - (a.startLine ?? a[4] ?? 0);
+            const bWidth = (b.endLine ?? b[5] ?? 0) - (b.startLine ?? b[4] ?? 0);
+            return aWidth - bWidth;
+          })[0];
+        if (row) {
+          const sym = this.toZoektSymbol(row, hit.match);
+          if (sym) resolved.set(hit.index, sym);
+        }
+      }
+    } catch (e) {
+      logQueryError('query:zoekt-symbol-lookup', e);
+    }
+    return resolved;
+  }
+
   async callTool(method: string, params: any, context: McpToolCallContext = {}): Promise<any> {
     if (method === 'list_repos') {
       // Paginated tool surface (#2119). `listRepos()` is unchanged for internal
@@ -3174,7 +3857,83 @@ export class LocalBackend {
     // a call that cannot write: dry_run omitted or literally true. dry_run:false -
     // and any malformed value, which the planner then rejects - keeps the stricter
     // mutating rule: an explicit repo, one indexed repo, or an MCP default.
-    const repo = await this.selectToolRepository(
+    // Unscoped query is the only tool that fans out across repositories. The
+    // caller's policy layer may narrow this set before reaching this backend.
+    if (method === 'query' && p.repo === undefined && this.repos.size > 1) {
+      const explicitSearchQuery = resolveAliasString(
+        p.search_query as string | undefined,
+        p.query as string | undefined,
+      );
+      const zoektQuery = typeof p.zoekt === 'string' ? p.zoekt.trim() : '';
+      const searchQuery = explicitSearchQuery || semanticQueryFromZoekt(zoektQuery);
+      const repos = [...this.repos.values()];
+      const candidates = searchQuery || zoektQuery
+        ? await this.discoverQueryCandidates(
+            {
+              keywordQuery: zoektQuery || searchQuery,
+              semanticQuery: searchQuery || zoektQuery,
+            },
+            repos,
+          )
+        : [];
+      const candidateByRepo = new Map(candidates.map((candidate) => [candidate.repo.id, candidate]));
+      const selected = repos
+        .map((repo) => candidateByRepo.get(repo.id) ?? { repo, score: 0, matches: [] })
+        .sort((a, b) => b.score - a.score);
+      const results = await Promise.all(
+        selected.map(async (candidate) => {
+          try {
+            const discoveredSemanticResults = candidate.matches
+              .filter((match) => match.source === 'vector' && match.id)
+              .map((match) => ({
+                repoId: candidate.repo.name,
+                nodeId: match.id,
+                name: match.name,
+                type: match.type,
+                filePath: match.filePath,
+                startLine: match.startLine,
+                endLine: match.endLine,
+              }));
+            const result = await this.runCrossRepoOperationForRepo(candidate.repo.id, () =>
+              this.query(candidate.repo, {
+                ...p,
+                ...(explicitSearchQuery || searchQuery
+                  ? { search_query: explicitSearchQuery || searchQuery }
+                  : {}),
+                _discoveredSemanticResults: discoveredSemanticResults,
+              }),
+            );
+            const candidateMatches = candidate.matches.map((match) => ({ ...match }));
+            return {
+              ...result,
+              repo: candidate.repo.name,
+              processes: (result?.processes ?? []).map((item: any) => ({
+                ...item,
+                repo: item.repo ?? candidate.repo.name,
+              })),
+              process_symbols: (result?.process_symbols ?? []).map((item: any) => ({
+                ...item,
+                repo: item.repo ?? candidate.repo.name,
+              })),
+              definitions: (result?.definitions ?? []).map((item: any) => ({
+                ...item,
+                repo: item.repo ?? candidate.repo.name,
+              })),
+              matches: [...candidateMatches, ...(result?.matches ?? [])].map((item: any) => ({
+                ...item,
+                repo: item.repo ?? candidate.repo.name,
+              })),
+            };
+          } catch (error) {
+            return { repo: candidate.repo.name, error: error instanceof Error ? error.message : String(error) };
+          }
+        }),
+      );
+      return this.mergeQueryResults(results);
+    }
+    let repo: RepoHandle;
+    try {
+      repo = await this.selectToolRepository(
       p.repo as string | undefined,
       p.branch as string | undefined,
       {
@@ -3183,11 +3942,33 @@ export class LocalBackend {
             ? false
             : method !== 'rename' || p.dry_run === undefined || p.dry_run === true,
       },
-    );
+      );
+    } catch (error) {
+      // repo_changes answers "unknown" instead of failing the call: a caller
+      // that cached against an unindexed branch must be able to tell that apart
+      // from "nothing changed".
+      if (method === 'repo_changes') {
+        return {
+          state: 'unknown',
+          reason: 'repo_not_indexed',
+          current_commit: null,
+          index_freshness: null,
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
+      throw error;
+    }
 
     switch (method) {
-      case 'query':
-        return this.withToolStaleness(repo, await this.query(repo, p));
+      case 'query': {
+        const explicitSearchQuery = resolveAliasString(p.search_query, p.query);
+        const zoektQuery = typeof p.zoekt === 'string' ? p.zoekt.trim() : '';
+        const queryParams =
+          explicitSearchQuery || !zoektQuery
+            ? p
+            : { ...p, search_query: semanticQueryFromZoekt(zoektQuery) };
+        return this.withToolStaleness(repo, await this.query(repo, queryParams));
+      }
       case 'cypher': {
         const raw = await this.cypher(repo, p);
         return this.withToolStaleness(repo, this.formatCypherAsMarkdown(raw));
@@ -3232,9 +4013,309 @@ export class LocalBackend {
         return this.withToolStaleness(repo, await this.grep(repo, p));
       case MCP_REFRESH_TOOL:
         return this.refreshIndex(repo, p, context);
+      case 'git_author_trace':
+        return this.gitAuthorTrace(repo, p);
+      case 'repo_changes':
+        return this.repoChanges(repo, p);
       default:
         throw new Error(`Unknown tool: ${method}`);
     }
+  }
+
+  private resolveSourcePath(repo: RepoHandle, filePath: string): string {
+    if (!filePath || typeof filePath !== 'string') {
+      throw new Error('filePath is required');
+    }
+    const repoRoot = path.resolve(repo.repoPath);
+    const candidate = path.isAbsolute(filePath)
+      ? path.resolve(filePath)
+      : path.resolve(repoRoot, filePath);
+    const rel = path.relative(repoRoot, candidate);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error('filePath is outside repository');
+    }
+    return candidate;
+  }
+
+  /**
+   * Repo changes — files changed between a caller-recorded baseline commit and
+   * this branch's indexed version, read from the local Git history. The end
+   * point is deliberately the indexed commit, not the branch's live tip.
+   */
+  private async repoChanges(
+    repo: RepoHandle,
+    params: { since?: string; paths?: string[] },
+  ): Promise<any> {
+    const since = String(params.since ?? '').trim();
+    const currentCommit = repo.lastCommit;
+    const { execFileSync, spawnSync } = await import('child_process');
+
+    // Baseline-rebuilding fields, present on every answer (null only when there
+    // is no index to report). `files` is deliberately NOT part of this base: an
+    // unknown answer must carry no change list for a caller to misread.
+    const unknownAnswer = (reason: string, message: string) => ({
+      current_commit: currentCommit,
+      index_freshness: repo.indexedAt,
+      state: 'unknown',
+      reason,
+      message,
+    });
+
+    const gitOptions = {
+      cwd: repo.repoPath,
+      encoding: 'utf-8' as const,
+      windowsHide: true,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    };
+
+    // Only a commit hash is understood — ISO times, tags and branch names have
+    // no single obvious meaning as a baseline here. Four is git's own shortest
+    // unambiguous abbreviation.
+    if (!/^[0-9a-f]{4,64}$/i.test(since)) {
+      return unknownAnswer('query_failed', `since must be a commit hash; got "${since}"`);
+    }
+
+    // Exit code 1 means "both commits exist, but unrelated" — a baseline from
+    // another line of history is not one we can diff against.
+    const ancestry = spawnSync(
+      'git',
+      ['merge-base', '--is-ancestor', since, currentCommit],
+      gitOptions,
+    );
+    if (ancestry.status === 1) {
+      return unknownAnswer(
+        'baseline_not_found',
+        `baseline commit "${since}" is not an ancestor of the indexed version`,
+      );
+    }
+    if (ancestry.status !== 0) {
+      const resolved = spawnSync(
+        'git',
+        ['rev-parse', '--verify', '--quiet', `${since}^{commit}`],
+        gitOptions,
+      );
+      if (resolved.status !== 0) {
+        return unknownAnswer(
+          'baseline_not_found',
+          `baseline commit "${since}" is not in this repository`,
+        );
+      }
+      return unknownAnswer('query_failed', `git ancestry check failed: ${ancestry.stderr.trim()}`);
+    }
+
+    // Per commit, oldest first, so a path's entry ends up describing its LAST
+    // operation in the window — a file changed and later reverted still shows.
+    // --no-renames keeps renames as a plain delete + add, which needs no special
+    // path handling. --diff-merges=first-parent is required for a merge to
+    // report its own changes at all (the default prints none), which is where a
+    // conflict resolution's edits live.
+    let output: string;
+    try {
+      output = execFileSync(
+        'git',
+        [
+          // Paths must come back as written: git's default quoting octal-escapes
+          // every non-ASCII path, which would match neither the caller's own
+          // `paths` filter nor a readable file name.
+          '-c',
+          'core.quotePath=false',
+          'log',
+          '--reverse',
+          '--no-renames',
+          '--diff-merges=first-parent',
+          '--name-status',
+          '--format=@%H',
+          `${since}..${currentCommit}`,
+        ],
+        { ...gitOptions, maxBuffer: 16 * 1024 * 1024 },
+      );
+    } catch (error) {
+      return unknownAnswer(
+        'query_failed',
+        `git log failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    // Path-scope match is on segment boundaries: `src/nested` covers its own
+    // files but never the sibling directory `src/nestedOther`. A `paths` that is
+    // not a list is treated as no scope — over-reporting beats a false "no
+    // changes".
+    const scopes = (Array.isArray(params.paths) ? params.paths : []).map((entry) =>
+      String(entry).replace(/\/+$/, ''),
+    );
+    const inScope = (filePath: string): boolean =>
+      scopes.length === 0 || scopes.some((s) => filePath === s || filePath.startsWith(`${s}/`));
+
+    const changes = new Map<string, string>();
+    for (const line of output.split('\n')) {
+      // Commit headers are prefixed with '@' so they can never be mistaken for
+      // a `--name-status` record, whose first field is a status letter.
+      if (line === '' || line.startsWith('@')) continue;
+      const [status, filePath] = line.split('\t');
+      const changeType = REPO_CHANGES_TYPES[status.charAt(0)];
+      if (filePath && changeType && inScope(filePath)) changes.set(filePath, changeType);
+    }
+
+    const matched = [...changes].map(([filePath, changeType]) => ({
+      path: filePath,
+      change_type: changeType,
+    }));
+    const truncated = matched.length > REPO_CHANGES_MAX_FILES;
+    const files = truncated ? matched.slice(0, REPO_CHANGES_MAX_FILES) : matched;
+
+    return {
+      state: 'ok',
+      current_commit: currentCommit,
+      index_freshness: repo.indexedAt,
+      files,
+      truncated,
+    };
+  }
+
+  private async gitAuthorTrace(
+    repo: RepoHandle,
+    params?: {
+      filePath?: string;
+      startLine?: number;
+      endLine?: number;
+      includeHistory?: boolean;
+      maxCommits?: number;
+    },
+  ): Promise<any> {
+    const filePath = String(params?.filePath ?? '');
+    const startLine = Math.max(1, Math.trunc(Number(params?.startLine ?? 1)));
+    const endLine = Math.max(startLine, Math.trunc(Number(params?.endLine ?? startLine)));
+    const fullPath = this.resolveSourcePath(repo, filePath);
+    const relPath = path.relative(repo.repoPath, fullPath).replace(/\\/g, '/');
+    const { execFileSync } = await import('child_process');
+    const shallow = execFileSync('git', ['rev-parse', '--is-shallow-repository'], {
+      cwd: repo.repoPath,
+      encoding: 'utf-8',
+      maxBuffer: 1024 * 1024 * 5,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    }).trim();
+    if (shallow === 'true') {
+      return {
+        repo: repo.name,
+        filePath: relPath,
+        startLine,
+        endLine,
+        primaryAuthors: [],
+        commits: [],
+        truncatedHistory: false,
+        warnings: ['浅克隆,无法获取真正修改人'],
+      };
+    }
+    const blame = execFileSync(
+      'git',
+      ['blame', '--line-porcelain', `-L`, `${startLine},${endLine}`, '--', relPath],
+      {
+        cwd: repo.repoPath,
+        encoding: 'utf-8',
+        maxBuffer: 1024 * 1024 * 5,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      },
+    );
+    const authors = new Map<
+      string,
+      { name: string; email: string; lines: number[]; lastSummary?: string }
+    >();
+    const blameCommits = new Map<
+      string,
+      { commit: string; authorName?: string; authorEmail?: string; summary?: string }
+    >();
+    const warnings: string[] = [];
+    let currentCommit = '';
+    let currentLine = startLine - 1;
+    for (const line of blame.split(/\r?\n/)) {
+      const header = /^(\^?[0-9a-f]{40})\s+\d+\s+(\d+)/.exec(line);
+      if (header) {
+        currentCommit = header[1];
+        currentLine = Number(header[2]);
+        if (currentCommit.startsWith('^')) {
+          if (!warnings.includes('浅克隆,无法获取真正修改人')) {
+            warnings.push('浅克隆,无法获取真正修改人');
+          }
+          currentCommit = '';
+          continue;
+        }
+        if (!blameCommits.has(currentCommit)) {
+          blameCommits.set(currentCommit, { commit: currentCommit });
+        }
+      } else if (line.startsWith('author ') && currentCommit) {
+        blameCommits.get(currentCommit)!.authorName = line.slice('author '.length);
+      } else if (line.startsWith('author-mail ') && currentCommit) {
+        blameCommits.get(currentCommit)!.authorEmail = line
+          .slice('author-mail '.length)
+          .replace(/^<|>$/g, '');
+      } else if (line.startsWith('summary ') && currentCommit) {
+        blameCommits.get(currentCommit)!.summary = line.slice('summary '.length);
+      } else if (line.startsWith('\t') && currentCommit) {
+        const commit = blameCommits.get(currentCommit);
+        if (commit?.authorName && commit.authorEmail) {
+          const key = `${commit.authorName}\n${commit.authorEmail}`;
+          const author =
+            authors.get(key) ??
+            ({
+              name: commit.authorName,
+              email: commit.authorEmail,
+              lines: [],
+              lastSummary: commit.summary,
+            } as { name: string; email: string; lines: number[]; lastSummary?: string });
+          author.lines.push(currentLine);
+          author.lastSummary = commit.summary;
+          authors.set(key, author);
+        }
+      }
+    }
+    const includeHistory = params?.includeHistory !== false;
+    const maxCommits = Math.max(1, Math.min(100, Math.trunc(Number(params?.maxCommits ?? 20))));
+    let commits: Array<{
+      commit: string;
+      authorName: string;
+      authorEmail: string;
+      summary: string;
+    }> = [];
+    let truncatedHistory = false;
+    if (includeHistory && warnings.length === 0) {
+      const log = execFileSync(
+        'git',
+        [
+          'log',
+          `--max-count=${maxCommits + 1}`,
+          '--format=%H%x1f%an%x1f%ae%x1f%s',
+          `-L`,
+          `${startLine},${endLine}:${relPath}`,
+        ],
+        {
+          cwd: repo.repoPath,
+          encoding: 'utf-8',
+          maxBuffer: 1024 * 1024 * 5,
+          env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+        },
+      );
+      const rows = log
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .filter((line) => /^[0-9a-f]{40}\x1f/.test(line))
+        .map((line) => {
+          const [commit, authorName, authorEmail, summary] = line.split('\x1f');
+          return { commit, authorName, authorEmail, summary };
+        });
+      truncatedHistory = rows.length > maxCommits;
+      commits = rows.slice(0, maxCommits);
+    }
+    return {
+      repo: repo.name,
+      filePath: relPath,
+      startLine,
+      endLine,
+      primaryAuthors: warnings.length ? [] : [...authors.values()],
+      commits: warnings.length ? [] : commits,
+      truncatedHistory,
+      warnings,
+    };
   }
 
   /** Indexes with a `refresh_index` run in flight, keyed by storage slot (#3524). */
@@ -3501,12 +4582,15 @@ export class LocalBackend {
     params: {
       query?: string;
       search_query?: string;
+      zoekt?: string;
       task_context?: string;
       goal?: string;
       limit?: number;
       max_symbols?: number;
       include_content?: boolean;
       chain_depth?: number;
+      /** Internal cross-repository vector results; not part of the MCP schema. */
+      _discoveredSemanticResults?: any[];
     },
   ): Promise<any> {
     try {
@@ -3526,12 +4610,15 @@ export class LocalBackend {
     params: {
       query?: string;
       search_query?: string;
+      zoekt?: string;
       task_context?: string;
       goal?: string;
       limit?: number;
       max_symbols?: number;
       include_content?: boolean;
       chain_depth?: number;
+      /** Internal cross-repository vector results; not part of the MCP schema. */
+      _discoveredSemanticResults?: any[];
     },
   ): Promise<any> {
     // #2175: each consumer resolves the search_query/query alias itself (there is no
@@ -3561,8 +4648,14 @@ export class LocalBackend {
     const processLimit = parsedLimit.value;
     const maxSymbolsPerProcess = parsedMaxSymbols.value;
     const requestedChainDepth = parsedChainDepth.value;
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const neo4jBackendEnabled = isNeo4jBackendEnabled();
+    // Neo4j 是远程后端，任何情况下都不能打开每个仓库的 LadybugDB 连接池。
+    // 在 query 入口显式拦截，避免仅依赖 ensureInitialized() 内部提前返回。
+    if (!neo4jBackendEnabled) {
+      await this.ensureInitialized(repo);
+    }
 
-    await this.ensureInitialized(repo);
     const requestedContent = params.include_content ?? false;
     // Do not trust a lingering graph property when the metadata contract says
     // source-derived text is unavailable. A full rebuild normally removes the
@@ -3590,9 +4683,50 @@ export class LocalBackend {
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
     const ftsDisabledReason = getFtsDisabledReason(meta?.capabilities?.fts);
     const vectorDegraded = { reason: undefined as string | undefined };
-    const [bm25Outcome, semanticOutcome] = await Promise.allSettled([
-      timer.time('bm25', this.bm25Search(repo, searchQuery, searchLimit, ftsDisabledReason)),
-      timer.time('vector', this.semanticSearch(repo, searchQuery, searchLimit, vectorDegraded)),
+    // 个性化：Zoekt 关键词检索与语义超时（含跨仓库预取的语义结果直接复用）。
+    const zoektQuery = params.zoekt?.trim() || searchQuery;
+    let semanticSearchTimedOut = false;
+    const semanticTimeoutMs = getQuerySemanticTimeoutMs();
+    const semanticSearchPromise =
+      params._discoveredSemanticResults !== undefined
+        ? Promise.resolve(params._discoveredSemanticResults)
+        : this.semanticSearch(repo, searchQuery, searchLimit, vectorDegraded);
+    const zoektConfig = loadZoektConfig();
+    const zoektSearchPromise = zoektConfig.enabled
+      ? new ZoektClient(zoektConfig)
+          .search(zoektQuery, {
+            repoFilter: repo.name,
+            maxDocDisplayCount: searchLimit,
+          })
+          .catch((err) => {
+            logger.warn(
+              { err: err instanceof Error ? err.message : String(err), repo: repo.name },
+              'GitNexus: Zoekt search degraded for query',
+            );
+            return { matches: [], stats: { matchCount: 0, durationMs: 0 } };
+          })
+      : Promise.resolve({ matches: [], stats: { matchCount: 0, durationMs: 0 } });
+    const [bm25Outcome, semanticOutcome, zoektOutcome] = await Promise.allSettled([
+      timer.time('bm25', this.bm25Search(repo, zoektQuery, searchLimit, ftsDisabledReason)),
+      timer.time(
+        'vector',
+        (semanticTimeoutMs === undefined
+          ? semanticSearchPromise
+          : withTimeout(
+              semanticSearchPromise,
+              semanticTimeoutMs,
+              `Semantic vector search exceeded ${semanticTimeoutMs}ms`,
+            )
+        ).catch((err) => {
+          semanticSearchTimedOut = semanticTimeoutMs !== undefined;
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err), timeoutMs: semanticTimeoutMs },
+            'GitNexus: semantic vector search degraded for query',
+          );
+          return [];
+        }),
+      ),
+      timer.time('zoekt', zoektSearchPromise),
     ]);
     // A rejected lane must not let the other lane outlive query(). In particular,
     // semantic search may still be importing the embedder and can start its
@@ -3601,8 +4735,10 @@ export class LocalBackend {
     // precedence for callers.
     if (bm25Outcome.status === 'rejected') throw bm25Outcome.reason;
     if (semanticOutcome.status === 'rejected') throw semanticOutcome.reason;
+    if (zoektOutcome.status === 'rejected') throw zoektOutcome.reason;
     const bm25SearchResult = bm25Outcome.value;
     const semanticResults = semanticOutcome.value;
+    const zoektResult = zoektOutcome.value;
 
     // Guard against undefined results (#1489) — when FTS is entirely
     // unavailable the search helper may return an unexpected shape.
@@ -3624,6 +4760,15 @@ export class LocalBackend {
         logger.warn({ context: 'query:fts-search', err }, 'GitNexus query failed (degraded)');
       }
     }
+    // 个性化：Neo4j 后端在 FTS 未命中时用路径线索兜底召回。
+    const pathHints = this.extractPathLikeHints(searchQuery, params.zoekt);
+    const pathResults =
+      neo4jBackendEnabled && pathHints.length > 0 && !ftsUsed
+        ? await timer.time(
+            'path',
+            this.findNeo4jFilePathMatches(repo, pathHints, searchLimit),
+          )
+        : [];
 
     // Merge via reciprocal rank fusion
     timer.start('merge');
@@ -3636,7 +4781,7 @@ export class LocalBackend {
       }
       assertIdentityFields(result.name, result.type, result.filePath);
       const key = result.nodeId || result.filePath;
-      const rrfScore = 1 / (60 + i);
+      const rrfScore = SEARCH_SOURCE_WEIGHTS.bm25 / (RRF_K + i + 1);
       const existing = scoreMap.get(key);
       if (existing) {
         existing.score += rrfScore;
@@ -3651,7 +4796,7 @@ export class LocalBackend {
       assertSymbolIdentity(result.nodeId);
       assertIdentityFields(result.name, result.type, result.filePath);
       const key = result.nodeId || result.filePath;
-      const rrfScore = 1 / (60 + i);
+      const rrfScore = SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + i + 1);
       const existing = scoreMap.get(key);
       if (existing) {
         existing.score += rrfScore;
@@ -3666,6 +4811,26 @@ export class LocalBackend {
     // is DB row order. The expansion queries feeding `bm25Results` are ordered
     // now, so this is belt-and-braces; it also stops a future unordered query
     // upstream from silently reintroducing the drift at the `slice` boundary.
+    const zoektMatches = zoektResult?.matches ?? [];
+    const zoektSymbols = await this.resolveZoektMatchSymbols(repo, zoektMatches);
+    for (let i = 0; i < zoektMatches.length; i++) {
+      const match = zoektMatches[i];
+      const symbol = zoektSymbols.get(i);
+      const data = symbol ?? {
+        name: match.fileName.split('/').pop() || match.fileName,
+        type: 'File',
+        filePath: match.fileName,
+        zoektScore: match.score,
+      };
+      const key = data.nodeId || `File:${data.filePath}`;
+      const rrfScore = SEARCH_SOURCE_WEIGHTS.zoekt / (RRF_K + i + 1);
+      const existing = scoreMap.get(key);
+      if (existing) {
+        existing.score += rrfScore;
+      } else {
+        scoreMap.set(key, { score: rrfScore, data });
+      }
+    }
     const merged = Array.from(scoreMap.entries())
       .sort((a, b) => b[1].score - a[1].score || compareCodeUnits(a[0], b[0]))
       .slice(0, searchLimit);
@@ -3710,16 +4875,28 @@ export class LocalBackend {
       // symbol with `is_entry_point: true` in `process_symbols` and (b) look up
       // the route attached to this process (if any) via ENTRY_POINT_OF.
       try {
-        const rows = await executeParameterized(
-          repo.lbugPath,
-          `
-          MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-          WHERE n.id IN $nodeIds
-          RETURN n.id AS nodeId, p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step, p.entryPointId AS entryPointId
-          ORDER BY nodeId, pid, step
-        `,
-          { nodeIds: ids },
-        );
+        const rows = neo4jBackendEnabled
+          ? await (
+              await import('../../core/neo4j/read-adapter.js')
+            ).executeReadCypher(
+              `
+              UNWIND $nodeIds AS nodeId
+              MATCH (n:CodeNode {repoId: $repoId, id: nodeId})-[r:STEP_IN_PROCESS]->(p:Process {repoId: $repoId})
+              RETURN n.id AS nodeId, p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step, p.entryPointId AS entryPointId
+              ORDER BY nodeId, pid, step
+            `,
+              { repoId: repo.name, nodeIds: ids },
+            )
+          : await executeParameterized(
+              repo.lbugPath,
+              `
+              MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+              WHERE n.id IN $nodeIds
+              RETURN n.id AS nodeId, p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step, p.entryPointId AS entryPointId
+              ORDER BY nodeId, pid, step
+            `,
+              { nodeIds: ids },
+            );
         for (const row of rows) {
           assertQueryIdentity(row, 'nodeId', 0, [
             ['label', 2],
@@ -3729,9 +4906,15 @@ export class LocalBackend {
           ]);
           assertSymbolIdentity(queryRowValue(row, 'pid', 1));
           const nid = row.nodeId ?? row[0];
-          let list = processRowsByNode.get(nid);
-          if (!list) processRowsByNode.set(nid, (list = []));
-          list.push(row);
+          // Older adapters may omit the leading node id for positional rows.
+          // Keep such a row associated with all requested symbols; native rows
+          // with a node id remain precisely associated.
+          const targetIds = nid ? [nid] : ids;
+          for (const targetId of targetIds) {
+            let list = processRowsByNode.get(targetId);
+            if (!list) processRowsByNode.set(targetId, (list = []));
+            list.push(nid ? row : { ...row, nodeId: targetId });
+          }
         }
       } catch (e) {
         rethrowSymbolIdentityError(e);
@@ -3748,16 +4931,28 @@ export class LocalBackend {
       // feeds cohesionBoost -> priority -> the processes `slice` below. ORDER BY
       // c.id makes the pick the lowest community id, every run.
       try {
-        const rows = await executeParameterized(
-          repo.lbugPath,
-          `
-          MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          WHERE n.id IN $nodeIds
-          RETURN n.id AS nodeId, c.cohesion AS cohesion, c.heuristicLabel AS module
-          ORDER BY nodeId, c.id
-        `,
-          { nodeIds: ids },
-        );
+        const rows = neo4jBackendEnabled
+          ? await (
+              await import('../../core/neo4j/read-adapter.js')
+            ).executeReadCypher(
+              `
+              UNWIND $nodeIds AS nodeId
+              MATCH (n:CodeNode {repoId: $repoId, id: nodeId})-[:MEMBER_OF]->(c:Community {repoId: $repoId})
+              RETURN n.id AS nodeId, c.cohesion AS cohesion, c.heuristicLabel AS module
+              ORDER BY nodeId, c.id
+            `,
+              { repoId: repo.name, nodeIds: ids },
+            )
+          : await executeParameterized(
+              repo.lbugPath,
+              `
+              MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+              WHERE n.id IN $nodeIds
+              RETURN n.id AS nodeId, c.cohesion AS cohesion, c.heuristicLabel AS module
+              ORDER BY nodeId, c.id
+            `,
+              { nodeIds: ids },
+            );
         for (const row of rows) {
           assertQueryIdentity(row, 'nodeId', 0, [['module', 2]]);
           const nid = row.nodeId ?? row[0];
@@ -3774,7 +4969,6 @@ export class LocalBackend {
         if (!isBenignMissingTableError(e)) enrichmentDegraded = true;
       }
     }
-
     // Aggregation is unchanged from the per-symbol version — it now reads the
     // pre-fetched maps instead of issuing a query per symbol. Iterating `merged`
     // in the same (sorted) order preserves processMap insertion order, the
@@ -4303,12 +5497,80 @@ export class LocalBackend {
     // is as much a "results may be incomplete" signal as enrichmentDegraded —
     // flag it the same way rather than only via the warning string.
     const ftsPartial = ftsUsed && (!!ftsQueryErrors || !!ftsMissingIndexes?.length);
+    if (semanticSearchTimedOut) {
+      warnings.push(
+        `Semantic vector search timed out after ${semanticTimeoutMs}ms — results use keyword search only. Check GITNEXUS_EMBEDDING_URL or raise GITNEXUS_QUERY_SEMANTIC_TIMEOUT_MS if the embedding service is healthy but slow.`,
+      );
+    }
 
+    const matches: QueryMatchSummary[] = [];
+    for (let i = 0; i < safeSemanticResults.length; i++) {
+      const result = safeSemanticResults[i];
+      if (!result.filePath) continue;
+      matches.push({
+        repo: repo.name,
+        filePath: result.filePath,
+        source: 'vector',
+        score: SEARCH_SOURCE_WEIGHTS.vector / (RRF_K + i + 1),
+        id: result.nodeId,
+        name: result.name,
+        startLine: toDisplayLine(result.startLine),
+        endLine: toDisplayLine(result.endLine),
+      });
+    }
+    for (let i = 0; i < zoektMatches.length; i++) {
+      const match = zoektMatches[i];
+      const symbol = zoektSymbols.get(i);
+      const lineNumber = this.getZoektHitLine(match);
+      matches.push({
+        repo: repo.name,
+        filePath: match.fileName,
+        source: 'zoekt',
+        score: SEARCH_SOURCE_WEIGHTS.zoekt / (RRF_K + i + 1),
+        id: symbol?.nodeId,
+        name: symbol?.name,
+        startLine: lineNumber ?? symbol?.startLine,
+        endLine: lineNumber ?? symbol?.endLine,
+        snippet: this.compactMatchSnippet(
+          match.lineMatches?.find((line: any) => !line.isContext)?.line ??
+            match.lineMatches?.[0]?.line,
+        ),
+      });
+    }
+    const fileMatches = pathHints.length
+      ? this.buildFileMatchesFromResults(
+          repo,
+          [
+            ...pathResults,
+            ...bm25Results,
+            ...zoektMatches.map((match: any) => ({
+              name: match.fileName.split('/').pop() || match.fileName,
+              type: 'File',
+              filePath: match.fileName,
+              zoektScore: match.score,
+              fileMatchSource: 'zoekt' as const,
+            })),
+          ],
+          pathHints,
+        )
+      : [];
+    const pathDiagnostics = pathHints.length
+      ? this.buildPathDiagnostics(
+          pathHints,
+          fileMatches,
+          neo4jBackendEnabled ? 'neo4j' : 'ladybugdb',
+          ftsUsed,
+        )
+      : undefined;
+    const sortedMatches = this.selectTopMatchesWithRepoCoverage(matches, 50);
     return {
       processes,
       process_symbols,
       definitions: returnedDefinitions,
+      matches: sortedMatches,
+      matched_repos: [...new Set(sortedMatches.map((match) => match.repo))],
       timing,
+      ...(pathHints.length ? { file_matches: fileMatches, path_diagnostics: pathDiagnostics } : {}),
       ...(contentAvailability ? { contentAvailability } : {}),
       ...(warnings.length > 0 && { warning: warnings.join(' ') }),
       ...((enrichmentDegraded || ftsPartial) && { partial: true }),
@@ -4318,6 +5580,89 @@ export class LocalBackend {
   /**
    * BM25 keyword search helper - uses LadybugDB FTS for always-fresh results
    */
+  private mapNeo4jFileSearchRows(rows: Neo4jFileSearchRow[]): any[] {
+    return rows
+      .filter((row) => row.filePath)
+      .map((row) => ({
+        nodeId: row.id,
+        name: row.name,
+        type: row.type ?? 'File',
+        filePath: row.filePath,
+        bm25Score: row.score ?? 0,
+      }));
+  }
+
+  private async findNeo4jFilePathMatches(
+    repo: RepoHandle,
+    hints: string[],
+    limit: number,
+  ): Promise<any[]> {
+    const candidateRepoIds = this.deriveNeo4jRepoIdCandidates(repo);
+    const normalizedHints = [
+      ...new Set(
+        hints
+          .map((hint) => hint.replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase().trim())
+          .filter((hint) => hint.length >= 2),
+      ),
+    ];
+    if (normalizedHints.length === 0) return [];
+
+    const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+    const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit)));
+    try {
+      const rows = await executeReadCypher(
+        `
+        UNWIND $hints AS hint
+        MATCH (node:File)
+        WHERE node.repoId IN $repoIds
+        WITH node,
+             hint,
+             replace(toLower(coalesce(node.filePath, '')), '\\\\', '/') AS normalizedPath,
+             toLower(coalesce(node.name, '')) AS normalizedName
+        WITH node,
+             CASE
+               WHEN normalizedPath = hint THEN 100.0
+               WHEN normalizedPath ENDS WITH '/' + hint THEN 90.0
+               WHEN normalizedName = hint THEN 80.0
+               WHEN normalizedPath CONTAINS hint THEN 20.0
+               ELSE 0.0
+             END AS score
+        WHERE score > 0
+        RETURN node.id AS id,
+               node.name AS name,
+               'File' AS type,
+               node.filePath AS filePath,
+               max(score) AS score
+        ORDER BY score DESC, size(coalesce(node.filePath, '')) ASC
+        LIMIT $limit
+      `,
+        { repoIds: candidateRepoIds, hints: normalizedHints, limit: boundedLimit },
+      );
+      return this.mapNeo4jFileSearchRows(rows).map((row) => ({
+        ...row,
+        fileMatchSource: 'path' as const,
+      }));
+    } catch (e) {
+      logQueryError('query:neo4j-file-path', e);
+      return [];
+    }
+  }
+
+  private deriveNeo4jRepoIdCandidates(repo: RepoHandle): string[] {
+    const candidates = new Set<string>([repo.name]);
+    const pathSegments = repo.repoPath
+      .replace(/^[/\\]+/, '')
+      .replace(/\\+/g, '/')
+      .split('/');
+    const lastSegment = pathSegments[pathSegments.length - 1] || '';
+    if (lastSegment && lastSegment !== repo.name) candidates.add(lastSegment);
+
+    const stripped = lastSegment.replace(/^(dev|iteng|pro)-/, '').replace(/-(dev|iteng|pro)$/, '');
+    if (stripped && stripped !== lastSegment && stripped !== repo.name) candidates.add(stripped);
+
+    return [...candidates];
+  }
+
   private async bm25Search(
     repo: RepoHandle,
     query: string,
@@ -4329,6 +5674,63 @@ export class LocalBackend {
     nonBenignErrors?: string[];
     missingIndexes?: string[];
   }> {
+    // 个性化：Neo4j 后端改用远端全文索引，避免落回 LadybugDB。
+
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      let ftsUsed = false;
+      const results: any[] = [];
+      const failures: string[] = [];
+      try {
+        const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+        const { escapeNeo4jFulltextQuery } = await import('../../core/neo4j/fulltext-query.js');
+        const fulltextQuery = escapeNeo4jFulltextQuery(query);
+        for (const { indexName } of FTS_INDEXES) {
+          try {
+            const rows = await executeReadCypher(
+              `
+              CALL db.index.fulltext.queryNodes('${indexName}', $query, {limit: $limit})
+              YIELD node, score
+              WHERE node.repoId = $repoId
+              RETURN node.id AS id,
+                     node.name AS name,
+                     labels(node)[0] AS type,
+                     node.filePath AS filePath,
+                     node.startLine AS startLine,
+                     node.endLine AS endLine,
+                     score AS score
+            `,
+              { repoId: repo.name, query: fulltextQuery, limit },
+            );
+            ftsUsed = true;
+            for (const row of rows) {
+              results.push({
+                nodeId: row.id,
+                name: row.name,
+                type: row.type,
+                filePath: row.filePath,
+                startLine: row.startLine,
+                endLine: row.endLine,
+                bm25Score: row.score,
+              });
+            }
+          } catch (err: any) {
+            failures.push(`${indexName}: ${err?.message ?? String(err)}`);
+          }
+        }
+        if (ftsUsed) {
+          results.sort((a, b) => (b.bm25Score ?? 0) - (a.bm25Score ?? 0));
+          return { results: results.slice(0, limit), ftsUsed: true };
+        }
+        throw new Error(failures.join('; ') || 'No Neo4j fulltext indexes were queried');
+      } catch (err: any) {
+        logger.warn(
+          { err: err?.message },
+          'GitNexus: Neo4j file FTS search failed — falling back to semantic-only',
+        );
+        return { results: [], ftsUsed: false };
+      }
+    }
     if (disabledReason) return { results: [], ftsUsed: false };
     let searchFTSFromLbug;
     try {
@@ -4522,6 +5924,15 @@ export class LocalBackend {
     // call's width, and the catch below must only clear an entry it did not set.
     let embeddedDims: number | undefined;
     try {
+      const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+      if (isNeo4jBackendEnabled()) {
+        const { embedQuery } = await import('../core/embedder.js');
+        const queryVec = await embedQuery(query);
+        const { semanticSearch: neo4jSemanticSearch } =
+          await import('../../core/neo4j/embedding-adapter.js');
+        return await neo4jSemanticSearch(repo.name, queryVec, limit);
+      }
+
       // Check if embedding table exists before loading the model (avoids heavy model init when embeddings are off)
       // determinism: probe — aggregate singleton. COUNT(*) with no grouping key returns exactly one row, and only
       // the count is read, to decide whether to load the embedding model at all.
@@ -4731,6 +6142,20 @@ export class LocalBackend {
     // still accepted (and the field the internal executeCypher() passes). New wins.
     request: { query?: string; statement?: string; params?: Record<string, unknown> },
   ): Promise<any> {
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      const cypherText = resolveAliasString(request.statement, request.query) ?? '';
+      if (!cypherText.trim()) {
+        return { error: 'statement (or legacy query) parameter is required and cannot be empty.' };
+      }
+      try {
+        const { executeRepoScopedReadCypher } = await import('../../core/neo4j/read-adapter.js');
+        return await executeRepoScopedReadCypher(cypherText, repo.name);
+      } catch (err: any) {
+        return { error: err.message || 'Query failed' };
+      }
+    }
+
     await this.ensureInitialized(repo);
 
     if (!isLbugReady(repo.lbugPath)) {
@@ -5450,6 +6875,50 @@ export class LocalBackend {
 
     if (!name && !uid) {
       return { error: 'Either "name" or "uid" parameter is required.' };
+    }
+
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      const { findSymbolContext } = await import('../../core/neo4j/read-adapter.js');
+      const rows = await findSymbolContext(repo.name, uid || name || '', 10, {
+        filePath: file_path,
+        kind,
+      });
+      if (rows.length === 0) {
+        return { error: `Symbol '${name || uid}' not found` };
+      }
+
+      const row = rows[0];
+      const categorizeNeo4jRefs = (refs: any[] | undefined, direction: 'incoming' | 'outgoing') => {
+        const cats: Record<string, any[]> = {};
+        for (const ref of refs ?? []) {
+          const relType = String(ref.type || '').toLowerCase();
+          if (!relType) continue;
+          const entry =
+            direction === 'incoming'
+              ? { uid: ref.source, name: ref.sourceName }
+              : { uid: ref.target, name: ref.targetName };
+          if (!cats[relType]) cats[relType] = [];
+          cats[relType].push(entry);
+        }
+        return cats;
+      };
+
+      return {
+        status: 'found',
+        symbol: {
+          uid: row.id,
+          name: row.name,
+          kind: row.type,
+          filePath: row.filePath,
+          startLine: row.startLine,
+          endLine: row.endLine,
+          ...(include_content && row.content ? { content: row.content } : {}),
+        },
+        incoming: categorizeNeo4jRefs(row.incoming, 'incoming'),
+        outgoing: categorizeNeo4jRefs(row.outgoing, 'outgoing'),
+        processes: [],
+      };
     }
 
     const outcome = await this.resolveSymbolCandidates(
@@ -6853,6 +8322,8 @@ export class LocalBackend {
     },
   ): Promise<any> {
     await this.ensureInitialized(repo);
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const neo4jBackendEnabled = isNeo4jBackendEnabled();
 
     const scope = params.scope || 'unstaged';
     const { execFileSync } = await import('child_process');
@@ -7014,7 +8485,18 @@ export class LocalBackend {
     // `labels(n)`, not `labels(n)[0]`: it returns the label as a scalar STRING,
     // and subscripting a string is 1-based over its characters, so `[0]` was
     // always "" and `changed_symbols[].type` never carried a type at all.
-    const symbolQuery = `
+    const symbolQuery = neo4jBackendEnabled
+      ? `
+        UNWIND $bounds AS b
+        MATCH (n {repoId: $repoId}) WHERE (n.filePath IN $paths OR ANY(s IN $suffixes WHERE n.filePath ENDS WITH s))
+          AND (n.filePath = b.path OR n.filePath ENDS WITH b.suffix)
+          AND NOT coalesce(n.id, '') STARTS WITH 'BasicBlock:'
+          AND n.startLine IS NOT NULL AND n.endLine IS NOT NULL
+          AND n.startLine <= b.hi AND n.endLine >= b.lo
+        RETURN b.path AS diffPath, n.id AS id, n.name AS name, labels(n)[0] AS type,
+               n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+      `
+      : `
         UNWIND $bounds AS b
         MATCH (n) WHERE (n.filePath IN $paths OR ANY(s IN $suffixes WHERE n.filePath ENDS WITH s))
           AND (n.filePath = b.path OR n.filePath ENDS WITH b.suffix)
@@ -7025,6 +8507,14 @@ export class LocalBackend {
                n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
       `;
 
+    // 个性化：Neo4j 后端改走远端 Cypher，参数与本地查询保持一致。
+    const symbolBatchParams = (batch: typeof bounds) => ({
+      bounds: batch,
+      // Both halves of the redundant conjunct, derived from the batch in
+      // hand so the prefilter sees exactly the files this query asks about.
+      paths: batch.map((bound) => bound.path),
+      suffixes: batch.map((bound) => bound.suffix),
+    });
     // Batches run concurrently: each `executeParameterized` holds one connection
     // checked out of the per-repo pool for the duration of its query, which is
     // the safety rule documented on `mapConcurrent` itself (`lib/utils.ts`; why
@@ -7032,14 +8522,13 @@ export class LocalBackend {
     // single-query sequential rule the arm64 macOS module loop below follows.
     const batchResults = await mapConcurrent(
       chunk(bounds, LBUG_QUERY_BATCH_SIZE),
-      (batch) =>
-        executeParameterized(repo.lbugPath, symbolQuery, {
-          bounds: batch,
-          // Both halves of the redundant conjunct, derived from the batch in
-          // hand so the prefilter sees exactly the files this query asks about.
-          paths: batch.map((bound) => bound.path),
-          suffixes: batch.map((bound) => bound.suffix),
-        }),
+      async (batch) =>
+        neo4jBackendEnabled
+          ? (await import('../../core/neo4j/read-adapter.js')).executeReadCypher(symbolQuery, {
+              repoId: repo.name,
+              ...symbolBatchParams(batch),
+            })
+          : executeParameterized(repo.lbugPath, symbolQuery, symbolBatchParams(batch)),
       { onError: (error) => logQueryError('detect-changes:file-symbols', error) },
     );
     // A batch whose query failed comes back `undefined`: those symbols are
@@ -7130,7 +8619,14 @@ export class LocalBackend {
     // Find affected processes -- batched queries instead of N+1
     const affectedProcesses = new Map<string, any>();
     if (changedSymbols.size > 0) {
-      const processQuery = `
+      const processQuery = neo4jBackendEnabled
+        ? `
+          MATCH (n {repoId: $repoId})-[r:STEP_IN_PROCESS]->(p:Process {repoId: $repoId})
+          WHERE n.id IN $ids
+          RETURN n.id AS nodeId, p.id AS pid, p.heuristicLabel AS label,
+                 p.processType AS processType, p.stepCount AS stepCount, r.step AS step
+        `
+        : `
           MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
           WHERE n.id IN $ids
           RETURN n.id AS nodeId, p.id AS pid, p.heuristicLabel AS label,
@@ -7147,7 +8643,11 @@ export class LocalBackend {
       // at 1,000. The contrast is documented on both constants.
       const processBatches = await mapConcurrent(
         chunk(Array.from(changedSymbols.keys()), LBUG_ID_PROBE_BATCH_SIZE),
-        (ids) => executeParameterized(repo.lbugPath, processQuery, { ids }),
+        async (ids) => {
+          if (!neo4jBackendEnabled) return executeParameterized(repo.lbugPath, processQuery, { ids });
+          const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+          return executeReadCypher(processQuery, { repoId: repo.name, ids });
+        },
         { onError: (error) => logQueryError('detect-changes:process-lookup', error) },
       );
       // Same reasoning as the symbol query above: a failed chunk drops processes
@@ -7658,6 +9158,51 @@ export class LocalBackend {
     await this.ensureInitialized(repo);
 
     const { target, direction } = params;
+
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      const maxDepth = params.maxDepth || 3;
+      const { findImpact } = await import('../../core/neo4j/read-adapter.js');
+      const rows = await findImpact(repo.name, params.target_uid || target, direction, maxDepth, {
+        filePath: params.file_path,
+        kind: params.kind,
+      });
+      const byDepth: Record<string, any[]> = {};
+
+      for (const row of rows) {
+        const depth = String(row.depth ?? 1);
+        if (!byDepth[depth]) byDepth[depth] = [];
+        byDepth[depth].push({
+          uid: row.id,
+          name: row.name,
+          kind: row.type,
+          filePath: row.filePath,
+        });
+      }
+
+      let risk = 'LOW';
+      const directCount = byDepth['1']?.length ?? 0;
+      if (directCount >= 30 || rows.length >= 200) {
+        risk = 'CRITICAL';
+      } else if (directCount >= 15 || rows.length >= 100) {
+        risk = 'HIGH';
+      } else if (directCount >= 5 || rows.length >= 30) {
+        risk = 'MEDIUM';
+      }
+
+      return {
+        target: { name: target },
+        direction,
+        impactedCount: rows.length,
+        risk,
+        summary: {
+          directCallers: direction === 'upstream' ? directCount : undefined,
+          directCallees: direction === 'downstream' ? directCount : undefined,
+          totalAffected: rows.length,
+        },
+        byDepth,
+      };
+    }
 
     // ── Dispatch order (KTD5) ──────────────────────────────────────────
     // (1) Validate `mode`. Absent/'callgraph' → unchanged path; 'pdg' → the
@@ -10016,8 +11561,22 @@ export class LocalBackend {
    * Fetch Route nodes with their consumers in a single query.
    * Shared by routeMap and shapeCheck to avoid N+1 query patterns.
    */
+  private async fetchRouteQuery(
+    repo: RepoHandle,
+    ladybugQuery: string,
+    neo4jQuery: string,
+    params: Record<string, unknown>,
+  ): Promise<any[]> {
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+      return executeReadCypher(neo4jQuery, { ...params, repoId: repo.name });
+    }
+    return executeParameterized(repo.lbugPath, ladybugQuery, params);
+  }
+
   private async fetchRoutesWithConsumers(
-    repoId: string,
+    repo: RepoHandle,
     routeFilter: string,
     params: Record<string, string>,
   ): Promise<
@@ -10052,22 +11611,40 @@ export class LocalBackend {
              consumer.name AS consumerName, consumer.filePath AS consumerFile,
              r.reason AS fetchReason, n.method AS method${optionalColumns}
     `;
+    // 个性化：Neo4j 后端使用远端 Cypher，可选列探测两套查询同步演进。
+    const neo4jRouteQuery = (optionalColumns: string) => `
+      MATCH (n:Route {repoId: $repoId})
+      WHERE n.id STARTS WITH 'Route:' ${routeFilter}
+      OPTIONAL MATCH (consumer {repoId: $repoId})-[r:FETCHES]->(n)
+      RETURN n.id AS routeId, n.name AS routeName, n.filePath AS handlerFile,
+             n.responseKeys AS responseKeys, n.errorKeys AS errorKeys, n.middleware AS middleware,
+             consumer.name AS consumerName, consumer.filePath AS consumerFile,
+             r.reason AS fetchReason, n.method AS method${optionalColumns}
+    `;
     const runtimeColumns =
       ', n.runtimeConfirmed AS runtimeConfirmed, n.runtimeSource AS runtimeSource, n.runtimeStatus AS runtimeStatus';
     // Newest columns first: an older index lacks `unverifiedConsumers`, an
     // older one still the runtime evidence.
-    const queries = [
+    const optionalColumnSets = [
       `${runtimeColumns}, n.unverifiedConsumers AS unverifiedConsumers`,
       runtimeColumns,
       '',
-    ].map(routeQuery);
+    ];
     let rows;
-    for (const [attempt, query] of queries.entries()) {
+    for (const [attempt, optionalColumns] of optionalColumnSets.entries()) {
       try {
-        rows = await executeParameterized(repoId, query, params);
+        rows = await this.fetchRouteQuery(
+          repo,
+          routeQuery(optionalColumns),
+          neo4jRouteQuery(optionalColumns),
+          params,
+        );
         break;
       } catch (error) {
-        if (attempt === queries.length - 1 || !isMissingRouteOptionalPropertyError(error)) {
+        if (
+          attempt === optionalColumnSets.length - 1 ||
+          !isMissingRouteOptionalPropertyError(error)
+        ) {
           throw error;
         }
       }
@@ -10175,19 +11752,24 @@ export class LocalBackend {
    * Single query instead of N+1.
    */
   private async fetchLinkedFlowsBatch(
-    repoId: string,
+    repo: RepoHandle,
     nodeIds: string[],
   ): Promise<Map<string, string[]>> {
     const result = new Map<string, string[]>();
     if (nodeIds.length === 0) return result;
     try {
       // Use list_contains to filter at DB level instead of fetching all and filtering in memory
-      const rows = await executeParameterized(
-        repoId,
+      const rows = await this.fetchRouteQuery(
+        repo,
         `
         MATCH (source)-[r:CodeRelation]->(proc:Process)
         WHERE r.type = 'ENTRY_POINT_OF'
           AND list_contains($nodeIds, source.id)
+        RETURN source.id AS sourceId, proc.label AS name
+      `,
+        `
+        MATCH (source {repoId: $repoId})-[:ENTRY_POINT_OF]->(proc:Process {repoId: $repoId})
+        WHERE source.id IN $nodeIds
         RETURN source.id AS sourceId, proc.label AS name
       `,
         { nodeIds },
@@ -10449,7 +12031,7 @@ export class LocalBackend {
 
     const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
     const queryParams = params.route ? { route: params.route } : {};
-    const routes = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
+    const routes = await this.fetchRoutesWithConsumers(repo, routeFilter, queryParams);
 
     if (routes.length === 0) {
       return {
@@ -10462,7 +12044,7 @@ export class LocalBackend {
     }
 
     const flowMap = await this.fetchLinkedFlowsBatch(
-      repo.lbugPath,
+      repo,
       routes.map((r) => r.id),
     );
 
@@ -10485,7 +12067,7 @@ export class LocalBackend {
 
     const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
     const queryParams = params.route ? { route: params.route } : {};
-    const allRoutes = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
+    const allRoutes = await this.fetchRoutesWithConsumers(repo, routeFilter, queryParams);
 
     const results = allRoutes
       .filter(
@@ -10589,7 +12171,7 @@ export class LocalBackend {
     }
 
     const toolIds = rows.map((r: any) => r.id ?? r[0]);
-    const flowMap = await this.fetchLinkedFlowsBatch(repo.lbugPath, toolIds);
+    const flowMap = await this.fetchLinkedFlowsBatch(repo, toolIds);
 
     return {
       tools: rows.map((r: any) => {
@@ -10640,7 +12222,7 @@ export class LocalBackend {
     }
     const wantedMethod =
       typeof rawMethod === 'string' ? rawMethod.trim().toUpperCase() || undefined : undefined;
-    const matched = await this.fetchRoutesWithConsumers(repo.lbugPath, routeFilter, queryParams);
+    const matched = await this.fetchRoutesWithConsumers(repo, routeFilter, queryParams);
     const routes = matched.filter(
       (r) => !wantedMethod || r.method === '*' || r.method?.toUpperCase() === wantedMethod,
     );
@@ -10654,7 +12236,7 @@ export class LocalBackend {
     }
 
     const flowMap = await this.fetchLinkedFlowsBatch(
-      repo.lbugPath,
+      repo,
       routes.map((r) => r.id),
     );
 
@@ -10840,17 +12422,32 @@ export class LocalBackend {
   async queryProcesses(repoName?: string, limit = 50): Promise<{ processes: any[] }> {
     const repo = await this.resolveRepo(repoName);
     await this.ensureInitialized(repo);
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const neo4jBackendEnabled = isNeo4jBackendEnabled();
+    const boundedLimit = Math.max(1, Math.min(1000, Math.trunc(limit)));
 
     try {
-      const processes = await executeQuery(
-        repo.lbugPath,
-        `
-        MATCH (p:Process)
-        RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
-        ORDER BY p.stepCount DESC, p.id
-        LIMIT ${limit}
-      `,
-      );
+      const processes = neo4jBackendEnabled
+        ? await (
+            await import('../../core/neo4j/read-adapter.js')
+          ).executeReadCypher(
+            `
+            MATCH (p:Process {repoId: $repoId})
+            RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
+            ORDER BY p.stepCount DESC, p.id
+            LIMIT ${boundedLimit}
+          `,
+            { repoId: repo.name },
+          )
+        : await executeQuery(
+            repo.lbugPath,
+            `
+            MATCH (p:Process)
+            RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
+            ORDER BY p.stepCount DESC, p.id
+            LIMIT ${boundedLimit}
+          `,
+          );
       return {
         processes: processes.map((p: any) => ({
           id: p.id || p[0],
@@ -10860,7 +12457,8 @@ export class LocalBackend {
           stepCount: p.stepCount || p[4],
         })),
       };
-    } catch {
+    } catch (err) {
+      if (neo4jBackendEnabled) throw err;
       return { processes: [] };
     }
   }
@@ -10936,31 +12534,57 @@ export class LocalBackend {
   async queryProcessDetail(name: string, repoName?: string): Promise<any> {
     const repo = await this.resolveRepo(repoName);
     await this.ensureInitialized(repo);
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const neo4jBackendEnabled = isNeo4jBackendEnabled();
 
-    const processes = await executeParameterized(
-      repo.lbugPath,
-      `
-      MATCH (p:Process)
-      WHERE p.label = $processName OR p.heuristicLabel = $processName
-      RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
-      ORDER BY id
-      LIMIT 1
-    `,
-      { processName: name },
-    );
+    const processes = neo4jBackendEnabled
+      ? await (
+          await import('../../core/neo4j/read-adapter.js')
+        ).executeReadCypher(
+          `
+          MATCH (p:Process {repoId: $repoId})
+          WHERE p.label = $processName OR p.heuristicLabel = $processName
+          RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
+          ORDER BY id
+          LIMIT 1
+        `,
+          { repoId: repo.name, processName: name },
+        )
+      : await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (p:Process)
+          WHERE p.label = $processName OR p.heuristicLabel = $processName
+          RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
+          ORDER BY id
+          LIMIT 1
+        `,
+          { processName: name },
+        );
     if (processes.length === 0) return { error: `Process '${name}' not found` };
 
     const proc = processes[0];
     const procId = proc.id || proc[0];
-    const steps = await executeParameterized(
-      repo.lbugPath,
-      `
-      MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: $procId})
-      RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step
-      ORDER BY r.step
-    `,
-      { procId },
-    );
+    const steps = neo4jBackendEnabled
+      ? await (
+          await import('../../core/neo4j/read-adapter.js')
+        ).executeReadCypher(
+          `
+          MATCH (n:CodeNode {repoId: $repoId})-[r:STEP_IN_PROCESS]->(p:Process {repoId: $repoId, id: $procId})
+          RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step
+          ORDER BY r.step
+        `,
+          { repoId: repo.name, procId },
+        )
+      : await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: $procId})
+          RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step
+          ORDER BY r.step
+        `,
+          { procId },
+        );
 
     return {
       process: {
@@ -10978,7 +12602,6 @@ export class LocalBackend {
       })),
     };
   }
-
   async disconnect(): Promise<void> {
     try {
       await closeLbug(); // close all connections

@@ -28,11 +28,13 @@ import fs from 'fs/promises';
 import {
   canonicalizePath,
   cloneDirBelongsToEntry,
+  getStoragePath,
   loadMeta,
   saveMeta,
   listRegisteredRepos,
   registryPathEquals,
   type RegistryEntry,
+  registerRepo,
 } from '../storage/repo-manager.js';
 import {
   requireDeletableStoragePath,
@@ -53,7 +55,12 @@ import {
 } from '../core/lbug/lbug-adapter.js';
 import { assertReadOnlyFtsCrashSafe } from '../core/lbug/sidecar-recovery.js';
 import { isValidQueryParams } from '../core/lbug/query-params.js';
-import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
+import {
+  EMBEDDING_TABLE_NAME,
+  NODE_TABLES,
+  type GraphNode,
+  type GraphRelationship,
+} from 'gitnexus-shared';
 import { searchFTSFromLbug } from '../core/search/bm25-index.js';
 import { hybridSearch } from '../core/search/hybrid-search.js';
 import { ftsDegradedWarning } from '../core/search/fts-indexes.js';
@@ -66,9 +73,27 @@ import { LBUG_DIRECTORY } from '../storage/storage-constants.js';
 import { getFtsDisabledReason, type FtsDisabledReason } from '../core/search/fts-policy.js';
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { installServeMcpAuth, mountMCPEndpoints } from './mcp-http.js';
+import {
+  buildNeo4jGraph,
+  listNeo4jFilePaths,
+  queryNeo4jBackend,
+  queryNeo4jClusterDetail,
+  queryNeo4jClusters,
+  queryNeo4jProcessDetail,
+  queryNeo4jProcesses,
+  runNeo4jEmbeddingRepair,
+  searchNeo4jBackend,
+  isNeo4jEmbeddingRepairCooldownError,
+} from './search.js';
 import { fileURLToPath } from 'url';
-import { isTerminalJobStatus, JobManager, type AnalyzeJobPartialOutcome } from './analyze-job.js';
+import {
+  isTerminalJobStatus,
+  JobManager,
+  type AnalyzeJob,
+  type AnalyzeJobPartialOutcome,
+} from './analyze-job.js';
 import { mountSSEProgress } from './sse-progress.js';
+import { escapeRegExp } from './validation.js';
 import {
   resolveEmbedRunOutcome,
   withMeasuredEmbeddingCount,
@@ -88,11 +113,49 @@ import {
   extractWebRepoName,
   getCloneDir,
   cloneOrPull,
+  cloneOrResetToBranch,
   warnIfInsecureAzureConfig,
   GITHUB_TOKEN_HOSTS,
 } from './git-clone.js';
+import { WebhookAnalyzeQueue, WebhookStartStaggerGate } from './webhook-analyze-queue.js';
+import { WikiQueue } from './wiki-queue.js';
+import { ResourceAwareConcurrencyController } from './resource-aware-concurrency.js';
+import { waitForJobManagerIdle } from './analyze-job-wait.js';
+import {
+  isAnalysisAlreadyInProgressError,
+  isJsonBodyParseError,
+  isRepoAlreadyActiveError,
+} from './error-classification.js';
+import { getKeywordSummaryHashSalt } from '../core/embeddings/keyword-summary.js';
+import { getAllowedEnvironments } from '../config/environment-policy.js';
+export {
+  isAnalysisAlreadyInProgressError,
+  isJsonBodyParseError,
+  isRepoAlreadyActiveError,
+} from './error-classification.js';
+import {
+  checkStaleness,
+  checkStalenessAsync,
+  syncWithUpstream,
+  type StalenessInfo,
+} from '../core/git-staleness.js';
+import {
+  WebhookWorktreeError,
+  assertEnvAllowed,
+  assertSafeSegment,
+  buildGiteaWebhookAnalyzeOptions,
+  buildRegistryName,
+  copyBootstrapIndex,
+  ensureLocalWorktree,
+  getGiteaWebhookRepoPath,
+  getLegacyManagedWorktreePath,
+  getManagedWorktreePath,
+  getProjectsRoot,
+  parseGiteaWebhookRepo,
+  upsertWebhookRepoConfig,
+  type WebhookRepoConfigEntry,
+} from './webhook-worktree.js';
 import { createAnalyzeUploadHandler } from './analyze-upload.js';
-import { checkStalenessAsync } from '../core/git-staleness.js';
 import { projectRepoDetail, projectRepoListEntry, resolveLastCommit } from './repo-projection.js';
 // Shared with the CLI's `--branch` (via the analyze-config wrapper) so both
 // entry points accept the same refs. Imported from core — not cli/ — so
@@ -104,11 +167,16 @@ import {
   createWriteOriginGuard,
   logOriginPolicy,
   PUBLIC_ORIGIN_ENV,
+  requireLoopbackPeer,
   resolveTrustProxy,
   TRUST_PROXY_ENV,
   warnIfRateLimitKeysCollapse,
 } from './middleware.js';
 import { createLaunchAnalysisWorker } from './analyze-launch.js';
+import { RepoLockRegistry } from './repo-lock-registry.js';
+import { createEmbeddingRepairCoordinator } from './embedding-repair-coordinator.js';
+import type { AnalyzeResultIpc } from './analyze-worker-ipc.js';
+import { ensureCocoaPodsDependencies } from './cocoapods.js';
 import { UPLOAD_ROOT } from './upload-paths.js';
 import { sweepStaleUploads } from './upload-sweep.js';
 import { isRfc1918PrivateIpv4 } from './private-ip.js';
@@ -127,6 +195,238 @@ export {
   type ServerInfoResponse,
   type ServeUpdateController,
 } from './update-controller.js';
+import { isNeo4jBackendEnabled } from '../core/neo4j/config.js';
+import { createRequire } from 'node:module';
+
+const _require = createRequire(import.meta.url);
+const pkg = _require('../../package.json');
+const DEFAULT_WEBHOOK_ANALYZE_CONCURRENCY = 1;
+const PROJECT_DISCOVERY_MAX_DEPTH = 4;
+const EMBEDDING_STATUS_COMPLETE = 'complete';
+const EMBEDDING_STATUS_FAILED = 'failed';
+const EMBEDDING_STATUS_RUNNING = 'running';
+type EmbeddingStatus =
+  | typeof EMBEDDING_STATUS_COMPLETE
+  | typeof EMBEDDING_STATUS_FAILED
+  | typeof EMBEDDING_STATUS_RUNNING;
+
+const envFlagEnabled = (value: string | undefined, defaultValue: boolean): boolean => {
+  if (value === undefined) return defaultValue;
+  return !['0', 'false', 'no', 'off'].includes(value.trim().toLowerCase());
+};
+
+const LOCAL_DIAGNOSTICS_ENABLED_ENV = 'GITNEXUS_LOCAL_DIAGNOSTICS_ENABLED';
+
+/** 仅在显式开启时挂载容器内锁诊断数据。 */
+export const isLocalDiagnosticsEnabled = (): boolean =>
+  envFlagEnabled(process.env[LOCAL_DIAGNOSTICS_ENABLED_ENV], false);
+
+export interface LocalDiagnosticJob {
+  id: string;
+  status: AnalyzeJob['status'];
+  repoName?: string;
+  progress: Pick<AnalyzeJob['progress'], 'phase' | 'percent'>;
+  startedAt: number;
+}
+
+/** 将运行时任务转换为不含路径、URL、异常文本的诊断视图。 */
+export const toLocalDiagnosticJob = (job: AnalyzeJob): LocalDiagnosticJob => ({
+  id: job.id,
+  status: job.status,
+  ...(job.repoName ? { repoName: job.repoName } : {}),
+  progress: { phase: job.progress.phase, percent: job.progress.percent },
+  startedAt: job.startedAt,
+});
+
+export const isRepairableIndexError = (err: unknown): boolean => {
+  const msg = String(err instanceof Error ? err.message : err).toLowerCase();
+  return (
+    msg.includes('ladybugdb not found') ||
+    msg.includes('ladybugdb not initialized') ||
+    msg.includes('failed integrity check') ||
+    msg.includes('mmap') ||
+    msg.includes('run: gitnexus analyze')
+  );
+};
+
+export const repoNameFromPath = (repoPath: string): string => path.basename(repoPath);
+
+const DEFAULT_EMBEDDING_RUNNING_TIMEOUT_MS = 30 * 60 * 1000;
+
+export const readEmbeddingRunningTimeoutMs = (): number => {
+  const raw = Number.parseInt(process.env.GITNEXUS_EMBEDDING_RUNNING_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_EMBEDDING_RUNNING_TIMEOUT_MS;
+};
+
+const isEmbeddingRunningStale = (indexedAt?: string): boolean => {
+  if (!indexedAt) return true;
+  const ts = Date.parse(indexedAt);
+  return !Number.isFinite(ts) || Date.now() - ts > readEmbeddingRunningTimeoutMs();
+};
+
+const shouldRepairExistingEmbeddingsForKeywordSummary = (): boolean =>
+  envFlagEnabled(process.env.GITNEXUS_KEYWORD_SUMMARY_REPAIR_EXISTING_EMBEDDINGS, false);
+
+export const shouldScheduleStartupEmbeddings = (
+  meta:
+    | {
+        embeddingStatus?: EmbeddingStatus;
+        indexedAt?: string;
+        stats?: { nodes?: number; embeddings?: number };
+        keywordSummaryHashSalt?: string;
+      }
+    | null
+    | undefined,
+  actualEmbeddings?: number,
+  expectedKeywordSummaryHashSalt = getKeywordSummaryHashSalt(),
+): boolean => {
+  const nodes = meta?.stats?.nodes ?? 0;
+  const embeddings = actualEmbeddings ?? meta?.stats?.embeddings ?? 0;
+  const embeddingIncomplete =
+    meta?.embeddingStatus === EMBEDDING_STATUS_RUNNING
+      ? isEmbeddingRunningStale(meta?.indexedAt)
+      : meta?.embeddingStatus !== undefined && meta.embeddingStatus !== EMBEDDING_STATUS_COMPLETE;
+  const keywordSummaryChanged =
+    shouldRepairExistingEmbeddingsForKeywordSummary() &&
+    embeddings > 0 &&
+    meta?.embeddingStatus !== EMBEDDING_STATUS_RUNNING &&
+    meta?.keywordSummaryHashSalt !== expectedKeywordSummaryHashSalt;
+  return nodes > 0 && (embeddings <= 0 || embeddingIncomplete || keywordSummaryChanged);
+};
+
+export const shouldScheduleStartupIncrementalAnalyze = (
+  staleness: Pick<StalenessInfo, 'isStale' | 'commitsBehind'>,
+): boolean => staleness.isStale && staleness.commitsBehind > 0;
+
+export const shouldRunStartupLbugHealthCheck = (): boolean => !isNeo4jBackendEnabled();
+
+const ENV_REPOS_FILE_RE = /^repos\.([A-Za-z0-9._-]+)\.json$/;
+
+export interface WebhookInspectionTarget {
+  fullName: string;
+  repoPath: string;
+  mainRepoPath: string;
+  cloneUrl?: string;
+  branch: string;
+  repoName: string;
+  registryName: string;
+  allowDuplicateName?: boolean;
+  env?: string;
+}
+
+export const getWebhookEnvReposFile = (projectsRoot: string, env: string): string => {
+  assertSafeSegment(env, 'env');
+  return path.join(projectsRoot, `repos.${env.toLowerCase()}.json`);
+};
+
+const readWebhookRepoEntries = async (reposFile: string): Promise<WebhookRepoConfigEntry[]> => {
+  try {
+    const raw = await fs.readFile(reposFile, 'utf-8');
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+export const loadWebhookInspectionTargets = async (
+  projectsRoot: string,
+): Promise<WebhookInspectionTarget[]> => {
+  const configFiles: Array<{ file: string; env?: string }> = [
+    { file: path.join(projectsRoot, 'repos.json') },
+  ];
+
+  try {
+    const names = await fs.readdir(projectsRoot);
+    for (const name of names.sort()) {
+      const match = ENV_REPOS_FILE_RE.exec(name);
+      if (!match) continue;
+      const env = match[1].toLowerCase();
+      assertSafeSegment(env, 'env');
+      configFiles.push({ file: path.join(projectsRoot, name), env });
+    }
+  } catch {
+    // repos.json is optional.
+  }
+
+  const targets: WebhookInspectionTarget[] = [];
+  const seenPaths = new Set<string>();
+  for (const config of configFiles) {
+    const entries = await readWebhookRepoEntries(config.file);
+    for (const entry of entries) {
+      if (!entry || typeof entry.full_name !== 'string') continue;
+      const branch = typeof entry.branch === 'string' ? entry.branch : 'master';
+      const mainRepoPath = getGiteaWebhookRepoPath(projectsRoot, entry.full_name);
+      const cloneUrl = typeof entry.clone_url === 'string' ? entry.clone_url : undefined;
+      const analyzeOptions = buildGiteaWebhookAnalyzeOptions(entry.full_name, branch);
+      const projectName = path.basename(entry.full_name);
+      const registryName = config.env
+        ? buildRegistryName(config.env, projectName)
+        : analyzeOptions.registryName;
+      const repoPath = config.env
+        ? getManagedWorktreePath(mainRepoPath, config.env, projectName)
+        : mainRepoPath;
+      const resolvedRepoPath = path.resolve(repoPath);
+      if (seenPaths.has(resolvedRepoPath)) continue;
+      seenPaths.add(resolvedRepoPath);
+      targets.push({
+        fullName: entry.full_name,
+        repoPath,
+        mainRepoPath,
+        cloneUrl,
+        branch,
+        repoName: registryName,
+        registryName,
+        allowDuplicateName: config.env ? undefined : analyzeOptions.allowDuplicateName,
+        env: config.env,
+      });
+    }
+  }
+  return targets;
+};
+
+const pathExists = async (targetPath: string): Promise<boolean> =>
+  fs.access(targetPath).then(
+    () => true,
+    () => false,
+  );
+
+const discoverProjectRepoPaths = async (
+  projectsRoot: string,
+  maxDepth = PROJECT_DISCOVERY_MAX_DEPTH,
+): Promise<string[]> => {
+  const repoPaths = new Set<string>();
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    if (depth > maxDepth) return;
+    if (await pathExists(path.join(dir, '.git'))) {
+      repoPaths.add(dir);
+      return;
+    }
+    let entries: import('fs').Dirent[] = [];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name === '.git' || entry.name === '.gitnexus') continue;
+      await walk(path.join(dir, entry.name), depth + 1);
+    }
+  };
+  await walk(path.resolve(projectsRoot), 0);
+  return [...repoPaths].sort();
+};
+
+export const getWebhookAnalyzeConcurrency = (): number => {
+  const raw = process.env.GITNEXUS_WEBHOOK_ANALYZE_CONCURRENCY || process.env.INDEXING_CONCURRENCY;
+  if (!raw) return DEFAULT_WEBHOOK_ANALYZE_CONCURRENCY;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_WEBHOOK_ANALYZE_CONCURRENCY;
+};
+
+export const shouldScheduleStartupWebhookRepos = (): boolean =>
+  envFlagEnabled(process.env.GITNEXUS_STARTUP_WEBHOOK_REPOS_ENABLED, false);
 
 /**
  * Determine whether an HTTP Origin header value is allowed by CORS policy.
@@ -908,7 +1208,7 @@ export const respondIfAnalysisPending = (
 export const handleQueryRequest = async (
   req: express.Request,
   res: express.Response,
-  resolveRepo: (repoName?: string) => Promise<{ storagePath: string } | undefined>,
+  resolveRepo: (repoName?: string) => Promise<{ name: string; storagePath: string } | undefined>,
 ): Promise<void> => {
   try {
     const cypher = req.body.cypher as string;
@@ -930,6 +1230,11 @@ export const handleQueryRequest = async (
       return;
     }
     if (respondIfAnalysisPending(entry, res)) return;
+    if (isNeo4jBackendEnabled()) {
+      const result = await queryNeo4jBackend(cypher, entry.name);
+      res.json({ result });
+      return;
+    }
     const lbugPath = resolveGraphPath(entry.storagePath);
     const { skipFts } = await loadFtsSession(entry.storagePath);
     const result = await withLbugDb(
@@ -1056,25 +1361,22 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   const cleanupMcp = await mountMCPEndpoints(app, backend);
   const jobManager = new JobManager();
   const updateController = createServeUpdateController();
+  const embedJobManager = new JobManager();
 
   // Backstop: remove any upload staging dirs orphaned by a previous crash.
   void sweepStaleUploads().catch(() => {});
 
-  // Shared repo lock — prevents concurrent analyze + embed on the same repo path,
-  // which would corrupt LadybugDB (analyze calls closeLbug + initLbug while embed has queries in flight).
-  const activeRepoPaths = new Set<string>();
+  // Shared repo lock serializes graph and metadata writes for one repository.
+  // The registry also notifies deferred embedding repair rounds when a structure
+  // worker releases the lock.
+  const repoLocks = new RepoLockRegistry();
+  const repoLockKey = (repoPath: string): string => canonicalizePath(path.resolve(repoPath));
+  const acquireRepoLock = (repoPath: string): string | null => repoLocks.acquire(repoLockKey(repoPath));
+  const releaseRepoLock = (repoPath: string): void => repoLocks.release(repoLockKey(repoPath));
 
-  const acquireRepoLock = (repoPath: string): string | null => {
-    if (activeRepoPaths.has(repoPath)) {
-      return `Another job is already active for this repository`;
-    }
-    activeRepoPaths.add(repoPath);
-    return null;
-  };
-
-  const releaseRepoLock = (repoPath: string): void => {
-    activeRepoPaths.delete(repoPath);
-  };
+  let onAnalysisFinalized:
+    | ((result: AnalyzeResultIpc, context: { jobId: string; repoPath: string }) => void)
+    | undefined;
 
   // Launch the analyze worker for an already-resolved repo directory. Shared by
   // the JSON /api/analyze route and the multipart /api/analyze/upload route.
@@ -1084,6 +1386,549 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     acquireRepoLock,
     releaseRepoLock,
     closeDbHandle: closeLbug,
+    onAnalysisFinalized: (result, context) => onAnalysisFinalized?.(result, context),
+  });
+
+  const resourceController = new ResourceAwareConcurrencyController();
+  const webhookParallelStartGate = new WebhookStartStaggerGate(() =>
+    resourceController.getParallelEntryStaggerMs(),
+  );
+  const webhookAnalyzeQueue = new WebhookAnalyzeQueue(
+    () => resourceController.getConcurrency('structure'),
+    {
+      startGate: webhookParallelStartGate,
+    },
+  );
+  const webhookEmbeddingRepairQueue = new WebhookAnalyzeQueue(
+    () => resourceController.getConcurrency('embedding'),
+  );
+  // ponytail: global lock, add per-provider capacity only when real throughput requires it.
+  const wikiQueue = new WikiQueue();
+
+  const startAnalyzeForPath = (
+    repoPath: string,
+    params: {
+      repoUrl?: string;
+      repoName?: string;
+      force?: boolean;
+      embeddings?: boolean;
+      deferEmbeddingRepair?: boolean;
+      registryName?: string;
+      registryBranch?: string;
+      allowDuplicateName?: boolean;
+    } = {},
+    lockAlreadyHeld = false,
+  ): ReturnType<JobManager['createJob']> => {
+    const job = jobManager.createJob({ repoUrl: params.repoUrl, repoPath });
+    if (job.status !== 'queued') return job;
+    const analyzeLockKey = getStoragePath(repoPath);
+    if (!lockAlreadyHeld) {
+      const lockErr = acquireRepoLock(analyzeLockKey);
+      if (lockErr) throw new Error(lockErr);
+      releaseRepoLock(analyzeLockKey);
+    }
+    jobManager.updateJob(job.id, {
+      repoPath,
+      repoName: params.repoName,
+      status: 'analyzing',
+      progress: { phase: 'analyzing', percent: 0, message: 'Analyzing repository...' },
+    });
+    launchAnalysisWorker(job, repoPath, {
+      force: !!params.force,
+      embeddings: params.embeddings,
+      deferEmbeddingRepair: params.deferEmbeddingRepair,
+      registryName: params.registryName,
+      registryBranch: params.registryBranch,
+      allowDuplicateName: params.allowDuplicateName,
+      lockAlreadyHeld,
+    });
+    return job;
+  };
+
+  const waitForAnalyzeJob = (jobId: string): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const current = jobManager.getJob(jobId);
+      if (current?.status === 'complete') return resolve();
+      if (current?.status === 'failed')
+        return reject(new Error(current.error || 'Analysis failed'));
+      const unsubscribe = jobManager.onProgress(jobId, (progress) => {
+        if (progress.phase === 'complete') {
+          unsubscribe();
+          resolve();
+        } else if (progress.phase === 'failed') {
+          unsubscribe();
+          reject(new Error(progress.message || 'Analysis failed'));
+        }
+      });
+    });
+
+  const enqueueWebhookAnalyze = (
+    repoPath: string,
+    params: Parameters<typeof startAnalyzeForPath>[1] = {},
+    beforeAnalyze?: () => Promise<void>,
+    lockAlreadyHeld = false,
+  ) => {
+    let job: ReturnType<typeof startAnalyzeForPath> | undefined;
+    const resolvedRepoPath = path.resolve(repoPath);
+    const queued = webhookAnalyzeQueue.enqueue({
+      key: resolvedRepoPath,
+      run: async (releaseStructureSlot) => {
+        const lockKey = getStoragePath(repoPath);
+        if (!lockAlreadyHeld) {
+          const lockErr = acquireRepoLock(lockKey);
+          if (lockErr) {
+            if (isRepoAlreadyActiveError(new Error(lockErr))) return;
+            throw new Error(lockErr);
+          }
+        }
+        let releaseProgressListener: (() => void) | undefined;
+        try {
+          await beforeAnalyze?.();
+          await ensureCocoaPodsDependencies(repoPath);
+          await waitForJobManagerIdle(jobManager);
+          job = startAnalyzeForPath(repoPath, {
+            ...params,
+            deferEmbeddingRepair: Boolean(params.deferEmbeddingRepair),
+          }, true);
+          releaseProgressListener = jobManager.onProgress(job.id, (progress) => {
+            if (progress.phase === 'embeddings' && progress.percent >= 90) {
+              releaseStructureSlot();
+              releaseProgressListener?.();
+              releaseProgressListener = undefined;
+            }
+          });
+          await waitForAnalyzeJob(job.id);
+        } finally {
+          releaseProgressListener?.();
+          if (!lockAlreadyHeld) releaseRepoLock(lockKey);
+        }
+      },
+    });
+    return {
+      status: queued.status,
+      get job() {
+        return job;
+      },
+      done: queued.done,
+    };
+  };
+
+  type EmbeddingRepairEntry = Awaited<ReturnType<typeof listRegisteredRepos>>[number];
+  const embeddingRepairRequests = new Map<
+    string,
+    { entry: EmbeddingRepairEntry; options: { source: string; registryBranch?: string } }
+  >();
+
+  const runEmbeddingRepairForStoragePath = async (storagePath: string): Promise<void> => {
+    const request = embeddingRepairRequests.get(storagePath);
+    if (!request) return;
+    const { entry, options } = request;
+    let job: ReturnType<JobManager['createJob']> | undefined;
+    const updateEmbeddingMeta = async (
+      embeddingStatus: EmbeddingStatus,
+      embeddings?: number,
+    ): Promise<void> => {
+      const latestMeta = await loadMeta(entry.storagePath);
+      const stats = {
+        ...(entry.stats ?? {}),
+        ...(latestMeta?.stats ?? {}),
+        ...(embeddings === undefined ? {} : { embeddings }),
+      };
+      const meta = {
+        ...(latestMeta ?? {}),
+        repoPath: latestMeta?.repoPath ?? entry.path,
+        lastCommit: latestMeta?.lastCommit ?? entry.lastCommit,
+        indexedAt: new Date().toISOString(),
+        branch: options.registryBranch ?? latestMeta?.branch ?? entry.branch,
+        remoteUrl: latestMeta?.remoteUrl ?? entry.remoteUrl,
+        embeddingStatus,
+        keywordSummaryHashSalt: getKeywordSummaryHashSalt(),
+        stats,
+      };
+      await saveMeta(entry.storagePath, meta);
+      await registerRepo(entry.path, meta, { name: entry.name, allowDuplicateName: true });
+    };
+    const progress = (p: any) => {
+      embedJobManager.updateJob(job!.id, {
+        progress: {
+          phase: p.phase === 'ready' ? 'complete' : p.phase === 'error' ? 'failed' : p.phase,
+          percent: p.percent,
+          message: p.message ?? `${p.phase} (${p.percent}%)`,
+        },
+      });
+    };
+    try {
+      job = embedJobManager.createJob({ repoPath: entry.path });
+      embedJobManager.updateJob(job.id, {
+        repoName: entry.name,
+        status: 'analyzing' as any,
+        progress: { phase: 'embeddings', percent: 0, message: 'Starting embedding repair...' },
+      });
+      await updateEmbeddingMeta(EMBEDDING_STATUS_RUNNING);
+      let embeddingCount = 0;
+      if (isNeo4jBackendEnabled()) {
+        embeddingCount = await runNeo4jEmbeddingRepair(entry.name, progress, entry.path);
+      } else {
+        const queued = enqueueWebhookAnalyze(entry.path, {
+          repoName: entry.name,
+          embeddings: true,
+          registryName: entry.name,
+          registryBranch: options.registryBranch,
+          allowDuplicateName: true,
+        }, undefined, true);
+        await queued.done;
+        await withLbugDb(path.join(entry.storagePath, 'lbug'), async () => {
+          const rows = await executeQuery(
+            `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS embeddings`,
+          );
+          embeddingCount = Number(rows?.[0]?.embeddings ?? rows?.[0]?.[0] ?? 0);
+        });
+      }
+      await updateEmbeddingMeta(EMBEDDING_STATUS_COMPLETE, embeddingCount);
+      await backend.init();
+      embedJobManager.updateJob(job.id, { status: 'complete', repoName: entry.name });
+    } catch (err) {
+      await updateEmbeddingMeta(EMBEDDING_STATUS_FAILED).catch(() => {});
+      if (job) {
+        embedJobManager.updateJob(job.id, {
+          status: 'failed',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      throw err;
+    }
+  };
+
+  const embeddingRepairCoordinator = createEmbeddingRepairCoordinator({
+    queue: {
+      enqueue: (repoId, task) => {
+        void webhookEmbeddingRepairQueue
+          .enqueue({ key: repoId, run: async () => task() })
+          .done.catch((err) => {
+            const repo = embeddingRepairRequests.get(repoId)?.entry.name ?? repoId;
+            handleEmbeddingRepairError(err, repo);
+          });
+      },
+    },
+    runner: { run: runEmbeddingRepairForStoragePath },
+    lock: isNeo4jBackendEnabled()
+      ? {
+          tryAcquire: () => true,
+          release: () => {},
+          onReleased: () => () => {},
+        }
+      : {
+          tryAcquire: (storagePath) => acquireRepoLock(storagePath) === null,
+          release: releaseRepoLock,
+          onReleased: (listener) => repoLocks.onReleased(listener),
+        },
+    timers: { setTimeout },
+    now: () => new Date().toISOString(),
+  });
+
+  const startEmbeddingRepairForEntry = (
+    entry: EmbeddingRepairEntry,
+    options: { source: string; registryBranch?: string },
+  ) => {
+    if (isNeo4jBackendEnabled()) {
+      embeddingRepairRequests.set(entry.name, { entry, options });
+      const projection = embeddingRepairCoordinator.request({
+        repo: entry.name,
+        source:
+          options.source === 'manual'
+            ? 'manual'
+            : options.source === 'finalization'
+              ? 'finalization'
+              : 'startup',
+      });
+      return { status: projection.status, job: undefined };
+    }
+
+    const storagePath = repoLockKey(entry.storagePath);
+    embeddingRepairRequests.set(storagePath, { entry, options });
+    const projection = embeddingRepairCoordinator.request({
+      repo: storagePath,
+      source:
+        options.source === 'manual'
+          ? 'manual'
+          : options.source === 'finalization'
+            ? 'finalization'
+            : 'startup',
+    });
+    return { status: projection.status, job: undefined };
+  };
+
+  onAnalysisFinalized = (result: AnalyzeResultIpc, context: { jobId: string; repoPath: string }): void => {
+    void (async () => {
+      try {
+        const entry = (await listRegisteredRepos()).find((candidate) =>
+          registryPathEquals(canonicalizePath(candidate.path), canonicalizePath(context.repoPath)),
+        );
+        if (!entry) return;
+        const meta = await loadMeta(entry.storagePath);
+        if (meta?.lastCommit) {
+          wikiQueue.enqueue(entry, meta.lastCommit).done.catch((err) => {
+            logger.warn({ err, repo: entry.name }, 'post-analysis wiki generation failed');
+          });
+        }
+
+        if (!result.embeddingRepairDeferred || !isNeo4jBackendEnabled()) return;
+        const { countEmbeddings } = await import('../core/neo4j/embedding-adapter.js');
+        const actualEmbeddings = await countEmbeddings(entry.name).catch(() => undefined);
+        if ((meta?.stats?.nodes ?? 0) <= 0 && actualEmbeddings === 0) return;
+        startEmbeddingRepairForEntry(entry, { source: 'finalization', registryBranch: entry.branch });
+      } catch (err) {
+        logger.error({ err, repoPath: context.repoPath }, 'post-analysis background scheduling failed');
+      }
+    })();
+  };
+  const handleEmbeddingRepairError = (err: unknown, repo: string): void => {
+    if (isAnalysisAlreadyInProgressError(err)) return;
+    if (isNeo4jEmbeddingRepairCooldownError(err)) {
+      const log = err.name === 'Neo4jEmbeddingRepairDeferredError' ? logger.warn : logger.debug;
+      log(
+        { repo, retryAfterMs: err.retryAfterMs },
+        err.name === 'Neo4jEmbeddingRepairDeferredError'
+          ? 'embedding repair deferred: embedding endpoint failures cooling repo down'
+          : 'embedding repair skipped: repo cooling down',
+      );
+      return;
+    }
+    logger.error({ err, repo }, 'embedding repair failed');
+  };
+
+  app.get('/api/internal/repo-locks/:repoName', requireLoopbackPeer, async (req, res) => {
+    if (!isLocalDiagnosticsEnabled()) {
+      res.status(404).end();
+      return;
+    }
+
+    const requestedName = req.params.repoName;
+    try {
+      const entry = (await listRegisteredRepos()).find((repo) => repo.name === requestedName);
+      if (!entry) {
+        res.status(404).json({ error: 'Repository not found' });
+        return;
+      }
+
+      const isActive = (job: AnalyzeJob): boolean =>
+        job.status !== 'complete' && job.status !== 'failed';
+      const belongsToRepo = (job: AnalyzeJob): boolean =>
+        job.repoName === entry.name || job.repoPath === entry.path || job.repoPath === entry.storagePath;
+      const jobs = [...jobManager.listJobs(), ...embedJobManager.listJobs()]
+        .filter(isActive)
+        .filter(belongsToRepo)
+        .map(toLocalDiagnosticJob);
+
+      res.json({
+        repoName: entry.name,
+        lockHeld: repoLocks.has(repoLockKey(entry.storagePath)),
+        jobs,
+      });
+    } catch {
+      res.status(500).json({ error: 'Unable to inspect repository lock' });
+    }
+  });
+
+  app.get('/health', (_req, res) => {
+    res.json({ status: 'ok', projectsRoot: getProjectsRoot() });
+  });
+
+  app.get('/status', (_req, res) => {
+    res.json({ status: 'ok', projectsRoot: getProjectsRoot() });
+  });
+
+  const scheduleStartupWebhookRepos = async (): Promise<void> => {
+    const projectsRoot = getProjectsRoot();
+    for (const target of await loadWebhookInspectionTargets(projectsRoot)) {
+      const queued = enqueueWebhookAnalyze(
+        target.repoPath,
+        {
+          repoUrl: target.cloneUrl,
+          repoName: target.repoName,
+          registryName: target.registryName,
+          registryBranch: target.branch,
+          allowDuplicateName: target.allowDuplicateName,
+        },
+        async () => {
+          if (!target.cloneUrl) return;
+          if (!target.env) {
+            await cloneOrResetToBranch(target.cloneUrl, target.repoPath, target.branch);
+            return;
+          }
+          await cloneOrResetToBranch(target.cloneUrl, target.mainRepoPath, target.branch);
+          await ensureLocalWorktree({
+            mainRepoPath: target.mainRepoPath,
+            worktreePath: target.repoPath,
+            branch: target.registryName,
+            baseRef: `origin/${target.branch}`,
+            resetToRef: `origin/${target.branch}`,
+          });
+        },
+      );
+      queued.done.catch((err) => {
+        logger.error({ err, repo: target.fullName }, 'Startup webhook indexing failed');
+      });
+    }
+  };
+
+  let indexHealthCheckRunning = false;
+  const runIndexHealthCheck = async (source = 'startup'): Promise<{ skipped: boolean }> => {
+    if (indexHealthCheckRunning) return { skipped: true };
+    indexHealthCheckRunning = true;
+    const projectsRoot = getProjectsRoot();
+    try {
+      const webhookBranchByPath = new Map<string, string>();
+      for (const target of await loadWebhookInspectionTargets(projectsRoot)) {
+        webhookBranchByPath.set(path.resolve(target.repoPath), target.branch);
+      }
+      const registeredBeforeSync = await listRegisteredRepos().catch(() => []);
+      const registeredPaths = new Set(
+        registeredBeforeSync.map((entry) => path.resolve(entry.path)),
+      );
+      for (const repoPath of await discoverProjectRepoPaths(projectsRoot)) {
+        const resolvedRepoPath = path.resolve(repoPath);
+        if (registeredPaths.has(resolvedRepoPath)) continue;
+        const repoName = repoNameFromPath(resolvedRepoPath);
+        const meta = await loadMeta(getStoragePath(resolvedRepoPath));
+        if (meta) {
+          await registerRepo(resolvedRepoPath, meta, { name: repoName });
+          registeredPaths.add(resolvedRepoPath);
+          continue;
+        }
+        const queued = enqueueWebhookAnalyze(resolvedRepoPath, { repoName });
+        queued.done.catch((err) => {
+          logger.error({ err, repoName }, 'discovered project repo analyze failed');
+        });
+      }
+
+      await backend.init().catch(() => {});
+      const entries = await listRegisteredRepos().catch(() => []);
+      const countNeo4jEmbeddings = isNeo4jBackendEnabled()
+        ? (await import('../core/neo4j/embedding-adapter.js')).countEmbeddings
+        : undefined;
+
+      for (const entry of entries) {
+        const registryBranch = webhookBranchByPath.get(path.resolve(entry.path)) ?? entry.branch;
+        const meta = await loadMeta(entry.storagePath);
+        let actualEmbeddings: number | undefined;
+        if (countNeo4jEmbeddings && (meta?.stats?.nodes ?? 0) > 0) {
+          try {
+            actualEmbeddings = await countNeo4jEmbeddings(entry.name);
+          } catch {
+            actualEmbeddings = undefined;
+          }
+        }
+        const needsEmbeddings = shouldScheduleStartupEmbeddings(meta, actualEmbeddings);
+        const remoteSync = await syncWithUpstream(entry.path);
+        if (!remoteSync.checked) {
+          logger.warn(
+            { repo: entry.name, reason: remoteSync.reason },
+            'index remote version check skipped; continuing local health check',
+          );
+        } else if (remoteSync.reset) {
+          logger.info(
+            { repo: entry.name, upstreamRef: remoteSync.upstreamRef },
+            'index project reset to remote upstream; scheduling reanalysis',
+          );
+        }
+        const staleness = remoteSync.reset
+          ? { isStale: true, commitsBehind: 1 }
+          : await checkStalenessAsync(entry.path, entry.lastCommit);
+
+        if (shouldRunStartupLbugHealthCheck()) {
+          try {
+            await withLbugDb(path.join(entry.storagePath, 'lbug'), async () => {});
+          } catch (err) {
+            if (!isRepairableIndexError(err)) continue;
+            const queued = enqueueWebhookAnalyze(entry.path, {
+              repoName: entry.name,
+              embeddings: needsEmbeddings || undefined,
+              registryName: entry.name,
+              registryBranch,
+              allowDuplicateName: true,
+            });
+            queued.done.catch((analyzeErr) => {
+              if (isAnalysisAlreadyInProgressError(analyzeErr)) {
+                logger.debug(
+                  { repo: entry.name },
+                  'index repair skipped: analysis already in progress',
+                );
+                return;
+              }
+              logger.error({ err: analyzeErr, repo: entry.name }, 'index repair failed');
+            });
+            continue;
+          }
+        }
+
+        const scheduleStaleAnalyze = (): void => {
+          logger.info(
+            { repo: entry.name, path: entry.path },
+            'Stale index analyze scheduled',
+          );
+          const queued = enqueueWebhookAnalyze(entry.path, {
+            repoName: entry.name,
+            force: false,
+            deferEmbeddingRepair: true,
+            registryName: entry.name,
+            registryBranch,
+            allowDuplicateName: true,
+          });
+          queued.done.catch((err) => {
+            if (isAnalysisAlreadyInProgressError(err)) {
+              logger.debug(
+                { repo: entry.name },
+                'stale index refresh skipped: analysis already in progress',
+              );
+              return;
+            }
+            logger.error({ err, repo: entry.name }, 'stale index refresh failed');
+          });
+        };
+
+        if (isNeo4jBackendEnabled() && needsEmbeddings) {
+          logger.info(
+            { repo: entry.name, actualEmbeddings, nodes: meta?.stats?.nodes ?? 0 },
+            'Embedding repair scheduled for existing graph',
+          );
+          startEmbeddingRepairForEntry(entry, { source, registryBranch });
+        }
+
+        if (shouldScheduleStartupIncrementalAnalyze(staleness)) {
+          scheduleStaleAnalyze();
+          continue;
+        }
+
+        if (!isNeo4jBackendEnabled() && needsEmbeddings) {
+          logger.info(
+            { repo: entry.name, actualEmbeddings, nodes: meta?.stats?.nodes ?? 0 },
+            'Embedding repair scheduled for existing graph',
+          );
+          const queued = startEmbeddingRepairForEntry(entry, { source, registryBranch });
+          if (queued.status === 'waiting_for_lock') {
+            logger.debug({ repo: entry.name }, 'embedding repair waiting for repository lock');
+          }
+        }
+      }
+      return { skipped: false };
+    } finally {
+      indexHealthCheckRunning = false;
+    }
+  };
+
+  if (shouldScheduleStartupWebhookRepos()) {
+    void scheduleStartupWebhookRepos();
+  }
+  void runIndexHealthCheck('startup').catch((err) => {
+    logger.error({ err }, 'startup index health check failed');
+  });
+
+  app.post('/api/index-health-check', (_req, res) => {
+    void runIndexHealthCheck('manual').catch((err) => {
+      logger.error({ err }, 'manual index health check failed');
+    });
+    res.status(202).json({ ok: true, accepted: true });
   });
 
   /**
@@ -1236,17 +2081,31 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       // variant took ~50s across 200 repos (#1363). Projecting inside the map
       // keeps the entry and its own check together — an index-matched second
       // array is the shape that silently mispairs them if either is reordered.
+      // 个性化：wiki 生命周期与 staleness 并行刷新，结果并入官方投影。
       res.json(
         await Promise.all(
           repos.map(async (r) => {
-            const [staleness, availability] = await Promise.all([
+            const [staleness, availability, wiki] = await Promise.all([
               checkStalenessAsync(r.path, r.lastCommit),
               getSourceAvailability(r),
+              wikiQueue.refreshLifecycle(r).catch((err) => {
+                logger.warn({ err, repo: r.name }, 'wiki lifecycle refresh failed');
+                return {
+                  enabled: true as const,
+                  sourceCommit: null,
+                  status: 'failed' as const,
+                  queue: 'idle' as const,
+                  lastError: 'generation_failed' as const,
+                };
+              }),
             ]);
-            return projectRepoListEntry(r, staleness, {
-              contentRetention: availability.contentRetention ?? 'full',
-              sourceAvailable: availability.available,
-            });
+            return {
+              ...projectRepoListEntry(r, staleness, {
+                contentRetention: availability.contentRetention ?? 'full',
+                sourceAvailable: availability.available,
+              }),
+              wiki,
+            };
           }),
         ),
       );
@@ -1408,6 +2267,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const stream = req.query.stream === 'true';
       const { skipFts } = await loadFtsSession(entry.storagePath);
 
+      if (isNeo4jBackendEnabled()) {
+        if (stream) {
+          res.status(400).json({ error: 'Graph streaming is not supported for Neo4j backend yet' });
+          return;
+        }
+        const graph = await buildNeo4jGraph(entry.name, includeContent);
+        res.json(graph);
+        return;
+      }
+
       if (stream) {
         const abortController = new AbortController();
         let responseFinished = false;
@@ -1504,6 +2373,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         : 10;
       const mode: string = req.body.mode ?? 'hybrid';
       const enrich: boolean = req.body.enrich !== false; // default true
+
+      if (isNeo4jBackendEnabled()) {
+        const results = await searchNeo4jBackend({
+          repoName: entry.name,
+          query,
+          mode,
+          limit,
+        });
+        res.json({ results });
+        return;
+      }
 
       const results = await withLbugDb(
         lbugPath,
@@ -1703,13 +2583,18 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const repoRoot = path.resolve(entry.path);
       const { skipFts } = await loadFtsSession(entry.storagePath);
 
-      const lbugPath = resolveGraphPath(entry.storagePath);
-      const fileRows = await withLbugDb(
-        lbugPath,
-        () =>
-          executeQuery(`MATCH (n:File) WHERE n.content IS NOT NULL RETURN n.filePath AS filePath`),
-        readOnlyFtsOptions(skipFts),
-      );
+      // Get file paths from the graph (lightweight — no content loaded).
+      // Neo4j 后端从远端图取路径，LadybugDB 后端沿用官方读取逻辑。
+      const fileRows = isNeo4jBackendEnabled()
+        ? (await listNeo4jFilePaths(entry.name)).map((filePath) => ({ filePath }))
+        : await withLbugDb(
+            resolveGraphPath(entry.storagePath),
+            () =>
+              executeQuery(
+                `MATCH (n:File) WHERE n.content IS NOT NULL RETURN n.filePath AS filePath`,
+              ),
+            readOnlyFtsOptions(skipFts),
+          );
 
       const filePaths: string[] = [];
       for (const row of fileRows) {
@@ -1774,6 +2659,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // List all processes
   app.get('/api/processes', createRouteLimiter(), async (req, res) => {
     try {
+      if (isNeo4jBackendEnabled()) {
+        const entry = await resolveRepo(requestedRepo(req));
+        if (!entry) {
+          res.status(404).json({ error: 'Repository not found' });
+          return;
+        }
+        if (respondIfAnalysisPending(entry, res)) return;
+        const result = await queryNeo4jProcesses(entry.name);
+        res.json(result);
+        return;
+      }
       const repoPath = await resolveBackendRepoPath(req, res);
       if (repoPath === null) return;
       const result = await backend.queryProcesses(repoPath);
@@ -1793,9 +2689,20 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
-      const repoPath = await resolveBackendRepoPath(req, res);
-      if (repoPath === null) return;
-      const result = await backend.queryProcessDetail(name, repoPath);
+      let result;
+      if (isNeo4jBackendEnabled()) {
+        const entry = await resolveRepo(requestedRepo(req));
+        if (!entry) {
+          res.status(404).json({ error: 'Repository not found' });
+          return;
+        }
+        if (respondIfAnalysisPending(entry, res)) return;
+        result = await queryNeo4jProcessDetail(name, entry.name);
+      } else {
+        const repoPath = await resolveBackendRepoPath(req, res);
+        if (repoPath === null) return;
+        result = await backend.queryProcessDetail(name, repoPath);
+      }
       if (result?.error) {
         res.status(404).json({ error: result.error });
         return;
@@ -1810,6 +2717,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // List all clusters
   app.get('/api/clusters', createRouteLimiter(), async (req, res) => {
     try {
+      if (isNeo4jBackendEnabled()) {
+        const entry = await resolveRepo(requestedRepo(req));
+        if (!entry) {
+          res.status(404).json({ error: 'Repository not found' });
+          return;
+        }
+        if (respondIfAnalysisPending(entry, res)) return;
+        const result = await queryNeo4jClusters(entry.name);
+        res.json(result);
+        return;
+      }
       const repoPath = await resolveBackendRepoPath(req, res);
       if (repoPath === null) return;
       const result = await backend.queryClusters(repoPath);
@@ -1829,9 +2747,20 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
-      const repoPath = await resolveBackendRepoPath(req, res);
-      if (repoPath === null) return;
-      const result = await backend.queryClusterDetail(name, repoPath);
+      let result;
+      if (isNeo4jBackendEnabled()) {
+        const entry = await resolveRepo(requestedRepo(req));
+        if (!entry) {
+          res.status(404).json({ error: 'Repository not found' });
+          return;
+        }
+        if (respondIfAnalysisPending(entry, res)) return;
+        result = await queryNeo4jClusterDetail(name, entry.name);
+      } else {
+        const repoPath = await resolveBackendRepoPath(req, res);
+        if (repoPath === null) return;
+        result = await backend.queryClusterDetail(name, repoPath);
+      }
       if (result?.error) {
         res.status(404).json({ error: result.error });
         return;
@@ -1840,6 +2769,133 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     } catch (err: any) {
       if (sendStorageRequirementHttp(err, res)) return;
       res.status(statusFromError(err)).json(httpErrorBody(err, 'Failed to query cluster detail'));
+    }
+  });
+
+  app.post('/webhook/gitea', async (req, res) => {
+    try {
+      const repo = parseGiteaWebhookRepo(req.body);
+      const branch = repo.branch || 'master';
+      const projectsRoot = getProjectsRoot();
+      const repoPath = getGiteaWebhookRepoPath(projectsRoot, repo.fullName);
+      await upsertWebhookRepoConfig(path.join(projectsRoot, 'repos.json'), {
+        full_name: repo.fullName,
+        clone_url: repo.cloneUrl,
+        branch,
+      });
+      const analyzeOptions = buildGiteaWebhookAnalyzeOptions(repo.fullName, branch);
+      const queued = enqueueWebhookAnalyze(
+        repoPath,
+        {
+          repoUrl: repo.cloneUrl,
+          repoName: analyzeOptions.registryName,
+          registryName: analyzeOptions.registryName,
+          registryBranch: branch,
+          allowDuplicateName: analyzeOptions.allowDuplicateName,
+        },
+        async () => {
+          await cloneOrResetToBranch(repo.cloneUrl, repoPath, branch);
+        },
+      );
+      queued.done.catch((err) => {
+        if (isAnalysisAlreadyInProgressError(err)) {
+          logger.debug(
+            { repo: repo.fullName },
+            'gitea webhook analyze skipped: analysis already in progress',
+          );
+          return;
+        }
+        logger.error({ err, repo: repo.fullName }, 'gitea webhook analyze failed');
+      });
+      res.status(202).json({
+        ok: true,
+        status: queued.status,
+        jobId: queued.job?.id,
+        repo: analyzeOptions.registryName,
+        path: repoPath,
+      });
+    } catch (err: any) {
+      if (err instanceof WebhookWorktreeError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      if (isRepoAlreadyActiveError(err)) {
+        res.status(202).json({ ok: true, status: 'active', message: err.message });
+        return;
+      }
+      res.status(500).json({ error: err.message || 'Failed to process Gitea webhook' });
+    }
+  });
+
+  app.post('/webhook/:env/index', async (req, res) => {
+    try {
+      const env = req.params.env.toLowerCase();
+      assertSafeSegment(env, 'env');
+      assertEnvAllowed(env, getAllowedEnvironments());
+      const repo = parseGiteaWebhookRepo(req.body);
+      const sourceBranch = repo.branch || 'master';
+      const projectsRoot = getProjectsRoot();
+      const projectName = path.basename(repo.fullName);
+      const mainRepoPath = getGiteaWebhookRepoPath(projectsRoot, repo.fullName);
+      const worktreePath = getManagedWorktreePath(mainRepoPath, env, projectName);
+      const legacyWorktreePath = getLegacyManagedWorktreePath(env, projectName);
+      const registryName = buildRegistryName(env, projectName);
+
+      await upsertWebhookRepoConfig(getWebhookEnvReposFile(projectsRoot, env), {
+        full_name: repo.fullName,
+        clone_url: repo.cloneUrl,
+        branch: sourceBranch,
+      });
+      await cloneOrResetToBranch(repo.cloneUrl, mainRepoPath, sourceBranch);
+      const worktree = await ensureLocalWorktree({
+        mainRepoPath,
+        worktreePath,
+        branch: registryName,
+        baseRef: `origin/${sourceBranch}`,
+        resetToRef: `origin/${sourceBranch}`,
+      });
+      await copyBootstrapIndex({
+        sourceRepoPath: legacyWorktreePath,
+        worktreePath,
+        branch: worktree.branch,
+        commit: worktree.commit,
+        registryName,
+        register: registerRepo,
+      });
+
+      const queued = enqueueWebhookAnalyze(worktreePath, {
+        repoUrl: repo.cloneUrl,
+        repoName: registryName,
+        registryName,
+        registryBranch: sourceBranch,
+      });
+      queued.done.catch((err) => {
+        if (isAnalysisAlreadyInProgressError(err)) {
+          logger.debug(
+            { repo: registryName },
+            'worktree webhook analyze skipped: analysis already in progress',
+          );
+          return;
+        }
+        logger.error({ err, repo: registryName }, 'worktree webhook analyze failed');
+      });
+      res.status(202).json({
+        ok: true,
+        status: queued.status,
+        jobId: queued.job?.id,
+        repo: registryName,
+        path: worktreePath,
+      });
+    } catch (err: any) {
+      if (err instanceof WebhookWorktreeError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      if (isRepoAlreadyActiveError(err)) {
+        res.status(202).json({ ok: true, status: 'active', message: err.message });
+        return;
+      }
+      res.status(500).json({ error: err.message || 'Failed to start webhook index' });
     }
   });
 
@@ -2095,7 +3151,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   // ── Embedding endpoints ────────────────────────────────────────────
 
-  const embedJobManager = new JobManager();
 
   // POST /api/embed — trigger server-side embedding generation
   app.post(
@@ -2153,6 +3208,28 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           // for the whole embedding write, released in the finally below.
           let slotLock: IndexLockHandle | undefined;
           try {
+            if (isNeo4jBackendEnabled()) {
+              const updateEmbedProgress = (p: any) => {
+                embedJobManager.updateJob(job.id, {
+                  progress: {
+                    phase:
+                      p.phase === 'ready' ? 'complete' : p.phase === 'error' ? 'failed' : p.phase,
+                    percent: p.percent,
+                    message:
+                      p.phase === 'loading-model'
+                        ? 'Loading embedding model...'
+                        : p.phase === 'embedding'
+                          ? `Embedding nodes (${p.percent}%)...`
+                          : p.phase === 'indexing'
+                            ? 'Creating vector index...'
+                            : p.phase === 'ready'
+                              ? 'Embeddings complete'
+                              : `${p.phase} (${p.percent}%)`,
+                  },
+                });
+              };
+              await runNeo4jEmbeddingRepair(entry.name, updateEmbedProgress, entry.path);
+            } else {
             slotLock = await acquireIndexLock(storagePath, { sweep: false });
             requireExclusiveIndexLock(
               slotLock,
@@ -2371,6 +3448,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               },
               skipFtsOption(ftsSession.skipFts),
             );
+            }
 
             // Don't overwrite 'failed' if the job was cancelled while the pipeline was running
             const current = embedJobManager.getJob(job.id);

@@ -1,3 +1,4 @@
+import { EventEmitter } from 'events';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   JobManager,
@@ -477,6 +478,81 @@ describe('JobManager', () => {
     vi.advanceTimersByTime(15_000);
     expect(signals).toEqual(['SIGTERM']);
     vi.restoreAllMocks();
+  });
+
+  it('does not auto-cancel a registered child after the old 30-minute limit by default', () => {
+    vi.useFakeTimers();
+    manager.dispose();
+    manager = new JobManager();
+    const prevTimeout = process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+    delete process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+
+    try {
+      const job = manager.createJob({ repoUrl: 'https://github.com/user/repo' });
+      manager.updateJob(job.id, { status: 'analyzing' });
+      const child = new EventEmitter() as any;
+      child.kill = vi.fn();
+
+      manager.registerChild(job.id, child);
+      vi.advanceTimersByTime(31 * 60 * 1000);
+
+      expect(manager.getJob(job.id)!.status).toBe('analyzing');
+      expect(manager.getJob(job.id)!.error).toBeUndefined();
+      expect(child.kill).not.toHaveBeenCalled();
+    } finally {
+      if (prevTimeout === undefined) delete process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+      else process.env.GITNEXUS_ANALYZE_TIMEOUT_MS = prevTimeout;
+      vi.useRealTimers();
+    }
+  });
+
+  it('auto-cancels a registered child once GITNEXUS_ANALYZE_TIMEOUT_MS elapses', () => {
+    vi.useFakeTimers();
+    manager.dispose();
+    manager = new JobManager();
+    const prevTimeout = process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+    process.env.GITNEXUS_ANALYZE_TIMEOUT_MS = '60000';
+
+    try {
+      const job = manager.createJob({ repoUrl: 'https://github.com/user/repo' });
+      manager.updateJob(job.id, { status: 'analyzing' });
+      const child = new EventEmitter() as any;
+      child.kill = vi.fn();
+
+      manager.registerChild(job.id, child);
+      vi.advanceTimersByTime(60_001);
+
+      expect(manager.hasPendingCancel(job.id)).toBe(true);
+      expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    } finally {
+      if (prevTimeout === undefined) delete process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+      else process.env.GITNEXUS_ANALYZE_TIMEOUT_MS = prevTimeout;
+      vi.useRealTimers();
+    }
+  });
+
+  it('dispose clears pending analysis timeouts', () => {
+    vi.useFakeTimers();
+    manager.dispose();
+    manager = new JobManager();
+    const prevTimeout = process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+    process.env.GITNEXUS_ANALYZE_TIMEOUT_MS = '60000';
+
+    try {
+      const job = manager.createJob({ repoUrl: 'https://github.com/user/repo' });
+      const child = new EventEmitter() as any;
+      child.kill = vi.fn();
+
+      manager.registerChild(job.id, child);
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+      manager.dispose();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      if (prevTimeout === undefined) delete process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+      else process.env.GITNEXUS_ANALYZE_TIMEOUT_MS = prevTimeout;
+      vi.useRealTimers();
+    }
   });
 
   it('cancelJob returns false for terminal jobs', () => {

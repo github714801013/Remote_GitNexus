@@ -18,7 +18,7 @@ import path from 'path';
 // local-backend.ts imports from core/lbug/pool-adapter.js; the mcp/core/lbug-adapter.js
 // re-exports from the same module, so we mock the canonical source.
 // vi.hoisted runs before vi.mock hoisting, making the fns available to both factories.
-const { lbugMocks } = vi.hoisted(() => ({
+const { lbugMocks, neo4jMocks, platformMocks } = vi.hoisted(() => ({
   lbugMocks: {
     initLbug: vi.fn().mockResolvedValue(undefined),
     executeQuery: vi.fn().mockResolvedValue([]),
@@ -26,6 +26,13 @@ const { lbugMocks } = vi.hoisted(() => ({
     ensureVectorExtension: vi.fn().mockResolvedValue(true),
     closeLbug: vi.fn().mockResolvedValue(undefined),
     isLbugReady: vi.fn().mockReturnValue(true),
+  },
+  neo4jMocks: {
+    isNeo4jBackendEnabled: vi.fn().mockReturnValue(false),
+    executeReadCypher: vi.fn().mockResolvedValue([]),
+  },
+  platformMocks: {
+    isVectorExtensionSupportedByPlatform: vi.fn().mockReturnValue(true),
   },
 }));
 
@@ -38,6 +45,16 @@ vi.mock('../../src/core/lbug/pool-adapter.js', async (importOriginal) => {
 vi.mock('../../src/mcp/core/lbug-adapter.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/mcp/core/lbug-adapter.js')>();
   return { ...actual, ...lbugMocks };
+});
+
+vi.mock('../../src/core/neo4j/config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/core/neo4j/config.js')>();
+  return { ...actual, isNeo4jBackendEnabled: neo4jMocks.isNeo4jBackendEnabled };
+});
+
+vi.mock('../../src/core/neo4j/read-adapter.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/core/neo4j/read-adapter.js')>();
+  return { ...actual, executeReadCypher: neo4jMocks.executeReadCypher };
 });
 
 vi.mock('../../src/storage/repo-manager.js', async (importOriginal) => {
@@ -125,6 +142,7 @@ import {
   TYPE_ONLY_IMPORT_REASON_SUFFIX,
 } from '../../src/core/ingestion/scope-resolution/graph-bridge/imports-to-edges.js';
 import { DART_PACKAGE_IDENTITY_REASON } from '../../src/core/ingestion/languages/dart/package-dependencies.js';
+import { executeReadCypher } from '../../src/core/neo4j/read-adapter.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -293,6 +311,7 @@ describe('LocalBackend.init', () => {
   beforeEach(() => {
     backend = new LocalBackend();
     vi.clearAllMocks();
+    neo4jMocks.isNeo4jBackendEnabled.mockReturnValue(false);
   });
 
   it('returns true when repos are available', async () => {
@@ -305,6 +324,15 @@ describe('LocalBackend.init', () => {
     setupNoRepos();
     const result = await backend.init();
     expect(result).toBe(false);
+  });
+
+  it('skips legacy Kuzu cleanup when Neo4j is the active backend', async () => {
+    setupSingleRepo();
+    neo4jMocks.isNeo4jBackendEnabled.mockReturnValue(true);
+
+    await backend.init();
+
+    expect(cleanupOldKuzuFiles).not.toHaveBeenCalled();
   });
 
   it('calls listRegisteredRepos with validate: true', async () => {
@@ -423,6 +451,8 @@ describe('LocalBackend.callTool', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    neo4jMocks.isNeo4jBackendEnabled.mockReturnValue(false);
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
     backend = new LocalBackend();
     setupSingleRepo();
     await backend.init();
@@ -771,6 +801,78 @@ describe('LocalBackend.callTool', () => {
     const result = await backend.callTool('query', { query: 'auth' });
     expect(result).toHaveProperty('processes');
     expect(result).toHaveProperty('definitions');
+  });
+
+  it('routes route_map through Neo4j when the Neo4j backend is enabled', async () => {
+    neo4jMocks.isNeo4jBackendEnabled.mockReturnValue(true);
+    neo4jMocks.executeReadCypher.mockImplementation(async (cypher: string) => {
+      if (cypher.includes('FETCHES')) {
+        return [
+          {
+            routeId: 'Route:GET /users',
+            routeName: '/users',
+            handlerFile: 'src/users.ts',
+            responseKeys: ['id'],
+            errorKeys: [],
+            middleware: [],
+            consumerName: 'loadUsers',
+            consumerFile: 'src/client.ts',
+            fetchReason: 'fetch-url-match|keys:id',
+            method: 'GET',
+          },
+        ];
+      }
+      return [{ sourceId: 'Route:GET /users', name: 'Users flow' }];
+    });
+
+    const result = await backend.callTool('route_map', { route: '/users' });
+
+    expect(result.routes).toEqual([
+      expect.objectContaining({
+        route: '/users',
+        method: 'GET',
+        handler: 'src/users.ts',
+      }),
+    ]);
+    expect(executeReadCypher).toHaveBeenCalled();
+    expect(executeParameterized).not.toHaveBeenCalled();
+    expect(neo4jMocks.executeReadCypher).toHaveBeenCalledWith(
+      expect.stringContaining('{repoId: $repoId}'),
+      expect.objectContaining({ repoId: 'test-project', route: '/users' }),
+    );
+  });
+
+  it('routes api_impact through Neo4j when the Neo4j backend is enabled', async () => {
+    neo4jMocks.isNeo4jBackendEnabled.mockReturnValue(true);
+    neo4jMocks.executeReadCypher.mockImplementation(async (cypher: string) => {
+      if (cypher.includes('FETCHES')) {
+        return [
+          {
+            routeId: 'Route:GET /users',
+            routeName: '/users',
+            handlerFile: 'src/users.ts',
+            responseKeys: ['id'],
+            errorKeys: [],
+            middleware: [],
+            consumerName: 'loadUsers',
+            consumerFile: 'src/client.ts',
+            fetchReason: 'fetch-url-match|keys:id',
+            method: 'GET',
+          },
+        ];
+      }
+      return [{ sourceId: 'Route:GET /users', name: 'Users flow' }];
+    });
+
+    const result = await backend.callTool('api_impact', { route: '/users', method: 'GET' });
+
+    expect(result).toMatchObject({
+      route: '/users',
+      method: 'GET',
+      handler: 'src/users.ts',
+    });
+    expect(executeReadCypher).toHaveBeenCalled();
+    expect(executeParameterized).not.toHaveBeenCalled();
   });
 
   it('checks cycles using only non-synthetic import edges', async () => {
@@ -3888,7 +3990,8 @@ describe('LocalBackend.resolveRepo', () => {
     try {
       setupMultipleRepos();
       await backend.init();
-      await expect(backend.callTool('query', { query: 'test' })).rejects.toThrow(
+    // 个性化：无 repo 的 query 会跨仓库 fan-out，歧义判定改用 context 验证。
+      await expect(backend.callTool('context', { name: 'test' })).rejects.toThrow(
         'Multiple repositories indexed',
       );
     } finally {
@@ -4202,7 +4305,7 @@ describe('LocalBackend.resolveRepo', () => {
 
     try {
       await backend.init();
-      await expect(backend.callTool('query', { query: 'test' })).rejects.toThrow(
+      await expect(backend.callTool('context', { name: 'test' })).rejects.toThrow(
         'Multiple repositories indexed',
       );
     } finally {
@@ -4318,6 +4421,14 @@ describe('LocalBackend.resolveRepo', () => {
     } finally {
       cwdSpy.mockRestore();
     }
+  });
+
+  it('queries all authorized repos without a repo param', async () => {
+    setupMultipleRepos();
+    await backend.init();
+    const result = await backend.callTool('query', { query: 'test' });
+    expect(result).toHaveProperty('processes');
+    expect(result).toHaveProperty('definitions');
   });
 
   it('resolves repo by name parameter', async () => {

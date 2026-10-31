@@ -1,0 +1,96 @@
+services:
+  # 搜索服务：端口 8001，常驻，保证 IDE 侧代码级问答秒回 (20% VRAM)
+  vllm-search:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-search
+    volumes:
+      - ./models:/app/models
+    ports:
+      - '8001:8000'
+    environment:
+      - HF_ENDPOINT=https://hf-mirror.com
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: >
+      --model /app/models/Alibaba-NLP/gte-Qwen2-1.5B-instruct
+      --served-model-name Alibaba-NLP/gte-Qwen2-1.5B-instruct
+      --dtype half
+      --gpu-memory-utilization 0.20
+      --max-model-len 8192
+      --max-num-seqs 16
+      --enforce-eager
+      --trust-remote-code
+      --port 8000
+    restart: always
+
+  # 索引服务 1：(分配 35% VRAM，约 7.8GB)
+  vllm-index-1:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-index-1
+    volumes:
+      - ./models:/app/models
+    environment:
+      - HF_ENDPOINT=https://hf-mirror.com
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: >
+      --model /app/models/Alibaba-NLP/gte-Qwen2-1.5B-instruct
+      --served-model-name Alibaba-NLP/gte-Qwen2-1.5B-instruct
+      --dtype half
+      --gpu-memory-utilization 0.35
+      --max-model-len 8192
+      --max-num-seqs 256
+      --enforce-eager
+      --trust-remote-code
+      --port 8000
+    restart: always
+
+  # 索引服务 2：(分配 35% VRAM，约 7.8GB)
+  vllm-index-2:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-index-2
+    volumes:
+      - ./models:/app/models
+    environment:
+      - HF_ENDPOINT=https://hf-mirror.com
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: >
+      --model /app/models/Alibaba-NLP/gte-Qwen2-1.5B-instruct
+      --served-model-name Alibaba-NLP/gte-Qwen2-1.5B-instruct
+      --dtype half
+      --gpu-memory-utilization 0.35
+      --max-model-len 8192
+      --max-num-seqs 256
+      --enforce-eager
+      --trust-remote-code
+      --port 8000
+    restart: always
+
+  # Nginx 负载均衡器：对外暴露 8002，分发给两个索引服务
+  vllm-index-lb:
+    image: nginx:alpine
+    container_name: vllm-index-lb
+    ports:
+      - '8002:8000'
+    volumes:
+      - ./nginx-vllm.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - vllm-index-1
+      - vllm-index-2
+    restart: always

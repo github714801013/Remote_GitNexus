@@ -90,6 +90,18 @@ export function resolveMiniMaxThinkingMode(
   return undefined;
 }
 
+const isLLMProvider = (value: string | undefined): value is LLMProvider =>
+  value === 'openai' ||
+  value === 'openrouter' ||
+  value === 'azure' ||
+  value === 'custom' ||
+  value === 'cursor' ||
+  value === 'claude' ||
+  value === 'codex' ||
+  value === 'opencode' ||
+  value === 'grok' ||
+  value === 'minimax';
+
 /**
  * Resolve LLM configuration from env vars, saved config, and optional overrides.
  * Priority: overrides (CLI flags) > env vars > ~/.gitnexus/config.json > error
@@ -100,8 +112,12 @@ export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<
   const { loadCLIConfig } = await import('../../storage/repo-manager.js');
   const savedConfig = await loadCLIConfig();
   const hasLegacyHttpConfig = !savedConfig.provider && !!(savedConfig.model || savedConfig.baseUrl);
+  const envProvider = process.env.GITNEXUS_WIKI_LLM_PROVIDER;
   const savedProvider =
-    overrides?.provider ?? savedConfig.provider ?? (hasLegacyHttpConfig ? 'openai' : 'minimax');
+    overrides?.provider ??
+    (isLLMProvider(envProvider) ? envProvider : undefined) ??
+    savedConfig.provider ??
+    (hasLegacyHttpConfig ? 'openai' : 'minimax');
   const reuseSavedHttpConfig =
     savedConfig.provider === savedProvider || (hasLegacyHttpConfig && savedProvider === 'openai');
   const savedLocalModel =
@@ -125,6 +141,7 @@ export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<
 
   const apiKey =
     overrides?.apiKey ||
+    process.env.GITNEXUS_WIKI_LLM_API_KEY ||
     (savedProvider === 'minimax' ? process.env.MINIMAX_API_KEY : undefined) ||
     (savedProvider !== 'minimax' ? process.env.GITNEXUS_API_KEY : undefined) ||
     (savedProvider !== 'minimax' ? process.env.OPENAI_API_KEY : undefined) ||
@@ -135,6 +152,7 @@ export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<
     apiKey,
     baseUrl:
       overrides?.baseUrl ||
+      process.env.GITNEXUS_WIKI_LLM_URL ||
       process.env.GITNEXUS_LLM_BASE_URL ||
       (reuseSavedHttpConfig ? savedConfig.baseUrl : undefined) ||
       (savedProvider === 'minimax'
@@ -142,6 +160,7 @@ export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<
         : 'https://openrouter.ai/api/v1'),
     model:
       overrides?.model ||
+      (localProvider ? undefined : process.env.GITNEXUS_WIKI_LLM_MODEL) ||
       (localProvider ? undefined : process.env.GITNEXUS_MODEL) ||
       savedLocalModel ||
       (localProvider
@@ -494,15 +513,23 @@ export async function callLLM(
   if (choice?.finish_reason === 'length') {
     throw truncatedResponseError(config.maxTokens);
   }
-  if (!choice?.message?.content) {
-    throw new Error('LLM returned empty response');
+  const message = choice?.message;
+  if (typeof message?.content === 'string' && message.content.length > 0) {
+    return {
+      content: message.content,
+      promptTokens: json.usage?.prompt_tokens,
+      completionTokens: json.usage?.completion_tokens,
+    };
   }
 
-  return {
-    content: choice.message.content,
-    promptTokens: json.usage?.prompt_tokens,
-    completionTokens: json.usage?.completion_tokens,
-  };
+  if (
+    (typeof message?.reasoning === 'string' && message.reasoning.length > 0) ||
+    (typeof message?.reasoning_content === 'string' && message.reasoning_content.length > 0)
+  ) {
+    throw new Error('LLM returned reasoning-only response; reasoning is not included in Wiki output');
+  }
+
+  throw new Error('LLM returned empty response');
 }
 
 // A response cut off by the completion limit reads like a finished one, and a
@@ -527,6 +554,43 @@ async function readSSEStream(
   let buffer = '';
   let contentFilterTriggered = false;
   let lengthLimitReached = false;
+  let sawReasoning = false;
+  let sawMalformedEofEvent = false;
+
+  const processLine = (line: string, atEof = false): void => {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.startsWith('data: ')) return;
+    const data = trimmed.slice(6);
+    if (data === '[DONE]') return;
+
+    try {
+      const parsed = JSON.parse(data);
+      const choice = parsed.choices?.[0];
+
+      // Detect content filter finish reason — skip delta from this chunk
+      if (choice?.finish_reason === 'content_filter') {
+        contentFilterTriggered = true;
+        return;
+      }
+      if (choice?.finish_reason === 'length') {
+        lengthLimitReached = true;
+      }
+
+      const delta = choice?.delta;
+      if (typeof delta?.reasoning === 'string' && delta.reasoning.length > 0) {
+        sawReasoning = true;
+      }
+      if (typeof delta?.reasoning_content === 'string' && delta.reasoning_content.length > 0) {
+        sawReasoning = true;
+      }
+      if (typeof delta?.content === 'string' && delta.content.length > 0) {
+        content += delta.content;
+        onChunk(content.length);
+      }
+    } catch {
+      if (atEof) sawMalformedEofEvent = true;
+    }
+  };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -535,36 +599,11 @@ async function readSSEStream(
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith('data: ')) continue;
-      const data = trimmed.slice(6);
-      if (data === '[DONE]') continue;
-
-      try {
-        const parsed = JSON.parse(data);
-        const choice = parsed.choices?.[0];
-
-        // Detect content filter finish reason — skip delta from this chunk
-        if (choice?.finish_reason === 'content_filter') {
-          contentFilterTriggered = true;
-          continue;
-        }
-        if (choice?.finish_reason === 'length') {
-          lengthLimitReached = true;
-        }
-
-        const delta = choice?.delta?.content;
-        if (delta) {
-          content += delta;
-          onChunk(content.length);
-        }
-      } catch {
-        // Skip malformed SSE chunks
-      }
-    }
+    for (const line of lines) processLine(line);
   }
+
+  buffer += decoder.decode();
+  if (buffer) processLine(buffer, true);
 
   if (contentFilterTriggered) {
     throw new Error(
@@ -576,9 +615,15 @@ async function readSSEStream(
     throw truncatedResponseError(maxTokens);
   }
 
-  if (!content) {
-    throw new Error('LLM returned empty streaming response');
+  if (sawMalformedEofEvent) {
+    throw new Error('LLM stream ended with an incomplete or unprocessed SSE event at EOF');
   }
 
-  return { content };
+  if (content) return { content };
+
+  if (sawReasoning) {
+    throw new Error('LLM returned reasoning-only response; reasoning is not included in Wiki output');
+  }
+
+  throw new Error('LLM returned empty streaming response');
 }

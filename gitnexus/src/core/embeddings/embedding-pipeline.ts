@@ -19,6 +19,7 @@ import {
 } from './embedder.js';
 import { isHttpMode, HttpEmbeddingError } from './http-client.js';
 import { generateEmbeddingText, splitEmbeddingText } from './text-generator.js';
+import { getKeywordSummaryHashSalt } from './keyword-summary.js';
 import { chunkNode, characterChunk } from './chunker.js';
 import { extractStructuralNames } from './structural-extractor.js';
 import {
@@ -109,6 +110,8 @@ export const contentHashForNode = (
   return createHash('sha1')
     .update(EMBEDDING_TEXT_VERSION)
     .update(`\n${config.maxInputChars ?? DEFAULT_EMBEDDING_CONFIG.maxInputChars}\n`)
+    .update(getKeywordSummaryHashSalt())
+    .update('\n')
     .update(text)
     .digest('hex');
 };
