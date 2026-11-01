@@ -5063,16 +5063,28 @@ export class LocalBackend {
           routeDefinitions.map((def) => def.id as string),
           LBUG_ID_PROBE_BATCH_SIZE,
         )) {
-          const rows = await executeParameterized(
-            repo.lbugPath,
-            `
+          const rows = neo4jBackendEnabled
+            ? await (
+                await import('../../core/neo4j/read-adapter.js')
+              ).executeReadCypher(
+                `
+            MATCH (handler)-[:HANDLES_ROUTE]->(route:Route {repoId: $repoId})
+            WHERE route.id IN $routeIds
+            RETURN route.id AS routeId, handler.id AS handlerId, handler.name AS handlerName,
+                   handler.filePath AS handlerFilePath, route.name AS url, route.method AS method
+          `,
+                { repoId: repo.name, routeIds: ids },
+              )
+            : await executeParameterized(
+                repo.lbugPath,
+                `
             MATCH (handler)-[r:CodeRelation {type: 'HANDLES_ROUTE'}]->(route:Route)
             WHERE route.id IN $routeIds
             RETURN route.id AS routeId, handler.id AS handlerId, handler.name AS handlerName,
                    handler.filePath AS handlerFilePath, route.name AS url, route.method AS method
           `,
-            { routeIds: ids },
-          );
+                { routeIds: ids },
+              );
           for (const row of rows) {
             assertQueryIdentity(row, 'routeId', 0, [
               ['handlerName', 2],
@@ -5165,15 +5177,40 @@ export class LocalBackend {
           const entryIds = pidChunk
             .map((pid) => processMap.get(pid)?.entryPointId)
             .filter((id): id is string => !!id && id.length > 0);
-          const routeRows = await executeParameterized(
-            repo.lbugPath,
-            entryIds.length === 0
-              ? `
+          const routeRows = neo4jBackendEnabled
+            ? await (
+                await import('../../core/neo4j/read-adapter.js')
+              ).executeReadCypher(
+                entryIds.length === 0
+                  ? `
+            MATCH (route:Route {repoId: $repoId})-[:ENTRY_POINT_OF]->(p:Process {repoId: $repoId})
+            WHERE p.id IN $pids
+            RETURN p.id AS pid, route.name AS url, route.method AS method
+          `
+                  : `
+            MATCH (route:Route {repoId: $repoId})-[:ENTRY_POINT_OF]->(p:Process {repoId: $repoId})
+            WHERE p.id IN $pids
+            RETURN p.id AS pid, route.name AS url, route.method AS method
+            UNION ALL
+            MATCH (route:Route {repoId: $repoId})-[:ENTRY_POINT_OF]->(entryFn)
+            WHERE entryFn.id IN $entryIds
+            RETURN entryFn.id AS pid, route.name AS url, route.method AS method
+            UNION ALL
+            MATCH (handler)-[:HANDLES_ROUTE]->(route:Route {repoId: $repoId})
+            WHERE handler.id IN $entryIds
+            RETURN handler.id AS pid, route.name AS url, route.method AS method
+          `,
+                { repoId: repo.name, pids: pidChunk, entryIds },
+              )
+            : await executeParameterized(
+                repo.lbugPath,
+                entryIds.length === 0
+                  ? `
             MATCH (route:Route)-[r:CodeRelation {type: 'ENTRY_POINT_OF'}]->(p:Process)
             WHERE p.id IN $pids
             RETURN p.id AS pid, route.name AS url, route.method AS method
           `
-              : `
+                  : `
             MATCH (route:Route)-[r:CodeRelation {type: 'ENTRY_POINT_OF'}]->(p:Process)
             WHERE p.id IN $pids
             RETURN p.id AS pid, route.name AS url, route.method AS method
@@ -5186,11 +5223,11 @@ export class LocalBackend {
             WHERE handler.id IN $entryIds
             RETURN handler.id AS pid, route.name AS url, route.method AS method
           `,
-            {
-              pids: pidChunk,
-              entryIds,
-            },
-          );
+                {
+                  pids: pidChunk,
+                  entryIds,
+                },
+              );
           for (const row of routeRows) {
             assertQueryIdentity(row, 'pid', 0, [
               ['url', 1],
@@ -5286,13 +5323,23 @@ export class LocalBackend {
       const previewChars = Math.floor(QUERY_CONTENT_MAX_CHARS / Math.max(1, targets.size));
       for (const ids of chunk([...targets.keys()], LBUG_QUERY_BATCH_SIZE)) {
         try {
-          const rows = await executeParameterized(
-            repo.lbugPath,
-            `MATCH (n) WHERE n.id IN $nodeIds
+          // Neo4j 的 substring 起点为 0，LadybugDB 为 1，同一预览窗口需平移。
+          const rows = neo4jBackendEnabled
+            ? await (
+                await import('../../core/neo4j/read-adapter.js')
+              ).executeReadCypher(
+                `MATCH (n:CodeNode {repoId: $repoId}) WHERE n.id IN $nodeIds
+             RETURN n.id AS nodeId, substring(n.content, 0, $previewChars) AS content,
+                    size(n.content) > $previewChars AS contentTruncated`,
+                { repoId: repo.name, nodeIds: ids, previewChars },
+              )
+            : await executeParameterized(
+                repo.lbugPath,
+                `MATCH (n) WHERE n.id IN $nodeIds
              RETURN n.id AS nodeId, substring(n.content, 1, $previewChars) AS content,
                     size(n.content) > $previewChars AS contentTruncated`,
-            { nodeIds: ids, previewChars },
-          );
+                { nodeIds: ids, previewChars },
+              );
           for (const row of rows) {
             assertQueryIdentity(row, 'nodeId', 0);
             const target = targets.get(row.nodeId ?? row[0]);

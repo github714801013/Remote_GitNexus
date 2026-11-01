@@ -614,4 +614,99 @@ describe('Neo4j cross-repo vector discovery', () => {
       'handlerB',
     ]);
   });
+
+  it('Neo4j 模式下 query 的 route 与内容增强不再落到 LadybugDB', async () => {
+    const backend = new LocalBackend();
+    // 无元数据时 contentRetention 视为 full，确保 include_content 分支执行。
+    (backend as any).readToolMetadata = vi.fn(async () => null);
+    vi.spyOn(backend as any, 'semanticSearch').mockResolvedValueOnce([
+      {
+        repoId: 'Repo A',
+        nodeId: 'Route:/api/x',
+        name: '/api/x',
+        type: 'Route',
+        filePath: 'src/routes.ts',
+        startLine: 1,
+        endLine: 2,
+      },
+      {
+        repoId: 'Repo A',
+        nodeId: 'Function:handler',
+        name: 'handler',
+        type: 'Function',
+        filePath: 'src/h.ts',
+        startLine: 3,
+        endLine: 9,
+      },
+    ]);
+    vi.mocked(executeReadCypher).mockImplementation(async (query: string) => {
+      if (query.includes('STEP_IN_PROCESS')) {
+        return [
+          {
+            nodeId: 'Function:handler',
+            pid: 'Process:P',
+            label: 'P',
+            heuristicLabel: 'P',
+            processType: 'intra_community',
+            stepCount: 1,
+            step: 1,
+            entryPointId: 'Function:handler',
+          },
+        ];
+      }
+      if (query.includes('ENTRY_POINT_OF')) {
+        return [{ pid: 'Process:P', url: '/api/x', method: 'GET' }];
+      }
+      if (query.includes('HANDLES_ROUTE')) {
+        return [
+          {
+            routeId: 'Route:/api/x',
+            handlerId: 'Function:handler',
+            handlerName: 'handler',
+            handlerFilePath: 'src/h.ts',
+            url: '/api/x',
+            method: 'GET',
+          },
+        ];
+      }
+      if (query.includes('substring')) {
+        return [
+          { nodeId: 'Route:/api/x', content: 'route preview', contentTruncated: false },
+          { nodeId: 'Function:handler', content: 'handler body', contentTruncated: false },
+        ];
+      }
+      return [];
+    });
+
+    const repo = {
+      id: 'repo-a',
+      name: 'Repo A',
+      repoPath: '/repo/a',
+      storagePath: '/repo/a/.gitnexus',
+      lbugPath: '/repo/a/.gitnexus/lbug',
+      indexedAt: '2026-05-30',
+      lastCommit: 'a',
+    };
+    const result = await (backend as any).query(repo, {
+      query: 'handler',
+      include_content: true,
+      limit: 5,
+    });
+
+    const calls = vi.mocked(executeReadCypher).mock.calls;
+    const routeBridge = calls.find(([query]) => query.includes('HANDLES_ROUTE'));
+    const routeLookup = calls.find(([query]) => query.includes('ENTRY_POINT_OF'));
+    const contentFetch = calls.find(([query]) => query.includes('substring'));
+    expect(routeBridge?.[1]).toMatchObject({ repoId: 'Repo A' });
+    expect(routeLookup?.[1]).toMatchObject({ repoId: 'Repo A' });
+    expect(contentFetch?.[1]).toMatchObject({ repoId: 'Repo A' });
+    expect(contentFetch?.[0]).toContain('substring(n.content, 0,');
+    expect(executeParameterized).not.toHaveBeenCalled();
+
+    const routeDefinition = result.definitions.find(
+      (definition: any) => definition.id === 'Route:/api/x',
+    );
+    expect(routeDefinition?.handlerName).toBe('handler');
+    expect(routeDefinition?.content).toBe('route preview');
+  });
 });
