@@ -6959,6 +6959,69 @@ export class LocalBackend {
       }
 
       const row = rows[0];
+      const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+      const symId = row.id as string;
+
+      // 流程参与与路由富化：与 LadybugDB 分支保持同一响应形状。
+      let processRows: any[] = [];
+      try {
+        processRows = await executeReadCypher(
+          `
+          MATCH (n:CodeNode {repoId: $repoId, id: $symId})-[r:STEP_IN_PROCESS]->(p:Process {repoId: $repoId})
+          RETURN p.id AS pid, p.heuristicLabel AS label, MIN(r.step) AS step, p.stepCount AS stepCount, p.entryPointId AS entryPointId
+          ORDER BY pid
+        `,
+          { repoId: repo.name, symId },
+        );
+      } catch (e) {
+        logQueryError('context:process-participation', e);
+      }
+
+      const entryPids = processRows
+        .filter((r: any) => r.entryPointId === symId)
+        .map((r: any) => r.pid);
+      const isEntryPoint = entryPids.length > 0;
+      const routes: Array<{ url: string; method?: string }> = [];
+      try {
+        const routeRows = await executeReadCypher(
+          `
+          MATCH (route:Route {repoId: $repoId})-[:ENTRY_POINT_OF]->(target {repoId: $repoId})
+          WHERE target.id = $symId OR target.id IN $entryPids
+          RETURN route.name AS url, route.method AS method
+          UNION
+          MATCH (handler {repoId: $repoId})-[:HANDLES_ROUTE]->(route:Route {repoId: $repoId})
+          WHERE handler.id = $symId
+          RETURN route.name AS url, route.method AS method
+        `,
+          { repoId: repo.name, symId, entryPids: entryPids.length > 0 ? entryPids : ['__none__'] },
+        );
+        const seenRoutes = new Set<string>();
+        for (const r of routeRows as any[]) {
+          const url = r.url;
+          const method = r.method;
+          if (!url) continue;
+          const dedupKey = routeEnrichmentKey(method ? String(method) : undefined, url);
+          if (!seenRoutes.has(dedupKey)) {
+            seenRoutes.add(dedupKey);
+            routes.push(method ? { url, method } : { url });
+          }
+        }
+      } catch (e) {
+        logQueryError('context:route-lookup', e);
+      }
+
+      const parsedDepth = parseChainDepth(params.chain_depth);
+      if (parsedDepth.ok === false) return { error: parsedDepth.error };
+      let chain: any[] | undefined;
+      if (parsedDepth.value > 0) {
+        try {
+          chain = await this._computeContextChain(repo, symId, parsedDepth.value);
+        } catch (e) {
+          rethrowSymbolIdentityError(e);
+          logQueryError('context:chain-bfs', e);
+        }
+      }
+
       const categorizeNeo4jRefs = (refs: any[] | undefined, direction: 'incoming' | 'outgoing') => {
         const cats: Record<string, any[]> = {};
         for (const ref of refs ?? []) {
@@ -6987,7 +7050,15 @@ export class LocalBackend {
         },
         incoming: categorizeNeo4jRefs(row.incoming, 'incoming'),
         outgoing: categorizeNeo4jRefs(row.outgoing, 'outgoing'),
-        processes: [],
+        ...(chain ? { chain } : {}),
+        ...(isEntryPoint ? { is_entry_point: true } : {}),
+        ...(routes.length > 0 ? { routes } : {}),
+        processes: processRows.map((r: any) => ({
+          id: r.pid,
+          name: r.label,
+          step_index: r.step,
+          step_count: r.stepCount,
+        })),
       };
     }
 
@@ -7561,6 +7632,10 @@ export class LocalBackend {
       END
     `;
 
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const useNeo4j = isNeo4jBackendEnabled();
+    const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+
     const layers: Array<{ depth: number; upstream?: any[]; downstream?: any[] }> = [];
     const visitedUpstream = new Set<string>([seedId]);
     const visitedDownstream = new Set<string>([seedId]);
@@ -7569,16 +7644,22 @@ export class LocalBackend {
 
     const walk = async (
       frontier: string[],
-      cypher: string,
+      cypher: { lbug: string; neo4j: string },
       logLabel: string,
       visited: Set<string>,
     ): Promise<{ nodes?: any[]; nextFrontier: string[] }> => {
       if (frontier.length === 0) return { nextFrontier: [] };
       try {
-        const rows = await executeParameterized(repo.lbugPath, cypher, {
-          frontier,
-          visited: Array.from(visited),
-        });
+        const rows = useNeo4j
+          ? await executeReadCypher(cypher.neo4j, {
+              frontier,
+              visited: Array.from(visited),
+              repoId: repo.name,
+            })
+          : await executeParameterized(repo.lbugPath, cypher.lbug, {
+              frontier,
+              visited: Array.from(visited),
+            });
         if (rows.length === 0) return { nextFrontier: [] };
         for (const row of rows) {
           assertQueryIdentity(row, 'uid', 0, [
@@ -7617,7 +7698,8 @@ export class LocalBackend {
 
       const upstream = await walk(
         upstreamFrontier,
-        `
+        {
+          lbug: `
             MATCH (caller)-[r:CodeRelation]->(n)
             WHERE r.type = 'CALLS' AND n.id IN $frontier
               AND NOT caller.id IN $visited
@@ -7628,6 +7710,18 @@ export class LocalBackend {
             ORDER BY isTest ASC, caller.filePath ASC, caller.name ASC
             LIMIT 50
           `,
+          neo4j: `
+            MATCH (caller:CodeNode {repoId: $repoId})-[r:CALLS]->(n:CodeNode {repoId: $repoId})
+            WHERE n.id IN $frontier
+              AND NOT caller.id IN $visited
+            WITH DISTINCT caller
+            RETURN caller.id AS uid, caller.name AS name,
+                   caller.filePath AS filePath, labels(caller)[0] AS kind,
+                   ${testOrderExpr('caller')} AS isTest
+            ORDER BY isTest ASC, caller.filePath ASC, caller.name ASC
+            LIMIT 50
+          `,
+        },
         'context:chain-bfs:upstream',
         visitedUpstream,
       );
@@ -7636,7 +7730,8 @@ export class LocalBackend {
 
       const downstream = await walk(
         downstreamFrontier,
-        `
+        {
+          lbug: `
             MATCH (n)-[r:CodeRelation]->(target)
             WHERE r.type = 'CALLS' AND n.id IN $frontier
               AND NOT target.id IN $visited
@@ -7647,6 +7742,18 @@ export class LocalBackend {
             ORDER BY isTest ASC, target.filePath ASC, target.name ASC
             LIMIT 50
           `,
+          neo4j: `
+            MATCH (n:CodeNode {repoId: $repoId})-[r:CALLS]->(target:CodeNode {repoId: $repoId})
+            WHERE n.id IN $frontier
+              AND NOT target.id IN $visited
+            WITH DISTINCT target
+            RETURN target.id AS uid, target.name AS name,
+                   target.filePath AS filePath, labels(target)[0] AS kind,
+                   ${testOrderExpr('target')} AS isTest
+            ORDER BY isTest ASC, target.filePath ASC, target.name ASC
+            LIMIT 50
+          `,
+        },
         'context:chain-bfs:downstream',
         visitedDownstream,
       );

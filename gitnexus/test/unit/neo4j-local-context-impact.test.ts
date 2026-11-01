@@ -138,6 +138,7 @@ describe('LocalBackend context and impact with Neo4j backend', () => {
       vi.mocked(executeReadCypher)
         .mockResolvedValueOnce([
           {
+            diffPath: 'src/handler.ts',
             id: 'Function:handler',
             name: 'handler',
             type: 'Function',
@@ -175,7 +176,7 @@ describe('LocalBackend context and impact with Neo4j backend', () => {
       expect(executeReadCypher).toHaveBeenNthCalledWith(
         1,
         expect.stringContaining('MATCH (n {repoId: $repoId})'),
-        expect.objectContaining({ repoId: 'Repo A', filePath: 'src/handler.ts' }),
+        expect.objectContaining({ repoId: 'Repo A', paths: ['src/handler.ts'] }),
       );
       expect(result.partial).toBeUndefined();
       expect(result.summary).toMatchObject({
