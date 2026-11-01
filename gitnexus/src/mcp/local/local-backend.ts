@@ -4466,6 +4466,24 @@ export class LocalBackend {
 
   // ─── Tool Implementations ────────────────────────────────────────
 
+  /**
+   * 按当前存储后端执行同一语义的图查询；Neo4j 分支自动注入 $repoId 作用域。
+   * LadybugDB 分支保持原有查询与参数不变。
+   */
+  private async executeGraphQuery(
+    repo: RepoHandle,
+    neo4jCypher: string,
+    lbugCypher: string,
+    params: Record<string, any> = {},
+  ): Promise<any[]> {
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    if (isNeo4jBackendEnabled()) {
+      const { executeReadCypher } = await import('../../core/neo4j/read-adapter.js');
+      return executeReadCypher(neo4jCypher, { ...params, repoId: repo.name });
+    }
+    return executeParameterized(repo.lbugPath, lbugCypher, params);
+  }
+
   /** Check repository graph invariants that are suitable for CI gating. */
   private async check(repo: RepoHandle, params?: { cycles?: boolean }): Promise<any> {
     if (params?.cycles === false) {
@@ -4475,31 +4493,36 @@ export class LocalBackend {
     const rowLimit = 100_001;
     // determinism: probe — overflow guard, not a window. The one-past cap is compared for exact equality below
     // and the whole result is REPLACED by an error, so a truncated page never reaches a caller.
-    const rows = await executeParameterized(
-      repo.lbugPath,
-      // A cycle here means "these modules cannot be initialized in any order".
-      // Only edges that force initialization count, so five kinds are excluded:
-      // Swift implicit module visibility and markdown links (never code
-      // dependencies at all); Dart package-identity edges, which point at
-      // pubspec.yaml so a manifest edit invalidates importers and cannot
-      // form an init cycle; imports reachable only through `import()` or a
-      // function body, which are deferred by construction — deferring is the
-      // standard idiom for BREAKING an init cycle, so counting it reports the
-      // fix as the bug; and imports reachable only through TypeScript
-      // `import type`, which `tsc` erases outright, so no module load exists
-      // to order. `imports-to-edges.ts` tags the last two with
-      // DEFERRED_IMPORT_REASON_SUFFIX / TYPE_ONLY_IMPORT_REASON_SUFFIX.
-      // The Dart exclusion has to sit in this filter, before LIMIT, or the
-      // identity edges consume the 100000-row admission cap on a cycle-free graph.
-      `MATCH (source:File)-[r:CodeRelation]->(target:File)
-       WHERE r.type = 'IMPORTS'
-         AND (r.reason IS NULL OR (
+    // A cycle here means "these modules cannot be initialized in any order".
+    // Only edges that force initialization count, so five kinds are excluded:
+    // Swift implicit module visibility and markdown links (never code
+    // dependencies at all); Dart package-identity edges, which point at
+    // pubspec.yaml so a manifest edit invalidates importers and cannot
+    // form an init cycle; imports reachable only through `import()` or a
+    // function body, which are deferred by construction — deferring is the
+    // standard idiom for BREAKING an init cycle, so counting it reports the
+    // fix as the bug; and imports reachable only through TypeScript
+    // `import type`, which `tsc` erases outright, so no module load exists
+    // to order. `imports-to-edges.ts` tags the last two with
+    // DEFERRED_IMPORT_REASON_SUFFIX / TYPE_ONLY_IMPORT_REASON_SUFFIX.
+    // The Dart exclusion has to sit in this filter, before LIMIT, or the
+    // identity edges consume the 100000-row admission cap on a cycle-free graph.
+    const importReasonFilter = `(r.reason IS NULL OR (
            r.reason <> 'swift-scope: implicit module visibility'
            AND r.reason <> 'markdown-link'
            AND r.reason <> '${DART_PACKAGE_IDENTITY_REASON}'
            AND NOT r.reason ENDS WITH '${DEFERRED_IMPORT_REASON_SUFFIX}'
            AND NOT r.reason ENDS WITH '${TYPE_ONLY_IMPORT_REASON_SUFFIX}'
-         ))
+         ))`;
+    const rows = await this.executeGraphQuery(
+      repo,
+      `MATCH (source:File {repoId: $repoId})-[r:IMPORTS]->(target:File {repoId: $repoId})
+       WHERE ${importReasonFilter}
+       RETURN source.filePath AS source, target.filePath AS target
+       LIMIT ${rowLimit}`,
+      `MATCH (source:File)-[r:CodeRelation]->(target:File)
+       WHERE r.type = 'IMPORTS'
+         AND ${importReasonFilter}
        RETURN source.filePath AS source, target.filePath AS target
        LIMIT ${rowLimit}`,
       {},
@@ -6423,27 +6446,23 @@ export class LocalBackend {
     const ids = candidates.filter((c) => c.type === '' && c.id).map((c) => c.id);
     if (ids.length === 0) return;
     try {
-      const rows = await executeParameterized(
-        repo.lbugPath,
-        `
-        MATCH (n:\`Class\`) WHERE n.id IN $ids RETURN n.id AS id, 'Class' AS label
-        UNION ALL
-        MATCH (n:\`Interface\`) WHERE n.id IN $ids RETURN n.id AS id, 'Interface' AS label
-        UNION ALL
-        MATCH (n:\`Function\`) WHERE n.id IN $ids RETURN n.id AS id, 'Function' AS label
-        UNION ALL
-        MATCH (n:\`Method\`) WHERE n.id IN $ids RETURN n.id AS id, 'Method' AS label
-        UNION ALL
-        MATCH (n:\`Constructor\`) WHERE n.id IN $ids RETURN n.id AS id, 'Constructor' AS label
-        UNION ALL
-        MATCH (n:\`CodeElement\`) WHERE n.id IN $ids RETURN n.id AS id, 'CodeElement' AS label
-        UNION ALL
-        MATCH (n:\`Const\`) WHERE n.id IN $ids RETURN n.id AS id, 'Const' AS label
-        UNION ALL
-        MATCH (n:\`Variable\`) WHERE n.id IN $ids RETURN n.id AS id, 'Variable' AS label
-        UNION ALL
-        MATCH (n:\`Static\`) WHERE n.id IN $ids RETURN n.id AS id, 'Static' AS label
-        `,
+      const enrichmentLabels = [
+        'Class',
+        'Interface',
+        'Function',
+        'Method',
+        'Constructor',
+        'CodeElement',
+        'Const',
+        'Variable',
+        'Static',
+      ];
+      const unionFor = (label: string, scoped: boolean) =>
+        `MATCH (n:\`${label}\`${scoped ? ' {repoId: $repoId}' : ''}) WHERE n.id IN $ids RETURN n.id AS id, '${label}' AS label`;
+      const rows = await this.executeGraphQuery(
+        repo,
+        enrichmentLabels.map((label) => unionFor(label, true)).join('\n        UNION ALL\n        '),
+        enrichmentLabels.map((label) => unionFor(label, false)).join('\n        UNION ALL\n        '),
         { ids },
       );
       const labelById = new Map<string, string>();
@@ -6576,8 +6595,9 @@ export class LocalBackend {
     if (uid) {
       // determinism: probe — PK-anchored singleton. $uid is a node primary key, so at most one row can match and
       // the LIMIT never chooses between rows.
-      const rows = await executeParameterized(
-        repo.lbugPath,
+      const rows = await this.executeGraphQuery(
+        repo,
+        `MATCH (n:CodeNode {repoId: $repoId}) WHERE n.id = $uid RETURN ${selectClause} LIMIT 1`,
         `MATCH (n {id: $uid}) RETURN ${selectClause} LIMIT 1`,
         { uid },
       );
@@ -6678,14 +6698,16 @@ export class LocalBackend {
     // resolves twice). Trade-off: the full-window (>= CANDIDATE_WINDOW
     // homonyms) minority path is now sequential instead of concurrent.
     const fetchWindow = async (where: string, params: Record<string, any>) => {
-      const rows = await executeParameterized(
-        repo.lbugPath,
+      const rows = await this.executeGraphQuery(
+        repo,
+        `MATCH (n:CodeNode {repoId: $repoId}) ${where} RETURN ${selectClause} ORDER BY n.id LIMIT ${CANDIDATE_WINDOW}`,
         `MATCH (n) ${where} RETURN ${selectClause} ORDER BY n.id LIMIT ${CANDIDATE_WINDOW}`,
         params,
       );
       if (rows.length < CANDIDATE_WINDOW) return { rows, countedTotal: rows.length };
-      const countRows = await executeParameterized(
-        repo.lbugPath,
+      const countRows = await this.executeGraphQuery(
+        repo,
+        `MATCH (n:CodeNode {repoId: $repoId}) ${where} RETURN COUNT(*) AS total`,
         `MATCH (n) ${where} RETURN COUNT(*) AS total`,
         params,
       ).catch((e) => {
@@ -6793,8 +6815,9 @@ export class LocalBackend {
           // LIMIT 2, not 1: the second row is the uniqueness check. One row back
           // means exactly one candidate carries the label and the collapse is
           // safe; two means fall through to normal ambiguity scoring.
-          const labelRows = await executeParameterized(
-            repo.lbugPath,
+          const labelRows = await this.executeGraphQuery(
+            repo,
+            `MATCH (n:\`${label}\` {repoId: $repoId}) WHERE n.id IN $candidateIds RETURN n.id AS id ORDER BY n.id LIMIT 2`,
             `MATCH (n:\`${label}\`) WHERE n.id IN $candidateIds RETURN n.id AS id ORDER BY n.id LIMIT 2`,
             { candidateIds },
           ).catch(() => []);
@@ -9049,8 +9072,15 @@ export class LocalBackend {
       // row order.
       const rowCap = Math.min(frontier.length * PER_NODE_FANOUT_CAP, ABS_ROW_CAP);
 
-      const rows = await executeParameterized(
-        repo.lbugPath,
+      const rows = await this.executeGraphQuery(
+        repo,
+        `MATCH (n:CodeNode {repoId: $repoId})-[r]->(m:CodeNode {repoId: $repoId})
+         WHERE n.id IN $frontierIds AND type(r) IN $edgeTypes
+         RETURN n.id AS sourceId, m.id AS id, m.name AS name, labels(m)[0] AS type,
+                m.filePath AS filePath, m.startLine AS startLine,
+                type(r) AS edgeType, r.confidence AS confidence
+         ORDER BY sourceId, id, edgeType
+         LIMIT ${rowCap}`,
         `MATCH (n)-[r:CodeRelation]->(m)
          WHERE n.id IN $frontierIds AND r.type IN $edgeTypes
          RETURN n.id AS sourceId, m.id AS id, m.name AS name, labels(m)[0] AS type,
