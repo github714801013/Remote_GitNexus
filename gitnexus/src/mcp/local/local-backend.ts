@@ -11875,14 +11875,20 @@ export class LocalBackend {
    * leaves the field out rather than reporting an empty list it did not verify.
    */
   private async fetchRequestFunctionCallers(
-    repoId: string,
+    repo: RepoHandle,
     viaIds: string[],
   ): Promise<Map<string, RequestFunctionCaller[]> | undefined> {
     const result = new Map<string, RequestFunctionCaller[]>();
     if (viaIds.length === 0) return result;
     try {
-      const rows = await executeParameterized(
-        repoId,
+      const rows = await this.executeGraphQuery(
+        repo,
+        `
+        MATCH (caller:CodeNode {repoId: $repoId})-[:CALLS]->(via:CodeNode {repoId: $repoId})
+        WHERE via.id IN $viaIds
+        RETURN DISTINCT via.id AS viaId, via.name AS viaName,
+               caller.name AS callerName, caller.filePath AS callerFile
+      `,
         `
         MATCH (caller)-[r:CodeRelation]->(via)
         WHERE r.type = 'CALLS' AND list_contains($viaIds, via.id)
@@ -12229,8 +12235,13 @@ export class LocalBackend {
     const toolFilter = params.tool ? `AND n.name CONTAINS $tool` : '';
     const queryParams = params.tool ? { tool: params.tool } : {};
 
-    const rows = await executeParameterized(
-      repo.lbugPath,
+    const rows = await this.executeGraphQuery(
+      repo,
+      `
+      MATCH (n:Tool {repoId: $repoId})
+      WHERE n.id STARTS WITH 'Tool:' ${toolFilter}
+      RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.description AS description
+    `,
       `
       MATCH (n:Tool)
       WHERE n.id STARTS WITH 'Tool:' ${toolFilter}
@@ -12324,7 +12335,7 @@ export class LocalBackend {
     for (const r of routes) {
       for (const c of r.consumers) for (const id of c.viaSymbolIds ?? []) viaIds.add(id);
     }
-    const callersByVia = await this.fetchRequestFunctionCallers(repo.lbugPath, [...viaIds]);
+    const callersByVia = await this.fetchRequestFunctionCallers(repo, [...viaIds]);
 
     // Count verbs per handler from the FULL match (before the method filter) so a
     // method-scoped query still flags a multi-verb handler's partial middleware.
@@ -12467,17 +12478,26 @@ export class LocalBackend {
   async queryClusters(repoName?: string, limit = 100): Promise<{ clusters: any[] }> {
     const repo = await this.resolveRepo(repoName);
     await this.ensureInitialized(repo);
+    const { isNeo4jBackendEnabled } = await import('../../core/neo4j/config.js');
+    const neo4jBackendEnabled = isNeo4jBackendEnabled();
 
     try {
       const rawLimit = Math.max(limit * 5, 200);
-      const clusters = await executeQuery(
-        repo.lbugPath,
+      const clusters = await this.executeGraphQuery(
+        repo,
+        `
+        MATCH (c:Community {repoId: $repoId})
+        RETURN c.id AS id, c.label AS label, c.heuristicLabel AS heuristicLabel, c.cohesion AS cohesion, c.symbolCount AS symbolCount
+        ORDER BY c.symbolCount DESC, c.id
+        LIMIT ${rawLimit}
+      `,
         `
         MATCH (c:Community)
         RETURN c.id AS id, c.label AS label, c.heuristicLabel AS heuristicLabel, c.cohesion AS cohesion, c.symbolCount AS symbolCount
         ORDER BY c.symbolCount DESC, c.id
         LIMIT ${rawLimit}
       `,
+        {},
       );
       const rawClusters = clusters.map((c: any) => ({
         id: c.id || c[0],
@@ -12487,7 +12507,8 @@ export class LocalBackend {
         symbolCount: c.symbolCount || c[4],
       }));
       return { clusters: this.aggregateClusters(rawClusters).slice(0, limit) };
-    } catch {
+    } catch (err) {
+      if (neo4jBackendEnabled) throw err;
       return { clusters: [] };
     }
   }
@@ -12548,8 +12569,13 @@ export class LocalBackend {
     const repo = await this.resolveRepo(repoName);
     await this.ensureInitialized(repo);
 
-    const clusters = await executeParameterized(
-      repo.lbugPath,
+    const clusters = await this.executeGraphQuery(
+      repo,
+      `
+      MATCH (c:Community {repoId: $repoId})
+      WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
+      RETURN c.id AS id, c.label AS label, c.heuristicLabel AS heuristicLabel, c.cohesion AS cohesion, c.symbolCount AS symbolCount
+    `,
       `
       MATCH (c:Community)
       WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
@@ -12575,8 +12601,15 @@ export class LocalBackend {
       weightedCohesion += (c.cohesion || 0) * s;
     }
 
-    const members = await executeParameterized(
-      repo.lbugPath,
+    const members = await this.executeGraphQuery(
+      repo,
+      `
+      MATCH (n:CodeNode {repoId: $repoId})-[:MEMBER_OF]->(c:Community {repoId: $repoId})
+      WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
+      RETURN DISTINCT n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+      ORDER BY filePath, name, type
+      LIMIT 30
+    `,
       `
       MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
       WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
