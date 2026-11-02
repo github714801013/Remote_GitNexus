@@ -12160,10 +12160,16 @@ export class LocalBackend {
     } catch (err: any) {
       return { error: err?.message || 'Invalid grep query.' };
     }
-    const fileRows: Array<{ filePath?: string }> = await executeQuery(
-      repo.lbugPath,
-      `MATCH (n:File) WHERE n.content IS NOT NULL RETURN n.filePath AS filePath`,
-    );
+    // Neo4j 后端的文件列表与 HTTP /api/grep 同源；Neo4j 不保留 content，
+    // 因此不能沿用 LadybugDB 的 content 过滤，直接用索引中的 File 节点。
+    const fileRows: Array<{ filePath?: string }> = isNeo4jBackendEnabled()
+      ? (await (await import('../../server/search.js')).listNeo4jFilePaths(repo.name)).map(
+          (filePath) => ({ filePath }),
+        )
+      : await executeQuery(
+          repo.lbugPath,
+          `MATCH (n:File) WHERE n.content IS NOT NULL RETURN n.filePath AS filePath`,
+        );
     const filePaths: string[] = [];
     for (const row of fileRows) {
       const filePath: string = row.filePath || '';
