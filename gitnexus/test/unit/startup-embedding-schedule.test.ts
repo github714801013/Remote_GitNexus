@@ -88,7 +88,7 @@ describe('startup embedding schedule', () => {
     expect(source.slice(repairPosition, stalePosition)).toMatch(
       /startEmbeddingRepairForEntry\(entry, \{ source, registryBranch \}\)/,
     );
-    expect(source.slice(stalePosition)).toMatch(/scheduleStaleAnalyze\(\);\n          continue;/);
+    expect(source.slice(stalePosition)).toMatch(/staleCandidates\.push\(\{/);
   });
 
   it('does not make Neo4j embedding repair acquire the structure/Ladybug repository lock', async () => {

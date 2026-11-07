@@ -139,6 +139,11 @@ import {
   syncWithUpstream,
   type StalenessInfo,
 } from '../core/git-staleness.js';
+import { getCurrentBranchAsync } from '../storage/git.js';
+import {
+  isKnownBranchMismatch,
+  selectStaleAnalyzeCandidates,
+} from './stale-analyze-scheduler.js';
 import {
   WebhookWorktreeError,
   assertEnvAllowed,
@@ -1773,6 +1778,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   };
 
   let indexHealthCheckRunning = false;
+  // 巡检路径分析失败的仓库在本进程内不再入队，重启后自然清空。
+  const staleAnalyzeFailedRepoPaths = new Set<string>();
+  const DETACHED_HEAD_LABEL = 'detached';
   const runIndexHealthCheck = async (source = 'startup'): Promise<{ skipped: boolean }> => {
     if (indexHealthCheckRunning) return { skipped: true };
     indexHealthCheckRunning = true;
@@ -1807,6 +1815,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const countNeo4jEmbeddings = isNeo4jBackendEnabled()
         ? (await import('../core/neo4j/embedding-adapter.js')).countEmbeddings
         : undefined;
+
+      const staleCandidates: Array<{
+        repoPath: string;
+        commitsBehind: number;
+        entry: RegistryEntry;
+        registryBranch: string | undefined;
+      }> = [];
 
       for (const entry of entries) {
         const registryBranch = webhookBranchByPath.get(path.resolve(entry.path)) ?? entry.branch;
@@ -1862,31 +1877,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           }
         }
 
-        const scheduleStaleAnalyze = (): void => {
-          logger.info(
-            { repo: entry.name, path: entry.path },
-            'Stale index analyze scheduled',
-          );
-          const queued = enqueueWebhookAnalyze(entry.path, {
-            repoName: entry.name,
-            force: false,
-            deferEmbeddingRepair: true,
-            registryName: entry.name,
-            registryBranch,
-            allowDuplicateName: true,
-          });
-          queued.done.catch((err) => {
-            if (isAnalysisAlreadyInProgressError(err)) {
-              logger.debug(
-                { repo: entry.name },
-                'stale index refresh skipped: analysis already in progress',
-              );
-              return;
-            }
-            logger.error({ err, repo: entry.name }, 'stale index refresh failed');
-          });
-        };
-
         if (isNeo4jBackendEnabled() && needsEmbeddings) {
           logger.info(
             { repo: entry.name, actualEmbeddings, nodes: meta?.stats?.nodes ?? 0 },
@@ -1896,7 +1886,24 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
 
         if (shouldScheduleStartupIncrementalAnalyze(staleness)) {
-          scheduleStaleAnalyze();
+          const currentBranch = await getCurrentBranchAsync(entry.path);
+          if (isKnownBranchMismatch(currentBranch, registryBranch)) {
+            logger.info(
+              {
+                repo: entry.name,
+                indexBranch: registryBranch,
+                checkoutBranch: currentBranch ?? DETACHED_HEAD_LABEL,
+              },
+              'Stale index analyze skipped: branch mismatch',
+            );
+            continue;
+          }
+          staleCandidates.push({
+            repoPath: entry.path,
+            commitsBehind: staleness.commitsBehind,
+            entry,
+            registryBranch,
+          });
           continue;
         }
 
@@ -1911,6 +1918,46 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           }
         }
       }
+
+      for (const candidate of staleCandidates) {
+        if (staleAnalyzeFailedRepoPaths.has(candidate.repoPath)) {
+          logger.info(
+            { repo: candidate.entry.name, path: candidate.repoPath },
+            'Stale index analyze skipped: previous analysis failed',
+          );
+        }
+      }
+
+      for (const candidate of selectStaleAnalyzeCandidates(
+        staleCandidates,
+        staleAnalyzeFailedRepoPaths,
+      )) {
+        const { entry, commitsBehind, registryBranch } = candidate;
+        logger.info(
+          { repo: entry.name, path: entry.path, commitsBehind },
+          'Stale index analyze scheduled',
+        );
+        const queued = enqueueWebhookAnalyze(entry.path, {
+          repoName: entry.name,
+          force: false,
+          deferEmbeddingRepair: true,
+          registryName: entry.name,
+          registryBranch,
+          allowDuplicateName: true,
+        });
+        queued.done.catch((err) => {
+          if (isAnalysisAlreadyInProgressError(err)) {
+            logger.debug(
+              { repo: entry.name },
+              'stale index refresh skipped: analysis already in progress',
+            );
+            return;
+          }
+          staleAnalyzeFailedRepoPaths.add(entry.path);
+          logger.error({ err, repo: entry.name }, 'stale index refresh failed');
+        });
+      }
+
       return { skipped: false };
     } finally {
       indexHealthCheckRunning = false;

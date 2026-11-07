@@ -1,4 +1,5 @@
-import { execFileSync, execSync, spawnSync } from 'child_process';
+import { execFile, execFileSync, execSync, spawnSync } from 'child_process';
+import { promisify } from 'util';
 import { statSync, existsSync } from 'fs';
 import path from 'path';
 import os from 'os';
@@ -10,6 +11,7 @@ import { GITNEXUS_MANAGED_PATH_EXCLUDES, isGitNexusManagedPath } from './gitnexu
 
 const chompGitOutput = (value: Buffer): string => value.toString().replace(/\r?\n$/, '');
 const GIT_PATH_LIST_MAX_BUFFER = 64 * 1024 * 1024;
+const execFileAsync = promisify(execFile);
 
 /**
  * True when the working tree has uncommitted changes that analyze would
@@ -712,6 +714,22 @@ export const getCurrentBranch = (repoPath: string): string | null => {
     })
       .toString()
       .trim();
+    if (!branch || branch === 'HEAD') return null;
+    return branch;
+  } catch {
+    return null;
+  }
+};
+
+/** getCurrentBranch 的异步版本，供批量循环避免阻塞事件循环。 */
+export const getCurrentBranchAsync = async (repoPath: string): Promise<string | null> => {
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      cwd: repoPath,
+      encoding: 'utf-8',
+      windowsHide: true,
+    });
+    const branch = stdout.trim();
     if (!branch || branch === 'HEAD') return null;
     return branch;
   } catch {
