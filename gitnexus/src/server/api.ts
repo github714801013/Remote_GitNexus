@@ -160,6 +160,11 @@ import {
   upsertWebhookRepoConfig,
   type WebhookRepoConfigEntry,
 } from './webhook-worktree.js';
+import {
+  createWebhookBeforeAnalyze,
+  reconcileMissingWebhookTargets,
+  shouldReconcileMissingWebhookTargets,
+} from './webhook-repo-reconciler.js';
 import { createAnalyzeUploadHandler } from './analyze-upload.js';
 import { projectRepoDetail, projectRepoListEntry, resolveLastCommit } from './repo-projection.js';
 // Shared with the CLI's `--branch` (via the analyze-config wrapper) so both
@@ -1743,34 +1748,26 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     res.json({ status: 'ok', projectsRoot: getProjectsRoot() });
   });
 
+  const enqueueWebhookTarget = (target: WebhookInspectionTarget) =>
+    enqueueWebhookAnalyze(
+      target.repoPath,
+      {
+        repoUrl: target.cloneUrl,
+        repoName: target.repoName,
+        registryName: target.registryName,
+        registryBranch: target.branch,
+        allowDuplicateName: target.allowDuplicateName,
+      },
+      createWebhookBeforeAnalyze(target, {
+        cloneOrReset: cloneOrResetToBranch,
+        ensureWorktree: ensureLocalWorktree,
+      }),
+    );
+
   const scheduleStartupWebhookRepos = async (): Promise<void> => {
     const projectsRoot = getProjectsRoot();
     for (const target of await loadWebhookInspectionTargets(projectsRoot)) {
-      const queued = enqueueWebhookAnalyze(
-        target.repoPath,
-        {
-          repoUrl: target.cloneUrl,
-          repoName: target.repoName,
-          registryName: target.registryName,
-          registryBranch: target.branch,
-          allowDuplicateName: target.allowDuplicateName,
-        },
-        async () => {
-          if (!target.cloneUrl) return;
-          if (!target.env) {
-            await cloneOrResetToBranch(target.cloneUrl, target.repoPath, target.branch);
-            return;
-          }
-          await cloneOrResetToBranch(target.cloneUrl, target.mainRepoPath, target.branch);
-          await ensureLocalWorktree({
-            mainRepoPath: target.mainRepoPath,
-            worktreePath: target.repoPath,
-            branch: target.registryName,
-            baseRef: `origin/${target.branch}`,
-            resetToRef: `origin/${target.branch}`,
-          });
-        },
-      );
+      const queued = enqueueWebhookTarget(target);
       queued.done.catch((err) => {
         logger.error({ err, repo: target.fullName }, 'Startup webhook indexing failed');
       });
@@ -1781,14 +1778,27 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // 巡检路径分析失败的仓库在本进程内不再入队，重启后自然清空。
   const staleAnalyzeFailedRepoPaths = new Set<string>();
   const DETACHED_HEAD_LABEL = 'detached';
-  const runIndexHealthCheck = async (source = 'startup'): Promise<{ skipped: boolean }> => {
+  const runIndexHealthCheck = async (
+    source: 'startup' | 'manual' = 'startup',
+  ): Promise<{ skipped: boolean }> => {
     if (indexHealthCheckRunning) return { skipped: true };
     indexHealthCheckRunning = true;
     const projectsRoot = getProjectsRoot();
     try {
+      const webhookTargets = await loadWebhookInspectionTargets(projectsRoot);
       const webhookBranchByPath = new Map<string, string>();
-      for (const target of await loadWebhookInspectionTargets(projectsRoot)) {
+      for (const target of webhookTargets) {
         webhookBranchByPath.set(path.resolve(target.repoPath), target.branch);
+      }
+      // 启动重放开启时已覆盖全部 webhook 目标，避免同路径重复入队。
+      if (shouldReconcileMissingWebhookTargets(source, shouldScheduleStartupWebhookRepos())) {
+        await reconcileMissingWebhookTargets(webhookTargets, {
+          pathExists,
+          enqueue: enqueueWebhookTarget,
+          logger,
+        }).catch((err) => {
+          logger.error({ err }, 'webhook repo reconciliation failed');
+        });
       }
       const registeredBeforeSync = await listRegisteredRepos().catch(() => []);
       const registeredPaths = new Set(
@@ -1965,7 +1975,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   };
 
   if (shouldScheduleStartupWebhookRepos()) {
-    void scheduleStartupWebhookRepos();
+    void scheduleStartupWebhookRepos().catch((err) => {
+      logger.error({ err }, 'startup webhook replay failed');
+    });
   }
   void runIndexHealthCheck('startup').catch((err) => {
     logger.error({ err }, 'startup index health check failed');

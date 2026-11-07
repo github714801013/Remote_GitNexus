@@ -18,4 +18,22 @@ describe('POST /api/index-health-check async contract', () => {
     expect(route).toMatch(/res\.status\(202\)\.json\([\s\S]*accepted:\s*true/);
     expect(route).not.toContain('await runIndexHealthCheck');
   });
+
+  it('reconciles missing webhook targets inside the health check', async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, '..', '..', 'src', 'server', 'api.ts'),
+      'utf8',
+    );
+    const loopStart = source.indexOf('const runIndexHealthCheck = async');
+    const loopEnd = source.indexOf("app.post('/api/index-health-check'", loopStart);
+    const loop = source.slice(loopStart, loopEnd);
+
+    expect(loopStart).toBeGreaterThanOrEqual(0);
+    expect(loopEnd).toBeGreaterThan(loopStart);
+    expect(loop).toContain('reconcileMissingWebhookTargets(webhookTargets');
+    expect(loop).toContain('enqueue: enqueueWebhookTarget');
+    expect(loop).toContain(
+      'shouldReconcileMissingWebhookTargets(source, shouldScheduleStartupWebhookRepos())',
+    );
+  });
 });
