@@ -141,6 +141,7 @@ import {
 } from '../core/git-staleness.js';
 import { getCurrentBranchAsync } from '../storage/git.js';
 import {
+  buildWebhookBranchByPath,
   isKnownBranchMismatch,
   selectStaleAnalyzeCandidates,
 } from './stale-analyze-scheduler.js';
@@ -1775,7 +1776,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   };
 
   let indexHealthCheckRunning = false;
-  // 巡检路径分析失败的仓库在本进程内不再入队，重启后自然清空。
+  // 巡检路径分析失败的仓库只跳过本轮，下一轮巡检重新参与候选。
   const staleAnalyzeFailedRepoPaths = new Set<string>();
   const DETACHED_HEAD_LABEL = 'detached';
   const runIndexHealthCheck = async (
@@ -1785,11 +1786,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     indexHealthCheckRunning = true;
     const projectsRoot = getProjectsRoot();
     try {
+      // 失败仓库只隔离一轮：一次失败不应让它在整个进程生命周期内失去追平机会。
+      staleAnalyzeFailedRepoPaths.clear();
       const webhookTargets = await loadWebhookInspectionTargets(projectsRoot);
-      const webhookBranchByPath = new Map<string, string>();
-      for (const target of webhookTargets) {
-        webhookBranchByPath.set(path.resolve(target.repoPath), target.branch);
-      }
+      const webhookBranchByPath = buildWebhookBranchByPath(webhookTargets);
       // 启动重放开启时已覆盖全部 webhook 目标，避免同路径重复入队。
       if (shouldReconcileMissingWebhookTargets(source, shouldScheduleStartupWebhookRepos())) {
         await reconcileMissingWebhookTargets(webhookTargets, {

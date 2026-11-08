@@ -1,10 +1,34 @@
+import path from 'node:path';
+
 /** 单轮巡检最多调度的仓库数。 */
 export const STALE_ANALYZE_MAX_PER_ROUND = 10;
+
+/** 参与索引分支映射的 webhook 目标；带 env 表示由 repos.<env>.json 登记的 worktree。 */
+export interface WebhookBranchSource {
+  repoPath: string;
+  branch: string;
+  env?: string;
+}
 
 export interface StaleAnalyzeCandidate {
   repoPath: string;
   commitsBehind: number;
 }
+
+/**
+ * 只有主仓的索引分支跟随 webhook 源分支。
+ * env worktree 的索引分支是它自己的分支，用源分支覆盖会让巡检恒判分支不匹配。
+ */
+export const buildWebhookBranchByPath = (
+  targets: readonly WebhookBranchSource[],
+): Map<string, string> => {
+  const byPath = new Map<string, string>();
+  for (const target of targets) {
+    if (target.env) continue;
+    byPath.set(path.resolve(target.repoPath), target.branch);
+  }
+  return byPath;
+};
 
 /** 仅当索引分支已知且与 checkout 分支不一致时返回真；索引分支缺失时保持原有调度行为。 */
 export const isKnownBranchMismatch = (
