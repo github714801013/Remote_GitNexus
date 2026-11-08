@@ -36,6 +36,7 @@ import {
 } from '../../src/mcp/server.js';
 import { installServeMcpAuth, mountMCPEndpoints } from '../../src/server/mcp-http.js';
 import type { McpRepositoryPolicy } from '../../src/mcp/repository-policy.js';
+import { _captureLogger } from '../../src/core/logger.js';
 
 // ─── Live-HTTP helpers (real req/res for SDK-touching paths) ───────────
 
@@ -415,6 +416,7 @@ describe('MCP request scope session binding', () => {
       'oanew',
     ]);
 
+    const cap = _captureLogger();
     const followUp = await request(
       port,
       'POST',
@@ -427,9 +429,10 @@ describe('MCP request scope session binding', () => {
         env: 'dev',
       },
       JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', id: 2, params: {} }),
-    );
+    ).finally(() => cap.restore());
     expect(followUp.status).toBe(200);
     expect(policies).toHaveLength(1);
+    expect(cap.records().filter((record) => record.level === 40)).toHaveLength(0);
 
     await close();
     await cleanup();
@@ -489,26 +492,45 @@ describe('createStreamableHttpHandler', () => {
   });
 
   it('returns 404 for an unknown session id', async () => {
-    const backend = createMockBackend();
-    const { handler, cleanup } = createStreamableHttpHandler(backend as never);
+    const cap = _captureLogger();
+    try {
+      const backend = createMockBackend();
+      const { handler, cleanup } = createStreamableHttpHandler(backend as never);
 
-    const req = {
-      headers: { 'mcp-session-id': 'non-existent-session-id' },
-      method: 'GET',
-      body: undefined,
-    } as unknown as Request;
+      const req = {
+        headers: { 'mcp-session-id': 'non-existent-session-id' },
+        method: 'GET',
+        path: '/mcp',
+        body: undefined,
+      } as unknown as Request;
 
-    const res = createMockRes();
+      const res = createMockRes();
 
-    await handler(req, res);
+      await handler(req, res);
 
-    expect(res._status).toBe(404);
-    expect(res._body).toMatchObject({
-      jsonrpc: '2.0',
-      error: { code: -32001, message: 'Session not found. Re-initialize.' },
-    });
+      expect(res._status).toBe(404);
+      expect(res._body).toMatchObject({
+        jsonrpc: '2.0',
+        error: { code: -32001, message: 'Session not found. Re-initialize.' },
+      });
+      expect(cap.records()).toContainEqual(
+        expect.objectContaining({
+          level: 40, // pino warn level
+          method: 'GET',
+          path: '/mcp',
+          sessionId: 'non-exis',
+          msg: 'MCP session not found; client must re-initialize',
+        }),
+      );
+      expect(
+        cap.records().filter((record) => record.msg === 'MCP session not found; client must re-initialize'),
+      ).toHaveLength(1);
+      expect(cap.text()).not.toContain('non-existent-session-id');
 
-    await cleanup();
+      await cleanup();
+    } finally {
+      cap.restore();
+    }
   });
 
   it('returns 400 for a GET with no session id', async () => {
@@ -665,26 +687,48 @@ describe('createStreamableHttpHandler', () => {
 
 describe('createSseHandlers', () => {
   it('returns 404 from messageHandler when sessionId is unknown', async () => {
-    const backend = createMockBackend();
-    const { messageHandler, cleanup } = createSseHandlers(backend as never, '/messages');
+    const cap = _captureLogger();
+    try {
+      const backend = createMockBackend();
+      const { messageHandler, cleanup } = createSseHandlers(backend as never, '/messages');
 
-    const req = {
-      query: { sessionId: 'non-existent' },
-      headers: {},
-      body: {},
-    } as unknown as Request;
+      const req = {
+        query: { sessionId: 'non-existent' },
+        headers: {},
+        method: 'POST',
+        path: '/messages',
+        body: {},
+      } as unknown as Request;
 
-    const res = createMockRes();
+      const res = createMockRes();
 
-    await messageHandler(req, res);
+      await messageHandler(req, res);
 
-    expect(res._status).toBe(404);
-    expect(res._body).toMatchObject({
-      jsonrpc: '2.0',
-      error: { code: -32001, message: 'SSE session not found. Reconnect to /sse.' },
-    });
+      expect(res._status).toBe(404);
+      expect(res._body).toMatchObject({
+        jsonrpc: '2.0',
+        error: { code: -32001, message: 'SSE session not found. Reconnect to /sse.' },
+      });
+      expect(cap.records()).toContainEqual(
+        expect.objectContaining({
+          level: 40, // pino warn level
+          method: 'POST',
+          path: '/messages',
+          sessionId: 'non-exis',
+          msg: 'MCP SSE session not found; client must reconnect and re-initialize',
+        }),
+      );
+      expect(
+        cap
+          .records()
+          .filter((record) => record.msg === 'MCP SSE session not found; client must reconnect and re-initialize'),
+      ).toHaveLength(1);
+      expect(cap.text()).not.toContain('non-existent');
 
-    await cleanup();
+      await cleanup();
+    } finally {
+      cap.restore();
+    }
   });
 
   it('returns 404 from messageHandler when no sessionId is provided', async () => {
@@ -704,6 +748,34 @@ describe('createSseHandlers', () => {
     expect(res._status).toBe(404);
 
     await cleanup();
+  });
+
+  it('does not log full session ids from repeated query parameters', async () => {
+    const cap = _captureLogger();
+    try {
+      const backend = createMockBackend();
+      const { messageHandler, cleanup } = createSseHandlers(backend as never, '/messages');
+
+      const req = {
+        query: { sessionId: ['aaaaaaaa-bbbb', 'x'] },
+        headers: {},
+        method: 'POST',
+        path: '/messages',
+        body: {},
+      } as unknown as Request;
+
+      const res = createMockRes();
+
+      await messageHandler(req, res);
+
+      expect(res._status).toBe(404);
+      expect(cap.records()).toContainEqual(expect.objectContaining({ level: 40, sessionId: null }));
+      expect(cap.text()).not.toContain('aaaaaaaa-bbbb');
+
+      await cleanup();
+    } finally {
+      cap.restore();
+    }
   });
 
   it('cleanup does not throw', async () => {

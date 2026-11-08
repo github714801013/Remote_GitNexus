@@ -290,6 +290,10 @@ export function createStreamableHttpHandler(
       await session.transport.handleRequest(req, res, req.body);
     } else if (sessionId) {
       // Unknown / expired session ID — tell the client to re-initialize (per MCP spec).
+      logger.warn(
+        { method: req.method, path: req.path, sessionId: sessionId.slice(0, 8) },
+        'MCP session not found; client must re-initialize',
+      );
       res.status(404).json({
         jsonrpc: '2.0',
         error: { code: -32001, message: 'Session not found. Re-initialize.' },
@@ -466,12 +470,15 @@ export function createSseHandlers(
   };
 
   const messageHandler = async (req: Request, res: Response): Promise<void> => {
-    const sessionId =
-      (req.query['sessionId'] as string | undefined) ??
-      (req.headers['mcp-session-id'] as string | undefined);
+    const sessionIdParam = req.query['sessionId'] ?? req.headers['mcp-session-id'];
+    const sessionId = typeof sessionIdParam === 'string' ? sessionIdParam : undefined;
     const entry = sessionId ? sseSessions.get(sessionId) : undefined;
 
     if (!entry) {
+      logger.warn(
+        { method: req.method, path: req.path, sessionId: sessionId?.slice(0, 8) ?? null },
+        'MCP SSE session not found; client must reconnect and re-initialize',
+      );
       res.status(404).json({
         jsonrpc: '2.0',
         error: { code: -32001, message: 'SSE session not found. Reconnect to /sse.' },
