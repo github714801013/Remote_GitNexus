@@ -275,11 +275,19 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
     const envHeapMb = Number(process.env.GITNEXUS_SERVER_ANALYZE_HEAP_MB);
     const includeEmbeddings = await analysisMayEmbed(targetPath, opts);
     if (launchAborted(job.id)) return;
-    const resources = resolveHostAnalysisResources({
-      mainHeapMb: Number.isInteger(envHeapMb) && envHeapMb > 0 ? envHeapMb + 48 : undefined,
-      includeEmbeddings,
-      supervisorBytes: analysisSupervisorReservation(),
-    });
+    let resources: ReturnType<typeof resolveHostAnalysisResources>;
+    try {
+      resources = resolveHostAnalysisResources({
+        mainHeapMb: Number.isInteger(envHeapMb) && envHeapMb > 0 ? envHeapMb + 48 : undefined,
+        includeEmbeddings,
+        supervisorBytes: analysisSupervisorReservation(),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.warn({ repoPath: targetPath, error: message }, 'analyze resource budget rejected');
+      jobManager.updateJob(job.id, { status: 'failed', error: message });
+      return;
+    }
     const analyzeLockKey = await requireStoragePath(
       targetPath,
       opts.force ? ANALYZE_FORCE_STORAGE_REQUIREMENTS : ANALYZE_STORAGE_REQUIREMENTS,

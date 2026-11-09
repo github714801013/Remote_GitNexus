@@ -1441,6 +1441,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       registryBranch: params.registryBranch,
       allowDuplicateName: params.allowDuplicateName,
       lockAlreadyHeld,
+    }).catch((err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error({ err, repo: params.repoName ?? repoPath }, 'analysis launch failed');
+      const current = jobManager.getJob(job.id);
+      if (!current || !isTerminalJobStatus(current.status)) {
+        jobManager.updateJob(job.id, { status: 'failed', error: message });
+      }
     });
     return job;
   };

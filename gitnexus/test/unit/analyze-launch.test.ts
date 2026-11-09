@@ -2,10 +2,11 @@ import { EventEmitter } from 'events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { JobManager } from '../../src/server/analyze-job.js';
 
-const { children, forkMock, neo4jEnabled } = vi.hoisted(() => ({
+const { children, forkMock, neo4jEnabled, resolveResourcesMock } = vi.hoisted(() => ({
   children: [] as any[],
   forkMock: vi.fn(),
   neo4jEnabled: vi.fn(() => false),
+  resolveResourcesMock: vi.fn(),
 }));
 
 vi.mock('child_process', () => ({
@@ -21,9 +22,11 @@ vi.mock('../../src/core/neo4j/config.js', () => ({
 vi.mock('../../src/core/analysis-host-resources.js', async (importOriginal) => {
   const actual =
     await importOriginal<typeof import('../../src/core/analysis-host-resources.js')>();
+  resolveResourcesMock.mockImplementation(actual.resolveHostAnalysisResources);
   return {
     ...actual,
     analysisMayEmbed: vi.fn(async () => false),
+    resolveHostAnalysisResources: resolveResourcesMock,
   };
 });
 
@@ -88,6 +91,23 @@ describe('createLaunchAnalysisWorker', () => {
       expect(backend.init).toHaveBeenCalledTimes(1);
       expect(manager.getJob(job.id)?.status).toBe('complete');
     });
+    manager.dispose();
+  });
+
+  it('marks the job failed instead of rejecting when the resource budget rejects the launch', async () => {
+    const manager = new JobManager();
+    const { createLaunchAnalysisWorker } = await import('../../src/server/analyze-launch.js');
+    const launch = createLaunchAnalysisWorker(makeLaunchDeps(manager));
+    const job = manager.createJob({ repoPath: 'D:/repo' });
+
+    resolveResourcesMock.mockImplementationOnce(() => {
+      throw new Error('Resource budget 24576 MiB cannot admit parser/model work');
+    });
+    await expect(launch(job, 'D:/repo', {})).resolves.toBeUndefined();
+
+    expect(manager.getJob(job.id)?.status).toBe('failed');
+    expect(manager.getJob(job.id)?.error).toContain('Resource budget');
+    expect(forkMock).not.toHaveBeenCalled();
     manager.dispose();
   });
 
