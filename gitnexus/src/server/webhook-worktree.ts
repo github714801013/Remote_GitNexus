@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { parseAllowedEnvs } from '../config/environment-policy.js';
+import { buildGitEnv } from '../core/git-auth.js';
 import type { RepoMeta } from '../storage/repo-manager.js';
 
 export { parseAllowedEnvs };
@@ -186,16 +187,12 @@ const canonicalPath = async (targetPath: string): Promise<string> => {
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 };
 
-const runGit = (args: string[], cwd: string): Promise<string> =>
+const runGit = (args: string[], cwd: string, options?: { url?: string }): Promise<string> =>
   new Promise((resolve, reject) => {
     const proc = spawn('git', args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        GIT_TERMINAL_PROMPT: '0',
-        GIT_ASKPASS: process.platform === 'win32' ? 'echo' : '/bin/true',
-      },
+      env: buildGitEnv(process.env, options),
     });
 
     let stdout = '';
@@ -221,7 +218,9 @@ const runGit = (args: string[], cwd: string): Promise<string> =>
 const fetchOriginRef = async (ref: string | undefined, cwd: string): Promise<void> => {
   if (!ref?.startsWith('origin/')) return;
   const branch = ref.slice('origin/'.length);
-  await runGit(['fetch', 'origin', `${branch}:refs/remotes/origin/${branch}`], cwd);
+  // fetch 走网络，需按 origin 主机白名单注入凭据；先本地读取 URL。
+  const url = await runGit(['remote', 'get-url', 'origin'], cwd);
+  await runGit(['fetch', 'origin', `${branch}:refs/remotes/origin/${branch}`], cwd, { url });
 };
 
 const preserveGitNexusMetadata = async (repoPath: string): Promise<string | undefined> => {
