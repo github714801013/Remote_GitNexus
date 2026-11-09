@@ -3338,6 +3338,7 @@ async function runFullAnalysisInner(
     );
     const meta: RepoMeta = {
       repoPath,
+      storagePath,
       lastCommit: currentCommit,
       indexedAt: new Date().toISOString(),
       branch: branchLabel ?? existingMeta?.branch,
