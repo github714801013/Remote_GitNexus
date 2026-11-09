@@ -81,6 +81,14 @@ describe('api read-only endpoint wiring', () => {
     expect(embedSection![0]).not.toMatch(/readOnly:\s*true/);
   });
 
+  it('keeps startup and manual index health checks without interval scheduling', async () => {
+    const source = await readSource();
+    expect(source).toContain("void runIndexHealthCheck('startup')");
+    expect(source).toContain("app.post('/api/index-health-check'");
+    expect(source).not.toContain('GITNEXUS_INDEX_HEALTH_INTERVAL_MS');
+    expect(source).not.toContain("runIndexHealthCheck('scheduled')");
+  });
+
   it('/api/embed delegates vector writes without reopening the graph in legacy write mode', async () => {
     const source = await readSource();
     const embedSection = source.match(

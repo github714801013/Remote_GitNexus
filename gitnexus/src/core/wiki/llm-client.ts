@@ -97,6 +97,18 @@ export function resolveMiniMaxThinkingMode(
   return undefined;
 }
 
+const isLLMProvider = (value: string | undefined): value is LLMProvider =>
+  value === 'openai' ||
+  value === 'openrouter' ||
+  value === 'azure' ||
+  value === 'custom' ||
+  value === 'cursor' ||
+  value === 'claude' ||
+  value === 'codex' ||
+  value === 'opencode' ||
+  value === 'grok' ||
+  value === 'minimax';
+
 /**
  * Resolve LLM configuration from env vars, saved config, and optional overrides.
  * Priority: overrides (CLI flags) > env vars > ~/.gitnexus/config.json > error
@@ -107,8 +119,12 @@ export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<
   const { loadCLIConfig } = await import('../../storage/repo-manager.js');
   const savedConfig = await loadCLIConfig();
   const hasLegacyHttpConfig = !savedConfig.provider && !!(savedConfig.model || savedConfig.baseUrl);
+  const envProvider = process.env.GITNEXUS_WIKI_LLM_PROVIDER;
   const savedProvider =
-    overrides?.provider ?? savedConfig.provider ?? (hasLegacyHttpConfig ? 'openai' : 'minimax');
+    overrides?.provider ??
+    (isLLMProvider(envProvider) ? envProvider : undefined) ??
+    savedConfig.provider ??
+    (hasLegacyHttpConfig ? 'openai' : 'minimax');
   const reuseSavedHttpConfig =
     savedConfig.provider === savedProvider || (hasLegacyHttpConfig && savedProvider === 'openai');
   const savedLocalModel =
@@ -132,6 +148,7 @@ export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<
 
   const apiKey =
     overrides?.apiKey ||
+    process.env.GITNEXUS_WIKI_LLM_API_KEY ||
     (savedProvider === 'minimax' ? process.env.MINIMAX_API_KEY : undefined) ||
     (savedProvider === 'anthropic' ? process.env.ANTHROPIC_API_KEY : undefined) ||
     (savedProvider !== 'minimax' ? process.env.GITNEXUS_API_KEY : undefined) ||
@@ -145,6 +162,7 @@ export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<
     apiKey,
     baseUrl:
       overrides?.baseUrl ||
+      process.env.GITNEXUS_WIKI_LLM_URL ||
       process.env.GITNEXUS_LLM_BASE_URL ||
       (reuseSavedHttpConfig ? savedConfig.baseUrl : undefined) ||
       (savedProvider === 'minimax'
@@ -154,6 +172,7 @@ export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<
           : 'https://openrouter.ai/api/v1'),
     model:
       overrides?.model ||
+      (localProvider ? undefined : process.env.GITNEXUS_WIKI_LLM_MODEL) ||
       (localProvider ? undefined : process.env.GITNEXUS_MODEL) ||
       savedLocalModel ||
       (localProvider
@@ -481,15 +500,23 @@ export async function callLLM(
   if (choice?.finish_reason === 'length') {
     throw truncatedResponseError(config.maxTokens, chatCompletionsStream.truncationReason);
   }
-  if (!choice?.message?.content) {
-    throw new Error('LLM returned empty response');
+  const message = choice?.message;
+  if (typeof message?.content === 'string' && message.content.length > 0) {
+    return {
+      content: message.content,
+      promptTokens: json.usage?.prompt_tokens,
+      completionTokens: json.usage?.completion_tokens,
+    };
   }
 
-  return {
-    content: choice.message.content,
-    promptTokens: json.usage?.prompt_tokens,
-    completionTokens: json.usage?.completion_tokens,
-  };
+  if (
+    (typeof message?.reasoning === 'string' && message.reasoning.length > 0) ||
+    (typeof message?.reasoning_content === 'string' && message.reasoning_content.length > 0)
+  ) {
+    throw new Error('LLM returned reasoning-only response; reasoning is not included in Wiki output');
+  }
+
+  throw new Error('LLM returned empty response');
 }
 
 interface LLMRequest {

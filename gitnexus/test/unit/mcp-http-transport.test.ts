@@ -35,6 +35,8 @@ import {
   SHUTDOWN_EXIT_CODES,
 } from '../../src/mcp/server.js';
 import { installServeMcpAuth, mountMCPEndpoints } from '../../src/server/mcp-http.js';
+import type { McpRepositoryPolicy } from '../../src/mcp/repository-policy.js';
+import { _captureLogger } from '../../src/core/logger.js';
 
 // ─── Live-HTTP helpers (real req/res for SDK-touching paths) ───────────
 
@@ -73,13 +75,6 @@ function request(
     if (body !== undefined) req.write(body);
     req.end();
   });
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
-  const start = Date.now();
-  while (!predicate() && Date.now() - start < timeoutMs) {
-    await new Promise((r) => setTimeout(r, 10));
-  }
 }
 
 /** A schema-complete JSON-RPC initialize request (passes the SDK isInitializeRequest). */
@@ -380,6 +375,70 @@ describe('startMcpHttpServer', () => {
 
 // ─── createStreamableHttpHandler ──────────────────────────────────────
 
+describe('MCP request scope session binding', () => {
+  it('binds projects/env at initialize and ignores changed headers on the same session', async () => {
+    const backend = createMockBackend({
+      listRepos: vi.fn().mockResolvedValue([
+        { name: 'dev-oanew', path: '/repos/dev-oanew', indexedAt: '2026-01-01', lastCommit: '1'.repeat(40) },
+        { name: 'oanew', path: '/repos/oanew', indexedAt: '2026-01-02', lastCommit: '2'.repeat(40) },
+        { name: 'dev-oa-stock', path: '/repos/dev-oa-stock', indexedAt: '2026-01-03', lastCommit: '3'.repeat(40) },
+      ]),
+    });
+    const policies: McpRepositoryPolicy[] = [];
+    const { handler, cleanup } = createStreamableHttpHandler(backend as never, {
+      createServer: (policy) => {
+        policies.push(policy);
+        return createMCPServer(backend as never, { repositoryPolicy: policy });
+      },
+    });
+    const app = express();
+    app.use(express.json());
+    app.all('/mcp', (req, res) => void handler(req, res).catch(() => {}));
+    const { port, close } = await listen(app);
+
+    const initialized = await request(
+      port,
+      'POST',
+      '/mcp',
+      {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        projects: 'oanew',
+        env: 'pro',
+      },
+      JSON.stringify(validInitialize()),
+    );
+    const sessionId = initialized.headers['mcp-session-id'];
+    expect(initialized.status).toBe(200);
+    expect(typeof sessionId).toBe('string');
+    expect(policies).toHaveLength(1);
+    expect((await policies[0]!.scopeBackend(backend as never).listRepos()).map((repo) => repo.name)).toEqual([
+      'oanew',
+    ]);
+
+    const cap = _captureLogger();
+    const followUp = await request(
+      port,
+      'POST',
+      '/mcp',
+      {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'mcp-session-id': String(sessionId),
+        projects: 'oa-stock',
+        env: 'dev',
+      },
+      JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', id: 2, params: {} }),
+    ).finally(() => cap.restore());
+    expect(followUp.status).toBe(200);
+    expect(policies).toHaveLength(1);
+    expect(cap.records().filter((record) => record.level === 40)).toHaveLength(0);
+
+    await close();
+    await cleanup();
+  });
+});
+
 describe('createStreamableHttpHandler', () => {
   it('attempts to create a new session for a POST with no session id', async () => {
     const backend = createMockBackend();
@@ -433,26 +492,45 @@ describe('createStreamableHttpHandler', () => {
   });
 
   it('returns 404 for an unknown session id', async () => {
-    const backend = createMockBackend();
-    const { handler, cleanup } = createStreamableHttpHandler(backend as never);
+    const cap = _captureLogger();
+    try {
+      const backend = createMockBackend();
+      const { handler, cleanup } = createStreamableHttpHandler(backend as never);
 
-    const req = {
-      headers: { 'mcp-session-id': 'non-existent-session-id' },
-      method: 'GET',
-      body: undefined,
-    } as unknown as Request;
+      const req = {
+        headers: { 'mcp-session-id': 'non-existent-session-id' },
+        method: 'GET',
+        path: '/mcp',
+        body: undefined,
+      } as unknown as Request;
 
-    const res = createMockRes();
+      const res = createMockRes();
 
-    await handler(req, res);
+      await handler(req, res);
 
-    expect(res._status).toBe(404);
-    expect(res._body).toMatchObject({
-      jsonrpc: '2.0',
-      error: { code: -32001, message: 'Session not found. Re-initialize.' },
-    });
+      expect(res._status).toBe(404);
+      expect(res._body).toMatchObject({
+        jsonrpc: '2.0',
+        error: { code: -32001, message: 'Session not found. Re-initialize.' },
+      });
+      expect(cap.records()).toContainEqual(
+        expect.objectContaining({
+          level: 40, // pino warn level
+          method: 'GET',
+          path: '/mcp',
+          sessionId: 'non-exis',
+          msg: 'MCP session not found; client must re-initialize',
+        }),
+      );
+      expect(
+        cap.records().filter((record) => record.msg === 'MCP session not found; client must re-initialize'),
+      ).toHaveLength(1);
+      expect(cap.text()).not.toContain('non-existent-session-id');
 
-    await cleanup();
+      await cleanup();
+    } finally {
+      cap.restore();
+    }
   });
 
   it('returns 400 for a GET with no session id', async () => {
@@ -478,7 +556,7 @@ describe('createStreamableHttpHandler', () => {
     await cleanup();
   });
 
-  it('U1: closes the orphaned Server when the SDK rejects an initialize before a session id', async () => {
+  it('U1: accepts a JSON-only Accept header (no SSE) and answers with JSON', async () => {
     const backend = createMockBackend();
     let closed = 0;
     // Inject createServer so we can observe the per-session Server's close().
@@ -499,8 +577,9 @@ describe('createStreamableHttpHandler', () => {
     app.all('/mcp', (req, res) => void handler(req, res).catch(() => {}));
     const { port, close } = await listen(app);
 
-    // POST initialize but with Accept: application/json ONLY (no text/event-stream):
-    // the SDK returns 406 BEFORE assigning transport.sessionId, exercising the orphan path.
+    // A JSON-only client (e.g. the AutoWonder Go executor) omits text/event-stream:
+    // the handler normalizes Accept, and enableJsonResponse answers with a JSON body
+    // instead of an SSE stream.
     const res = await request(
       port,
       'POST',
@@ -509,9 +588,61 @@ describe('createStreamableHttpHandler', () => {
       JSON.stringify(validInitialize()),
     );
 
-    expect(res.status).toBe(406);
-    await waitFor(() => closed > 0);
-    expect(closed).toBeGreaterThan(0); // the connected Server was closed, not leaked
+    expect(res.status).toBe(200);
+    expect(String(res.headers['content-type'] ?? '')).toMatch(/application\/json/);
+    expect(typeof res.headers['mcp-session-id']).toBe('string');
+    expect(JSON.parse(res.body)).toMatchObject({ jsonrpc: '2.0', id: 1 });
+    expect(closed).toBe(0); // session established; the Server is kept alive
+
+    await close();
+    await cleanup();
+  });
+
+  it('U12: accepts a wildcard Accept header (curl default) and answers with JSON', async () => {
+    const backend = createMockBackend();
+    const { handler, cleanup } = createStreamableHttpHandler(backend as never);
+    const app = express();
+    app.use(express.json());
+    app.all('/mcp', (req, res) => void handler(req, res).catch(() => {}));
+    const { port, close } = await listen(app);
+
+    const res = await request(
+      port,
+      'POST',
+      '/mcp',
+      { 'Content-Type': 'application/json', Accept: '*/*' },
+      JSON.stringify(validInitialize()),
+    );
+
+    expect(res.status).toBe(200);
+    expect(String(res.headers['content-type'] ?? '')).toMatch(/^application\/json/);
+
+    await close();
+    await cleanup();
+  });
+
+  it('U11: POST initialize answers application/json for standard MCP clients too', async () => {
+    const backend = createMockBackend();
+    const { handler, cleanup } = createStreamableHttpHandler(backend as never);
+    const app = express();
+    app.use(express.json());
+    app.all('/mcp', (req, res) => void handler(req, res).catch(() => {}));
+    const { port, close } = await listen(app);
+
+    const res = await request(
+      port,
+      'POST',
+      '/mcp',
+      {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+      },
+      JSON.stringify(validInitialize()),
+    );
+
+    expect(res.status).toBe(200);
+    expect(String(res.headers['content-type'] ?? '')).toMatch(/^application\/json/);
+    expect(JSON.parse(res.body)).toMatchObject({ jsonrpc: '2.0', id: 1 });
 
     await close();
     await cleanup();
@@ -556,26 +687,48 @@ describe('createStreamableHttpHandler', () => {
 
 describe('createSseHandlers', () => {
   it('returns 404 from messageHandler when sessionId is unknown', async () => {
-    const backend = createMockBackend();
-    const { messageHandler, cleanup } = createSseHandlers(backend as never, '/messages');
+    const cap = _captureLogger();
+    try {
+      const backend = createMockBackend();
+      const { messageHandler, cleanup } = createSseHandlers(backend as never, '/messages');
 
-    const req = {
-      query: { sessionId: 'non-existent' },
-      headers: {},
-      body: {},
-    } as unknown as Request;
+      const req = {
+        query: { sessionId: 'non-existent' },
+        headers: {},
+        method: 'POST',
+        path: '/messages',
+        body: {},
+      } as unknown as Request;
 
-    const res = createMockRes();
+      const res = createMockRes();
 
-    await messageHandler(req, res);
+      await messageHandler(req, res);
 
-    expect(res._status).toBe(404);
-    expect(res._body).toMatchObject({
-      jsonrpc: '2.0',
-      error: { code: -32001, message: 'SSE session not found. Reconnect to /sse.' },
-    });
+      expect(res._status).toBe(404);
+      expect(res._body).toMatchObject({
+        jsonrpc: '2.0',
+        error: { code: -32001, message: 'SSE session not found. Reconnect to /sse.' },
+      });
+      expect(cap.records()).toContainEqual(
+        expect.objectContaining({
+          level: 40, // pino warn level
+          method: 'POST',
+          path: '/messages',
+          sessionId: 'non-exis',
+          msg: 'MCP SSE session not found; client must reconnect and re-initialize',
+        }),
+      );
+      expect(
+        cap
+          .records()
+          .filter((record) => record.msg === 'MCP SSE session not found; client must reconnect and re-initialize'),
+      ).toHaveLength(1);
+      expect(cap.text()).not.toContain('non-existent');
 
-    await cleanup();
+      await cleanup();
+    } finally {
+      cap.restore();
+    }
   });
 
   it('returns 404 from messageHandler when no sessionId is provided', async () => {
@@ -595,6 +748,34 @@ describe('createSseHandlers', () => {
     expect(res._status).toBe(404);
 
     await cleanup();
+  });
+
+  it('does not log full session ids from repeated query parameters', async () => {
+    const cap = _captureLogger();
+    try {
+      const backend = createMockBackend();
+      const { messageHandler, cleanup } = createSseHandlers(backend as never, '/messages');
+
+      const req = {
+        query: { sessionId: ['aaaaaaaa-bbbb', 'x'] },
+        headers: {},
+        method: 'POST',
+        path: '/messages',
+        body: {},
+      } as unknown as Request;
+
+      const res = createMockRes();
+
+      await messageHandler(req, res);
+
+      expect(res._status).toBe(404);
+      expect(cap.records()).toContainEqual(expect.objectContaining({ level: 40, sessionId: null }));
+      expect(cap.text()).not.toContain('aaaaaaaa-bbbb');
+
+      await cleanup();
+    } finally {
+      cap.restore();
+    }
   });
 
   it('cleanup does not throw', async () => {

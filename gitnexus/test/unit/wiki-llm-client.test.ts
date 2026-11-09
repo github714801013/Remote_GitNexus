@@ -109,6 +109,10 @@ describe('resolveLLMConfig provider isolation', () => {
     vi.stubEnv('OPENAI_API_KEY', 'openai-key');
     vi.stubEnv('GITNEXUS_API_KEY', 'gitnexus-key');
     vi.stubEnv('MINIMAX_API_KEY', '');
+    // 隔离个性化 Wiki LLM 环境变量与本机 ~/.gitnexus/config.json。
+    vi.stubEnv('GITNEXUS_WIKI_LLM_PROVIDER', '');
+    vi.stubEnv('GITNEXUS_WIKI_LLM_API_KEY', '');
+    vi.spyOn(await import('../../src/storage/repo-manager.js'), 'loadCLIConfig').mockResolvedValue({});
 
     const config = await resolveLLMConfig();
 
@@ -124,6 +128,14 @@ describe('resolveLLMConfig provider isolation', () => {
       model: MINIMAX_MODEL_IDS[0],
       apiVersion: 'minimax-version',
     });
+    // 隔离本机环境对凭据与端点的干扰。
+    vi.stubEnv('GITNEXUS_WIKI_LLM_API_KEY', '');
+    vi.stubEnv('GITNEXUS_API_KEY', '');
+    vi.stubEnv('OPENAI_API_KEY', '');
+    vi.stubEnv('GITNEXUS_WIKI_LLM_URL', '');
+    vi.stubEnv('GITNEXUS_LLM_BASE_URL', '');
+    vi.stubEnv('GITNEXUS_WIKI_LLM_MODEL', '');
+    vi.stubEnv('GITNEXUS_MODEL', '');
 
     const config = await resolveLLMConfig({ provider: 'openai' });
 
@@ -663,6 +675,86 @@ describe('callLLM — Azure content_filter error', () => {
   });
 });
 
+describe('callLLM — Wiki 可见正文与推理字段', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('非流式响应严格优先返回可见正文', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: 'visible output',
+                reasoning: 'internal reasoning must not be published',
+                reasoning_content: 'other internal reasoning',
+              },
+            },
+          ],
+          usage: {},
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const { callLLM } = await import('../../src/core/wiki/llm-client.js');
+    await expect(
+      callLLM('test', {
+        apiKey: 'sk-test',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-4o',
+        maxTokens: 100,
+        temperature: 0,
+      }),
+    ).resolves.toMatchObject({ content: 'visible output' });
+  });
+
+  it('非流式 reasoning-only 响应不会泄露推理文本', async () => {
+    const reasoning = 'internal reasoning must not be published';
+    const fetchSpy = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ choices: [{ message: { content: '', reasoning_content: reasoning } }], usage: {} }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const { callLLM } = await import('../../src/core/wiki/llm-client.js');
+    const error = await callLLM('test', {
+      apiKey: 'sk-test',
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4o',
+      maxTokens: 100,
+      temperature: 0,
+    }).catch((err: unknown) => err as Error);
+
+    expect(error.message).toContain('reasoning-only');
+    expect(error.message).not.toContain(reasoning);
+  });
+
+  it('非流式空响应仍使用普通空响应错误', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ choices: [{ message: { content: '' } }], usage: {} }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const { callLLM } = await import('../../src/core/wiki/llm-client.js');
+    await expect(
+      callLLM('test', {
+        apiKey: 'sk-test',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-4o',
+        maxTokens: 100,
+        temperature: 0,
+      }),
+    ).rejects.toThrow('LLM returned empty response');
+  });
+});
+
 describe('readSSEStream — content_filter handling', () => {
   afterEach(() => vi.unstubAllGlobals());
 
@@ -706,6 +798,65 @@ describe('readSSEStream — content_filter handling', () => {
         { onChunk: () => {} },
       ),
     ).rejects.toThrow('content filter');
+  });
+});
+
+describe('readSSEStream — reasoning 与 EOF 兼容', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  const streamResponse = (streamContent: string) => {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(streamContent));
+        controller.close();
+      },
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
+  };
+
+  const config = {
+    apiKey: 'sk-test',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4o',
+    maxTokens: 100,
+    temperature: 0,
+  };
+
+  it('reasoning 后的可见正文只返回正文并按正文报告进度', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(
+      streamResponse(
+        [
+          'data: {"choices":[{"delta":{"reasoning":"internal"}}]}\n\n',
+          'data: {"choices":[{"delta":{"reasoning_content":"thought"}}]}\n\n',
+          'data: {"choices":[{"delta":{"content":"visible"}}]}\n\n',
+          'data: {"choices":[{"delta":{"content":" output"}}]}\n\n',
+          'data: [DONE]\n\n',
+        ].join(''),
+      ),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+    const onChunk = vi.fn();
+
+    const { callLLM } = await import('../../src/core/wiki/llm-client.js');
+    await expect(callLLM('test', config, undefined, { onChunk })).resolves.toMatchObject({
+      content: 'visible output',
+    });
+    expect(onChunk).toHaveBeenNthCalledWith(1, 7);
+    expect(onChunk).toHaveBeenNthCalledWith(2, 14);
+  });
+
+  it('空流仍使用普通空流错误', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(streamResponse('data: [DONE]\n\n'));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const { callLLM } = await import('../../src/core/wiki/llm-client.js');
+    await expect(callLLM('test', config, undefined, { onChunk: () => {} })).rejects.toThrow(
+      'LLM returned empty streaming response',
+    );
   });
 });
 

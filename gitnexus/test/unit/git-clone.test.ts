@@ -26,10 +26,12 @@ import {
   buildGitEnv,
   normalizeGitUrlForCompare,
   assertRemoteMatchesRequestedUrl,
+  GITEA_TOKEN_HOSTS,
   isAzureDevOpsUrl,
   warnIfInsecureAzureConfig,
   runGitForTest,
   getRemoteOriginUrl as serverGetRemoteOriginUrl,
+  restoreGitNexusMetadata,
 } from '../../src/server/git-clone.js';
 import path from 'node:path';
 import os from 'node:os';
@@ -479,10 +481,28 @@ describe('git-clone', () => {
       expect(foreign.GIT_CONFIG_COUNT).toBe('1');
     });
 
+    it('injects the configured Gitea token only for the Gitea host', () => {
+      const previousToken = process.env.GITEA_TOKEN;
+      process.env.GITEA_TOKEN = 'gitea-secret';
+      try {
+        const allowed = buildGitEnv({}, { url: 'https://code.9ji.com/org/repo.git' });
+        // 官方在索引 0 固定注入 core.hooksPath，凭据头因此顺延到索引 1。
+        expect(allowed.GIT_CONFIG_COUNT).toBe('2');
+        expect(allowed.GIT_CONFIG_KEY_1).toBe('http.https://code.9ji.com/org/repo.git.extraHeader');
+        expect(allowed.GIT_CONFIG_VALUE_1).toContain('Basic ');
+        const thirdParty = buildGitEnv({}, { url: 'https://example.com/org/repo.git' });
+        expect(thirdParty.GIT_CONFIG_COUNT).toBe('1');
+        expect([...GITEA_TOKEN_HOSTS]).toEqual(['code.9ji.com']);
+      } finally {
+        if (previousToken === undefined) delete process.env.GITEA_TOKEN;
+        else process.env.GITEA_TOKEN = previousToken;
+      }
+    });
     it('does not inject a token for a non-github host (defense-in-depth host bind)', () => {
       const env = buildGitEnv({}, { token: 'ghp_secret123', url: 'https://gitlab.com/owner/repo' });
       expect(env.GIT_CONFIG_COUNT).toBe('1');
     });
+
 
     it('never includes the raw token value in any env entry', () => {
       // Defence-in-depth: token must only appear inside the base64 of the
@@ -1312,9 +1332,22 @@ describe('git-clone', () => {
       const remote = path.join(root, 'remote.git');
       const target = path.join(root, 'repo');
       const remoteUrl = 'git@github.com:team/repo.git';
-      const gitConfig = path.join(root, 'gitconfig');
-      const previousGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
-      const previousNoSystemConfig = process.env.GIT_CONFIG_NOSYSTEM;
+      // git 2.32 才引入 GIT_CONFIG_GLOBAL，本机 2.31 会静默忽略该项；
+      // 改用 buildGitEnv 同样依赖的 GIT_CONFIG_COUNT 协议（git ≥ 2.31）注入 insteadOf。
+      const managedConfigKeys = [
+        'GIT_CONFIG_COUNT',
+        'GIT_CONFIG_KEY_0',
+        'GIT_CONFIG_VALUE_0',
+        'GIT_CONFIG_KEY_1',
+        'GIT_CONFIG_VALUE_1',
+        'GIT_CONFIG_KEY_2',
+        'GIT_CONFIG_VALUE_2',
+        'GIT_CONFIG_KEY_3',
+        'GIT_CONFIG_VALUE_3',
+      ] as const;
+      const previousManagedConfig = managedConfigKeys.map(
+        (key) => [key, process.env[key]] as const,
+      );
 
       try {
         await runGit(['init', '--bare', remote], root);
@@ -1334,12 +1367,18 @@ describe('git-clone', () => {
         await runGit(['remote', 'add', 'origin', remoteFileUrl], source);
         await runGit(['push', 'origin', 'master', 'main'], source);
 
-        await fs.writeFile(
-          gitConfig,
-          `[protocol "file"]\n\tallow = always\n[url "${remoteFileUrl}"]\n\tinsteadOf = ${remoteUrl}\n\tinsteadOf = git@github.com.:team/repo.git\n`,
-        );
-        process.env.GIT_CONFIG_GLOBAL = gitConfig;
-        process.env.GIT_CONFIG_NOSYSTEM = '1';
+        Object.assign(process.env, {
+          GIT_CONFIG_COUNT: '4',
+          GIT_CONFIG_KEY_0: `url.${remoteFileUrl}.insteadOf`,
+          GIT_CONFIG_VALUE_0: remoteUrl,
+          GIT_CONFIG_KEY_1: `url.${remoteFileUrl}.insteadOf`,
+          GIT_CONFIG_VALUE_1: 'git@github.com.:team/repo.git',
+          GIT_CONFIG_KEY_2: 'protocol.file.allow',
+          GIT_CONFIG_VALUE_2: 'always',
+          // 隔离开发者全局配置里的 core.autocrlf，检出内容与提交内容一致。
+          GIT_CONFIG_KEY_3: 'core.autocrlf',
+          GIT_CONFIG_VALUE_3: 'false',
+        });
 
         await runGit(['clone', '--depth', '1', '--branch', 'master', remoteUrl, target], root);
         await expect(
@@ -1376,10 +1415,10 @@ describe('git-clone', () => {
           await runGit(['rev-parse', 'origin/main'], target),
         );
       } finally {
-        if (previousGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
-        else process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig;
-        if (previousNoSystemConfig === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
-        else process.env.GIT_CONFIG_NOSYSTEM = previousNoSystemConfig;
+        for (const [key, value] of previousManagedConfig) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
         await fs.rm(root, { recursive: true, force: true });
       }
     });
@@ -1917,6 +1956,56 @@ describe('git-clone', () => {
         await expect(promise).rejects.toThrow('timed out after 20ms');
       } finally {
         vi.useRealTimers();
+      }
+    });
+  });
+
+  describe('restoreGitNexusMetadata', () => {
+    it('restores the backup and removes it', async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-restore-'));
+      try {
+        const metadataDir = path.join(root, 'backup', '.gitnexus');
+        await fs.mkdir(metadataDir, { recursive: true });
+        await fs.writeFile(path.join(metadataDir, 'meta.json'), '{"ok":true}');
+        const targetDir = path.join(root, 'repo');
+        await fs.mkdir(targetDir, { recursive: true });
+
+        await restoreGitNexusMetadata(metadataDir, targetDir);
+
+        await expect(
+          fs.readFile(path.join(targetDir, '.gitnexus', 'meta.json'), 'utf8'),
+        ).resolves.toBe('{"ok":true}');
+        await expect(fs.access(path.dirname(metadataDir))).rejects.toThrow();
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it('retries once when a concurrent process recreates the destination (EEXIST)', async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-restore-race-'));
+      try {
+        const metadataDir = path.join(root, 'backup', '.gitnexus');
+        await fs.mkdir(metadataDir, { recursive: true });
+        await fs.writeFile(path.join(metadataDir, 'meta.json'), '{"ok":true}');
+        const targetDir = path.join(root, 'repo');
+        await fs.mkdir(targetDir, { recursive: true });
+
+        const eexist = Object.assign(new Error('EEXIST: file already exists, mkdir'), {
+          code: 'EEXIST',
+        });
+        const cpSpy = vi.spyOn(fs, 'cp').mockRejectedValueOnce(eexist);
+        try {
+          await restoreGitNexusMetadata(metadataDir, targetDir);
+        } finally {
+          cpSpy.mockRestore();
+        }
+
+        await expect(
+          fs.readFile(path.join(targetDir, '.gitnexus', 'meta.json'), 'utf8'),
+        ).resolves.toBe('{"ok":true}');
+        await expect(fs.access(path.dirname(metadataDir))).rejects.toThrow();
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
       }
     });
   });

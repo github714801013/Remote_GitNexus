@@ -61,6 +61,7 @@ export type AnalyzeResultIpc = Pick<
   | 'graphWriteCollapsed'
   | 'isPrimaryBranch'
   | 'storagePath'
+  | 'embeddingRepairDeferred'
 >;
 
 /**
@@ -88,5 +89,6 @@ export function projectAnalyzeResultForIpc(result: AnalyzeResult): AnalyzeResult
     // The storage the run wrote. A checkout's first analyze may create a
     // shared-store slot (#3352) the launcher's pre-run lookup could not see.
     storagePath: result.storagePath,
+    embeddingRepairDeferred: result.embeddingRepairDeferred,
   };
 }

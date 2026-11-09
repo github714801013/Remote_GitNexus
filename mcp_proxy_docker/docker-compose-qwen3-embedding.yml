@@ -1,0 +1,32 @@
+services:
+  qwen3-embedding-vllm:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+    container_name: qwen3-embedding-vllm
+    ports:
+      - '${QWEN3_EMBEDDING_PORT:-954}:8000'
+    volumes:
+      - ./models/Qwen3-Embedding-4B:/app/models/Qwen3-Embedding-4B:ro
+    environment:
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+      - TZ=Asia/Shanghai
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: >
+      --model /app/models/Qwen3-Embedding-4B
+      --served-model-name qwen3-embedding-4b
+      --task embed
+      --max-model-len 4096
+      --max-num-seqs 32
+      --max-num-batched-tokens 16384
+      --gpu-memory-utilization 0.85
+      --dtype float16
+      --enforce-eager
+      --trust-remote-code
+      --disable-log-requests
+      --port 8000
+    restart: always

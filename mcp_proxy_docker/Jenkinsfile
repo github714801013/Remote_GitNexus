@@ -1,0 +1,50 @@
+pipeline {
+    agent any
+
+    /*
+       注意：此流水线假设宿主机环境已配置 PROJECTS_ROOT 等环境变量。
+       如果是在 Linux 宿主机上运行，建议将变量写入 /etc/environment
+       或 Jenkins 节点的环境变量配置中。
+    */
+
+    stages {
+        stage('Checkout') {
+            steps {
+                // Jenkins 自动检出 GitNexus 源码及 mcp_proxy_docker 目录
+                checkout scm
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                dir('mcp_proxy_docker') {
+                    // 执行部署脚本
+                    sh 'chmod +x deploy.sh'
+                    sh './deploy.sh'
+                }
+            }
+        }
+
+        stage('Smoke Test') {
+            steps {
+                script {
+                    // 等待容器启动 (由远程部署执行后，此处可能是检查远程的健康状态)
+                    // 如果远程部署完成，通常不需要在 Jenkins 节点本地做测试
+                    // 但可以做远程探测
+                    sleep 5
+                    // 假设远程主机可访问，可通过环境变量配置健康检查地址
+                    // sh 'curl -f "$GITNEXUS_HEALTHCHECK_URL" || exit 1'
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Deployment successful! GitNexus MCP Proxy is running.'
+        }
+        failure {
+            echo 'Deployment failed. Check Jenkins console and remote logs.'
+        }
+    }
+}

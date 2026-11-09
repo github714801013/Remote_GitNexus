@@ -23,6 +23,7 @@ import {
   splitEmbeddingText,
   withoutOverlappingContext,
 } from './text-generator.js';
+import { getKeywordSummaryHashSalt } from './keyword-summary.js';
 import { chunkNode, characterChunk, type EmbeddingChunk } from './chunker.js';
 import { ensureAndParse } from './ast-utils.js';
 import { extractStructuralNames } from './structural-extractor.js';
@@ -156,6 +157,9 @@ export const contentHashForNode = (
   const hash = createHash('sha1')
     .update(version)
     .update(`\n${config.maxInputChars ?? DEFAULT_EMBEDDING_CONFIG.maxInputChars}\n`);
+  // 个性化：关键词摘要参与嵌入文本时，摘要变化必须触发重新嵌入。
+  hash.update(getKeywordSummaryHashSalt());
+  hash.update('\n');
   // Only a non-default model joins the hash, so default-model hashes stay unchanged.
   if (config.modelId !== undefined && config.modelId !== DEFAULT_EMBEDDING_CONFIG.modelId) {
     hash.update(`model:${config.modelId}\n`);

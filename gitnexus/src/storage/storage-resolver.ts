@@ -1,6 +1,7 @@
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
+import { isNeo4jBackendEnabled } from '../core/neo4j/config.js';
 import { stripWindowsLongPathPrefix } from '../lib/utils.js';
 import { getGlobalDir } from './global-dir.js';
 import {
@@ -570,10 +571,15 @@ export const inspectStoragePath = async (
     state = 'owned';
   }
 
+  // Neo4j 后端下代码索引存放在图数据库，存储目录不承载 LadybugDB 文件；
+  // 归属已确认（owned）的条目应视为具备可用代码索引，否则 Neo4j 部署的
+  // 注册表条目会被 listRegisteredRepos 等校验全部丢弃。
+  const usableCodeIndexDB = hasCodeIndexDB || (state === 'owned' && isNeo4jBackendEnabled());
+
   return {
     ...context,
     state,
-    hasCodeIndexDB,
+    hasCodeIndexDB: usableCodeIndexDB,
     reason: reason ?? transientDBReason,
   };
 };

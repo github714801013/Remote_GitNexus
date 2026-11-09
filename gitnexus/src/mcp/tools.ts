@@ -140,6 +140,8 @@ Returns a page of repositories — each with name, path, indexed date, last comm
 
 PAGINATION: Results are paginated so a large registry is not truncated by MCP/LLM token limits. "limit" sets the page size (default ${LIST_REPOS_DEFAULT_LIMIT}, max ${LIST_REPOS_MAX_LIMIT}; values above the max are rejected, not capped). "offset" selects the start. To enumerate EVERY repository: when pagination.hasMore is true, call list_repos again with offset set to pagination.nextOffset, and repeat until hasMore is false. Repositories are returned in a stable order, so paging never skips or duplicates an entry while the registry is unchanged.
 
+Set \"isAll\" to true to inspect index status for every indexed repository. This does not grant access to code tools or repository resources outside the current session scope.
+
 WHEN TO USE: First step when multiple repos are indexed, or to discover available repos.
 AFTER THIS: READ gitnexus://repo/{name}/context for the repo you want to work with.
 
@@ -165,6 +167,12 @@ specify the "repo" parameter explicitly.`,
           default: 0,
           minimum: 0,
         },
+        isAll: {
+          type: 'boolean',
+          description:
+            'When true, inspect index status for all repositories without widening other MCP permissions.',
+          default: false,
+        },
       },
       required: [],
     },
@@ -188,6 +196,10 @@ Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank
 
 ARRAY MODE: repo accepts 1-${QUERY_MAX_REPOSITORIES} names/paths without @ entries; checkout aliases deduplicate. Even one member returns { repos, processes, process_symbols, definitions, per_repo, partial }. Rows carry canonical-path _repo: join (_repo, process_id) and pass repo: "<row._repo>" to context. Chains inherit _repo. Local ranks merge under a global process limit and 20-definition cap. Errors, warnings, timing, content availability and staleness stay in per_repo; partial flags failed/degraded members. Arrays obey allowlists and work in read-only mode.
 
+REPOSITORY SCOPE: repo is optional. When omitted, query searches and aggregates all repositories in the current MCP authorization scope; it never widens the allowlist. Only query supports this cross-repository aggregation. Tools such as context, impact, and read_file remain single-repository operations.
+
+When zoekt is provided, Zoekt exact/regex/file-filter matches are fused into the same ranking.
+
 GROUP MODE: set "repo" to "@<groupName>" to search all member repos in that group (merged via RRF), or "@<groupName>/<groupRepoPath>" to run against a single member (same path keys as in group.yaml). If you use "@<groupName>" only, the member repo defaults to the lexicographically first key in group.yaml "repos". Prefer resources for contracts/status (see migration from legacy group_* tools).
 
 SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). When "repo" starts with "@", only processes whose symbols fall under that prefix are included. For a normal indexed repo name (no leading @), this field is currently ignored by the server.
@@ -204,6 +216,10 @@ ${HOT_READ_STALENESS_NOTE}`,
         search_query: {
           type: 'string',
           description: 'Natural language or keyword search query.',
+        },
+        zoekt: {
+          type: 'string',
+          description: 'Optional Zoekt query DSL for exact keywords, regular expressions, or file filters. When omitted, search_query is used for semantic/BM25 search.',
         },
         task_context: {
           type: 'string',
@@ -259,7 +275,7 @@ ${HOT_READ_STALENESS_NOTE}`,
           items: { type: 'string', minLength: 1 },
           minItems: 1,
           maxItems: QUERY_MAX_REPOSITORIES,
-          description: `Indexed repository name or path, or a list of 1-${QUERY_MAX_REPOSITORIES} names/paths. Array entries must not use @group routing. Scalar group mode remains "@<groupName>" / "@<groupName>/<memberPath>" (member path keys from group.yaml). ${CWD_AWARE_REPO_OMISSION}`,
+          description: `Indexed repository name or path, or a list of 1-${QUERY_MAX_REPOSITORIES} names/paths. Array entries must not use @group routing. Scalar group mode remains "@<groupName>" / "@<groupName>/<memberPath>" (member path keys from group.yaml). ${CWD_AWARE_REPO_OMISSION} Omit to search all repositories in the current MCP authorization scope; this does not bypass the allowlist.`,
         },
         service: {
           type: 'string',
@@ -1140,6 +1156,56 @@ Optional caseSensitive and literal match HTTP /api/grep (default: case-insensiti
       required: ['pattern'],
     },
   },
+  {
+    name: 'git_author_trace',
+    description: `Show git authorship for a concrete file line range.
+
+WHEN TO USE: After code location is known, identify who last changed the lines and which commits touched the range.`,
+    annotations: READ_ONLY_TOOL_ANNOTATIONS,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string', description: 'Source file path.' },
+        startLine: { type: 'integer', description: '1-based start line.', minimum: 1 },
+        endLine: { type: 'integer', description: '1-based end line.', minimum: 1 },
+        repo: { type: 'string', description: CWD_AWARE_REPO_OMISSION },
+      },
+      required: ['filePath', 'startLine'],
+    },
+  },
+  {
+    name: 'repo_changes',
+    description: `List the files changed between a caller-recorded baseline commit and a branch's indexed version.
+
+WHEN TO USE: Before reusing a cached understanding of a module, to learn whether the files it was built from have changed since — and what kind of change each one saw.
+
+The answer is computed from the local Git history, so a file that was modified and later reverted still counts as changed. Pass the \`current_commit\` recorded earlier as \`since\`, and the files the cached understanding depends on as \`paths\`. The end point is the branch's INDEXED version, not its live tip: read \`index_freshness\` to judge how old the answer is.
+
+Returns: \`state\` (ok/unknown), \`current_commit\`, \`index_freshness\`, \`files\` (path + change_type), \`truncated\`. \`state=ok\` with an empty \`files\` array means nothing changed; \`state=unknown\` carries a \`reason\` and OMITS \`files\` — never read that as "no changes".`,
+    annotations: READ_ONLY_TOOL_ANNOTATIONS,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'Repository name or path.' },
+        branch: {
+          type: 'string',
+          description: 'Branch whose indexed version is the end point of the query.',
+        },
+        since: {
+          type: 'string',
+          description:
+            'Baseline commit hash (full, or a short hash Git resolves unambiguously). ISO times, tags and branch names are not accepted.',
+        },
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Optional file or directory prefixes of interest, matched on path-segment boundaries. Omit for the whole repository.',
+        },
+      },
+      required: ['repo', 'branch', 'since'],
+    },
+  },
 ];
 
 /**
@@ -1211,6 +1277,7 @@ export const REPO_SCOPED_TOOLS = new Set([
   'api_impact',
   'trace',
   'refresh_index',
+  'git_author_trace',
 ]);
 
 for (const tool of [...GITNEXUS_TOOLS, REFRESH_INDEX_TOOL]) {

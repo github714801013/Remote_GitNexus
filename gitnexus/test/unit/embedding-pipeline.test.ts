@@ -6,6 +6,7 @@ import {
   resolveEmbeddingInstallPolicy,
 } from '../../src/core/embeddings/embedding-pipeline.js';
 import { generateEmbeddingText } from '../../src/core/embeddings/text-generator.js';
+import { getKeywordSummaryHashSalt } from '../../src/core/embeddings/keyword-summary.js';
 import type {
   EmbeddableNode,
   EmbeddingConfig,
@@ -159,8 +160,9 @@ describe('contentHashForNode', () => {
     expect(contentHashForNode(node, { chunkSize: 80 })).not.toBe(
       '1fbea03b8ce82ecef5674a8c3d00168ad4fec352',
     );
+    // 个性化：关键词摘要 salt 参与哈希，固定窗口指纹的期望值随之更新。
     expect(contentHashForNode(node, { chunkSize: 80, chunkStrategy: 'fixed' })).toBe(
-      '47b836f2d7f5ae1668fd8a8f98e91f5d4f60f483',
+      '9c3c922350b5c4f27107ecf60a9f318b1bfea1af',
     );
   });
 
@@ -182,8 +184,9 @@ describe('contentHashForNode', () => {
     expect(contentHashForNode(node, { chunkSize: 10000 }, source)).not.toBe(
       '5e404f884483e022751b285e3916ccff1e05e486',
     );
+    // 个性化：关键词摘要 salt 参与哈希，固定窗口指纹的期望值随之更新。
     expect(contentHashForNode(node, { chunkSize: 10000, chunkStrategy: 'fixed' }, source)).toBe(
-      'a99871a014df204483887e05bc5fabc9ad7d41b6',
+      '2e46bee1d097f514f610d661356caa0f4cf6d532',
     );
   });
 
@@ -221,6 +224,8 @@ describe('contentHashForNode', () => {
     const expected = createHash('sha1')
       .update(EMBEDDING_TEXT_VERSION)
       .update(`\n${DEFAULT_EMBEDDING_CONFIG.maxInputChars}\n`)
+      .update(getKeywordSummaryHashSalt())
+      .update('\n')
       .update(generateEmbeddingText(node, node.content))
       .digest('hex');
     expect(contentHashForNode(node)).toBe(expected);

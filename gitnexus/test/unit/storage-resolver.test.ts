@@ -7,6 +7,7 @@ import {
   ANALYZE_STORAGE_REQUIREMENTS,
   INDEX_FORCE_STORAGE_REQUIREMENTS,
   InvalidStoragePathError,
+  LIST_STORAGE_REQUIREMENTS,
   STORAGE_PATH_ENV,
   STORAGE_ROOT_ENV,
   requireDeletableStoragePath,
@@ -27,6 +28,7 @@ const temporaryPaths: string[] = [];
 const savedStoragePath = process.env[STORAGE_PATH_ENV];
 const savedStorageRoot = process.env[STORAGE_ROOT_ENV];
 const savedHome = process.env.GITNEXUS_HOME;
+const savedStorageBackend = process.env.GITNEXUS_STORAGE_BACKEND;
 
 const makeTempDir = async (prefix: string): Promise<string> => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -41,6 +43,8 @@ afterEach(async () => {
   else process.env[STORAGE_ROOT_ENV] = savedStorageRoot;
   if (savedHome === undefined) delete process.env.GITNEXUS_HOME;
   else process.env.GITNEXUS_HOME = savedHome;
+  if (savedStorageBackend === undefined) delete process.env.GITNEXUS_STORAGE_BACKEND;
+  else process.env.GITNEXUS_STORAGE_BACKEND = savedStorageBackend;
   await Promise.all(
     temporaryPaths.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })),
   );
@@ -363,5 +367,24 @@ describe('storage resolver', () => {
     await expect(
       requireDeletableStoragePath({ path: repo, storagePath: aliasedRepo }),
     ).rejects.toBeInstanceOf(StorageDeletionError);
+  });
+
+  it('treats an owned Neo4j-backed storage slot without a LadybugDB directory as usable', async () => {
+    const repo = await makeTempDir('gitnexus-storage-resolver-neo4j-repo-');
+    const storagePath = defaultStoragePath(repo);
+    await fs.mkdir(storagePath, { recursive: true });
+    await fs.writeFile(
+      path.join(storagePath, 'gitnexus.json'),
+      JSON.stringify({ repoPath: repo, storagePath }),
+    );
+    delete process.env[STORAGE_PATH_ENV];
+    delete process.env[STORAGE_ROOT_ENV];
+
+    await expect(requireStoragePath(repo, LIST_STORAGE_REQUIREMENTS)).rejects.toBeInstanceOf(
+      StorageRequirementError,
+    );
+
+    process.env.GITNEXUS_STORAGE_BACKEND = 'neo4j';
+    await expect(requireStoragePath(repo, LIST_STORAGE_REQUIREMENTS)).resolves.toBe(storagePath);
   });
 });

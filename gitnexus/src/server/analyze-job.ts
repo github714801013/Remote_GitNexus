@@ -92,6 +92,17 @@ const JOB_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 /** Delay before force-killing an unresponsive standalone child after cancellation. */
 const CANCEL_GRACE_MS = 60_000;
 
+/**
+ * 个性化：分析任务超时毫秒数。`GITNEXUS_ANALYZE_TIMEOUT_MS` 未设置或非法时
+ * 沿用官方默认 30 分钟；显式设为 0 表示不限制；正数按毫秒生效。
+ */
+function analyzeTimeoutMs(): number {
+  const raw = process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === '') return JOB_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : JOB_TIMEOUT_MS;
+}
+
 export class JobManager {
   private jobs = new Map<string, AnalyzeJob>();
   private children = new Map<string, ChildProcess>();
@@ -214,16 +225,20 @@ export class JobManager {
     const previousTimer = this.timeouts.get(jobId);
     if (previousTimer) clearTimeout(previousTimer);
 
+    // 个性化：超时可配置（默认 30 分钟；0 表示不限时）。
+    const timeoutMs = analyzeTimeoutMs();
+    if (timeoutMs <= 0) return;
+
     // One deadline covers preflight, graph preparation, continuation, and retries.
     const elapsed = Date.now() - (this.jobs.get(jobId)?.startedAt ?? Date.now());
     const timer = setTimeout(
       () => {
         const job = this.jobs.get(jobId);
         if (job && !this.isTerminal(job.status)) {
-          this.cancelJob(jobId, 'Analysis timed out (30 minute limit)');
+          this.cancelJob(jobId, `Analysis timed out (${Math.round(timeoutMs / 60_000)} minute limit)`);
         }
       },
-      Math.max(0, JOB_TIMEOUT_MS - elapsed),
+      Math.max(0, timeoutMs - elapsed),
     );
     this.timeouts.set(jobId, timer);
   }

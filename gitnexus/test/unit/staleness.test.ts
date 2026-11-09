@@ -11,6 +11,7 @@ import { execFileSync } from 'child_process';
 import {
   checkStaleness,
   checkStalenessAsync,
+  syncWithUpstream,
   type StalenessInfo,
 } from '../../src/core/git-staleness.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -36,6 +37,7 @@ describe('checkStaleness', () => {
     }
 
     const result = checkStaleness(process.cwd(), headCommit);
+    expect(result.status).toBe('current');
     expect(result.isStale).toBe(false);
     expect(result.commitsBehind).toBe(0);
     expect(result.hint).toBeUndefined();
@@ -56,19 +58,22 @@ describe('checkStaleness', () => {
     if (!previousCommit) return;
 
     const result = checkStaleness(process.cwd(), previousCommit);
+    expect(result.status).toBe('behind');
     expect(result.isStale).toBe(true);
     expect(result.commitsBehind).toBeGreaterThan(0);
     expect(result.hint).toContain('behind HEAD');
   });
 
-  it('fails open when git command fails (e.g., invalid path)', () => {
+  it('returns unknown when git command fails (e.g., invalid path)', () => {
     const result = checkStaleness('/nonexistent/path', 'abc123');
+    expect(result.status).toBe('unknown');
     expect(result.isStale).toBe(false);
     expect(result.commitsBehind).toBe(0);
   });
 
-  it('fails open with invalid commit hash', () => {
+  it('reports diverged (fail-open) for an invalid commit hash', () => {
     const result = checkStaleness(process.cwd(), 'not-a-real-commit-hash');
+    expect(result.status).toBe('diverged');
     expect(result.isStale).toBe(false);
     expect(result.commitsBehind).toBe(0);
   });
@@ -87,6 +92,7 @@ describe('checkStalenessAsync', () => {
     }
 
     const result = await checkStalenessAsync(process.cwd(), headCommit);
+    expect(result.status).toBe('current');
     expect(result.isStale).toBe(false);
     expect(result.commitsBehind).toBe(0);
     expect(result.hint).toBeUndefined();
@@ -106,19 +112,22 @@ describe('checkStalenessAsync', () => {
     if (!previousCommit) return;
 
     const result = await checkStalenessAsync(process.cwd(), previousCommit);
+    expect(result.status).toBe('behind');
     expect(result.isStale).toBe(true);
     expect(result.commitsBehind).toBeGreaterThan(0);
     expect(result.hint).toContain('behind HEAD');
   });
 
-  it('fails open when git command fails (e.g., invalid path)', async () => {
+  it('returns unknown when git command fails (e.g., invalid path)', async () => {
     const result = await checkStalenessAsync('/nonexistent/path', 'abc123');
+    expect(result.status).toBe('unknown');
     expect(result.isStale).toBe(false);
     expect(result.commitsBehind).toBe(0);
   });
 
-  it('fails open with invalid commit hash', async () => {
+  it('reports diverged (fail-open) for an invalid commit hash', async () => {
     const result = await checkStalenessAsync(process.cwd(), 'not-a-real-commit-hash');
+    expect(result.status).toBe('diverged');
     expect(result.isStale).toBe(false);
     expect(result.commitsBehind).toBe(0);
   });
@@ -387,4 +396,13 @@ describe('staleness when the checkout has regressed behind the indexed commit (#
       });
     });
   }
+});
+
+describe('syncWithUpstream', () => {
+  it('returns a structured fallback when upstream cannot be resolved', async () => {
+    const result = await syncWithUpstream('/nonexistent/path');
+    expect(result.checked).toBe(false);
+    expect(result.reset).toBe(false);
+    expect(result.reason).toBeTruthy();
+  });
 });

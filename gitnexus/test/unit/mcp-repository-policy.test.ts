@@ -67,6 +67,182 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
+describe('MCP request repository scope', () => {
+  const MAPPED_REPOS: RepoListing[] = [
+    { name: 'dev-oanew', path: '/repos/dev-oanew', indexedAt: '2026-01-01', lastCommit: '1'.repeat(40) },
+    { name: 'dev-oa-stock', path: '/repos/dev-oa-stock', indexedAt: '2026-01-02', lastCommit: '2'.repeat(40) },
+    { name: 'oanew', path: '/repos/oanew', indexedAt: '2026-01-03', lastCommit: '3'.repeat(40) },
+    { name: 'oa-stock', path: '/repos/oa-stock', indexedAt: '2026-01-04', lastCommit: '4'.repeat(40) },
+  ];
+
+  it('resolves dynamic project/environment candidates and tolerates a missing candidate', async () => {
+    const repos: RepoListing[] = [
+      {
+        name: 'jiuji-m',
+        path: '/repos/jiuji-m',
+        indexedAt: '2026-01-01',
+        lastCommit: '5'.repeat(40),
+      },
+      {
+        name: 'dev-oa-stock',
+        path: '/repos/dev-oa-stock',
+        indexedAt: '2026-01-02',
+        lastCommit: '6'.repeat(40),
+      },
+    ];
+    const backend = createBackend(repos);
+    const policy = await createMcpRepositoryPolicy(backend, {});
+
+    const scoped = policy.forRequestScope({ projects: ' JIUJI-M ', env: 'pro, dev' });
+
+    expect((await scoped.scopeBackend(backend).listRepos()).map((repo) => repo.name)).toEqual([
+      'jiuji-m',
+    ]);
+  });
+
+  it('uses the shared environment allowlist and maps iteng projects to iteng-prefixed repositories', async () => {
+    vi.stubEnv('GITNEXUS_WEBHOOK_ALLOWED_ENVS', 'dev,pro,iteng');
+    const backend = createBackend([
+      {
+        name: 'iteng-saasoanew',
+        path: '/repos/iteng-saasoanew',
+        indexedAt: '2026-01-01',
+        lastCommit: '7'.repeat(40),
+      },
+    ]);
+    const policy = await createMcpRepositoryPolicy(backend, {});
+
+    expect(
+      (await policy.forRequestScope({ projects: 'saasoanew', env: 'iteng' }).scopeBackend(backend).listRepos()).map(
+        (repo) => repo.name,
+      ),
+    ).toEqual(['iteng-saasoanew']);
+  });
+
+  it('rejects an environment that is not in the shared allowlist', async () => {
+    vi.stubEnv('GITNEXUS_WEBHOOK_ALLOWED_ENVS', 'dev,pro');
+    const policy = await createMcpRepositoryPolicy(createBackend(), {});
+
+    expect(() => policy.forRequestScope({ env: 'iteng' })).toThrow(
+      /unknown environment: iteng/i,
+    );
+  });
+
+  it('does not require projects when environment is provided', async () => {
+    const repos: RepoListing[] = [
+      {
+        name: 'jiuji-m',
+        path: '/repos/jiuji-m',
+        indexedAt: '2026-01-01',
+        lastCommit: '7'.repeat(40),
+      },
+      {
+        name: 'dev-jiuji-m',
+        path: '/repos/dev-jiuji-m',
+        indexedAt: '2026-01-02',
+        lastCommit: '8'.repeat(40),
+      },
+      {
+        name: 'other',
+        path: '/repos/other',
+        indexedAt: '2026-01-03',
+        lastCommit: '9'.repeat(40),
+      },
+    ];
+    const backend = createBackend(repos);
+    const policy = await createMcpRepositoryPolicy(backend, {});
+
+    expect(
+      (await policy.forRequestScope({ env: 'dev' }).scopeBackend(backend).listRepos()).map(
+        (repo) => repo.name,
+      ),
+    ).toEqual(['dev-jiuji-m']);
+  });
+
+  it('rejects a project when none of its generated candidates are indexed', async () => {
+    const backend = createBackend([
+      {
+        name: 'jiuji-m',
+        path: '/repos/jiuji-m',
+        indexedAt: '2026-01-01',
+        lastCommit: 'a'.repeat(40),
+      },
+    ]);
+    const policy = await createMcpRepositoryPolicy(backend, {});
+
+    expect(() =>
+      policy.forRequestScope({ projects: 'missing-project', env: 'dev,pro' }),
+    ).toThrow(/unknown project|no repositories match/i);
+  });
+
+  it('maps projects and env headers to the explicit repository matrix', async () => {
+    const policy = await createMcpRepositoryPolicy(createBackend(MAPPED_REPOS), {});
+
+    const scoped = policy.forRequestScope({ projects: ' OANEW, oa-stock ', env: ' DEV ' });
+
+    expect((await scoped.scopeBackend(createBackend(MAPPED_REPOS)).listRepos()).map((repo) => repo.name)).toEqual([
+      'dev-oanew',
+      'dev-oa-stock',
+    ]);
+  });
+
+  it('treats a missing header dimension as a wildcard and rejects invalid values', async () => {
+    const backend = createBackend(MAPPED_REPOS);
+    const policy = await createMcpRepositoryPolicy(backend, {});
+
+    expect(
+      (await policy.forRequestScope({ env: 'pro' }).scopeBackend(backend).listRepos()).map(
+        (repo) => repo.name,
+      ),
+    ).toEqual(['oanew', 'oa-stock']);
+    expect(
+      (await policy.forRequestScope({ projects: 'oa-stock' }).scopeBackend(backend).listRepos()).map(
+        (repo) => repo.name,
+      ),
+    ).toEqual(['dev-oa-stock', 'oa-stock']);
+
+    expect(() => policy.forRequestScope({ projects: 'unknown' })).toThrow(/unknown project/i);
+    expect(() => policy.forRequestScope({ env: 'staging' })).toThrow(/unknown environment/i);
+    expect(() => policy.forRequestScope({ projects: 'oanew,,oa-stock' })).toThrow(/empty/i);
+    expect(() => policy.forRequestScope({ projects: '*' })).toThrow(/invalid/i);
+  });
+
+  it('intersects request scope with the global allowlist and fails on an empty intersection', async () => {
+    const backend = createBackend(MAPPED_REPOS);
+    const policy = await createMcpRepositoryPolicy(backend, {
+      GITNEXUS_MCP_ALLOWED_REPOS: 'dev-oanew,oa-stock',
+    });
+
+    const scoped = policy.forRequestScope({ projects: 'oanew,oa-stock', env: 'pro' });
+    expect((await scoped.scopeBackend(backend).listRepos()).map((repo) => repo.name)).toEqual([
+      'oa-stock',
+    ]);
+
+    expect(() =>
+      policy.forRequestScope({ projects: 'oanew', env: 'pro' }),
+    ).toThrow(/no repositories match/i);
+  });
+
+  it('lets list_repos(isAll=true) inspect all index entries without widening tool scope', async () => {
+    const backend = createBackend(MAPPED_REPOS);
+    const policy = await createMcpRepositoryPolicy(backend, {});
+    const scoped = policy.forRequestScope({ env: 'pro' }).scopeBackend(backend);
+
+    const all = (await scoped.callTool('list_repos', { isAll: true })) as {
+      repositories: RepoListing[];
+    };
+    expect(all.repositories.map((repo) => repo.name)).toEqual([
+      'dev-oa-stock',
+      'dev-oanew',
+      'oa-stock',
+      'oanew',
+    ]);
+    await expect(scoped.callTool('query', { search_query: 'auth', repo: 'dev-oanew' })).rejects.toThrow(
+      /not available/i,
+    );
+  });
+});
+
 describe('MCP repository policy', () => {
   it('trims, resolves, and deduplicates configured repository specifiers', async () => {
     const backend = createBackend();
@@ -80,11 +256,12 @@ describe('MCP repository policy', () => {
     expect(repos.map((repo) => repo.name)).toEqual(['Alpha', 'Beta']);
 
     await scoped.callTool('query', { search_query: 'auth' });
-    expect(backend.callTool).toHaveBeenLastCalledWith('query', {
+    // 省略 repo 的 query 复用官方数组模式，一次调用传入去重后的授权仓库列表。
+    expect(backend.callTool).toHaveBeenCalledTimes(1);
+    expect(backend.callTool).toHaveBeenCalledWith('query', {
       search_query: 'auth',
-      repo: '/repos/alpha',
+      repo: ['/repos/alpha', '/repos/beta'],
     });
-
     await scoped.callTool('context', { name: 'auth', repo: ' beta ' });
     expect(backend.callTool).toHaveBeenLastCalledWith('context', {
       name: 'auth',
@@ -134,15 +311,23 @@ describe('MCP repository policy', () => {
     });
   });
 
-  it('requires an explicit repo when multiple repositories are allowed without a default', async () => {
+  it('allows query without repo to aggregate all allowed repositories', async () => {
     const backend = createBackend();
     const policy = await createMcpRepositoryPolicy(backend, {
       GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,Beta',
     });
-    await expect(
-      policy.scopeBackend(backend).callTool('query', { search_query: 'auth' }),
-    ).rejects.toThrow(/explicit repo.*multiple repositories are allowed/i);
-    expect(backend.callTool).not.toHaveBeenCalled();
+    const scoped = policy.scopeBackend(backend);
+
+    const result = await scoped.callTool('query', { search_query: 'auth' });
+    expect(backend.callTool).toHaveBeenCalledTimes(1);
+    expect(backend.callTool).toHaveBeenCalledWith('query', {
+      search_query: 'auth',
+      repo: ['/repos/alpha', '/repos/beta'],
+    });
+    expect(result).toMatchObject({
+      name: 'query',
+      args: { search_query: 'auth', repo: ['/repos/alpha', '/repos/beta'] },
+    });
   });
 
   it('aligns unrestricted schema with the refreshed snapshot when count and cache diverge', async () => {
@@ -173,9 +358,12 @@ describe('MCP repository policy', () => {
       readOnlyRequiresRepo: true,
       mutatingRequiresRepo: true,
     });
-    await expect(
-      policy.scopeBackend(backend).callTool('query', { search_query: 'auth' }),
-    ).rejects.toThrow(/explicit repo.*multiple repositories are allowed/i);
+    // 列表收缩后，省略 repo 的 query 仍按当前授权范围走官方数组模式。
+    await policy.scopeBackend(backend).callTool('query', { search_query: 'auth' });
+    expect(backend.callTool).toHaveBeenCalledWith('query', {
+      search_query: 'auth',
+      repo: ['/repos/alpha', '/repos/beta'],
+    });
   });
 
   it('fails startup when the default is outside the allowlist after canonical resolution', async () => {

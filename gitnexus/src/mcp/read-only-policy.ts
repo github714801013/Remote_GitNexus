@@ -21,6 +21,8 @@ export const MCP_READ_ONLY_TOOLS = new Set([
   'shape_check',
   'api_impact',
   'trace',
+  'git_author_trace',
+  'repo_changes',
 ]);
 
 const READ_ONLY_RENAME_SUMMARY =

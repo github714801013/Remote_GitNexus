@@ -582,6 +582,89 @@ describe('JobManager', () => {
     expect(controller.signal.aborted).toBe(true);
   });
 
+  it('auto-cancels a registered child after the default 30-minute limit when GITNEXUS_ANALYZE_TIMEOUT_MS is unset', () => {
+    vi.useFakeTimers();
+    manager.dispose();
+    manager = new JobManager();
+    const prevTimeout = process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+    delete process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+
+    try {
+      const job = manager.createJob({ repoUrl: 'https://github.com/user/repo' });
+      manager.updateJob(job.id, { status: 'analyzing' });
+      const child = new EventEmitter() as any;
+      child.kill = vi.fn();
+
+      manager.registerChild(job.id, child);
+      vi.advanceTimersByTime(30 * 60 * 1000 + 1);
+
+      expect(manager.hasPendingCancel(job.id)).toBe(true);
+      // 官方取消先走协作式关闭，宽限期结束后才 SIGKILL。
+      child.exitCode = null;
+      child.signalCode = null;
+      vi.advanceTimersByTime(60_000 + 1);
+      expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    } finally {
+      if (prevTimeout === undefined) delete process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+      else process.env.GITNEXUS_ANALYZE_TIMEOUT_MS = prevTimeout;
+      vi.useRealTimers();
+    }
+  });
+
+  it('auto-cancels a registered child once GITNEXUS_ANALYZE_TIMEOUT_MS elapses', () => {
+    vi.useFakeTimers();
+    manager.dispose();
+    manager = new JobManager();
+    const prevTimeout = process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+    process.env.GITNEXUS_ANALYZE_TIMEOUT_MS = '60000';
+
+    try {
+      const job = manager.createJob({ repoUrl: 'https://github.com/user/repo' });
+      manager.updateJob(job.id, { status: 'analyzing' });
+      const child = new EventEmitter() as any;
+      child.kill = vi.fn();
+
+      manager.registerChild(job.id, child);
+      vi.advanceTimersByTime(60_001);
+
+      expect(manager.hasPendingCancel(job.id)).toBe(true);
+      // 官方取消先走协作式关闭，宽限期结束后才 SIGKILL。
+      child.exitCode = null;
+      child.signalCode = null;
+      vi.advanceTimersByTime(60_000 + 1);
+      expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    } finally {
+      if (prevTimeout === undefined) delete process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+      else process.env.GITNEXUS_ANALYZE_TIMEOUT_MS = prevTimeout;
+      vi.useRealTimers();
+    }
+  });
+
+  it('dispose clears pending analysis timeouts', () => {
+    vi.useFakeTimers();
+    manager.dispose();
+    manager = new JobManager();
+    const prevTimeout = process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+    process.env.GITNEXUS_ANALYZE_TIMEOUT_MS = '60000';
+
+    try {
+      const job = manager.createJob({ repoUrl: 'https://github.com/user/repo' });
+      const child = new EventEmitter() as any;
+      child.kill = vi.fn();
+
+      manager.registerChild(job.id, child);
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+      manager.dispose();
+      // dispose 后仅剩取消宽限期计时器，分析超时计时器必须全部清除。
+      expect(vi.getTimerCount()).toBe(1);
+    } finally {
+      if (prevTimeout === undefined) delete process.env.GITNEXUS_ANALYZE_TIMEOUT_MS;
+      else process.env.GITNEXUS_ANALYZE_TIMEOUT_MS = prevTimeout;
+      vi.useRealTimers();
+    }
+  });
+
   it('cancelJob returns false for terminal jobs', () => {
     const job = manager.createJob({ repoUrl: 'https://github.com/user/repo' });
     manager.updateJob(job.id, { status: 'complete' });

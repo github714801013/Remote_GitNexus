@@ -67,6 +67,7 @@ import {
   type PreparedAnalysisHandoff,
 } from './analysis-phase-supervisor.js';
 import { reconcileGraphNodeIdentities } from './incremental/write-reconciliation.js';
+import type { Neo4jGraphLoadProgress } from './neo4j/graph-loader.js';
 import { resetDegradedParseCounter } from './tree-sitter/safe-parse.js';
 import {
   initLbug,
@@ -279,11 +280,18 @@ import {
 } from './parse-cache-identity.js';
 import {
   loadParseCache,
+  saveParseCache,
+  pruneCache,
   createColdParseRebuildDir,
   getColdParseRebuildDir,
   emptyParseCache,
   forgetCreatedParseCacheDir,
 } from '../storage/parse-cache.js';
+import {
+  getDurableParsedFileDir,
+  mergeStagedDurableParsedFileStore,
+  pruneAndSaveDurableParsedFileStore,
+} from '../storage/parsedfile-store.js';
 import {
   getCurrentCheckout,
   getRemoteUrl,
@@ -361,6 +369,7 @@ import {
   type RebuildReason,
   type RebuildReasonKey,
 } from './rebuild-reasons.js';
+import { isNeo4jBackendEnabled } from './neo4j/config.js';
 
 /**
  * Strip C0/C1 control characters from a progress/diagnostic message.
@@ -531,6 +540,12 @@ export interface AnalyzeOptions {
    * silently wipes existing embeddings when run without --embeddings).
    */
   dropEmbeddings?: boolean;
+  /**
+   * Defer Neo4j embedding repair to the long-lived server after structural
+   * finalization. Forked analyze workers must not own background repair work:
+   * they exit immediately after reporting completion.
+   */
+  deferEmbeddingRepair?: boolean;
   skipGit?: boolean;
   /** Skip AGENTS.md and CLAUDE.md gitnexus block updates. */
   skipAgentsMd?: boolean;
@@ -856,6 +871,8 @@ export interface AnalyzeResult {
    */
   graphWriteCollapsed?: { expected: number; persisted: number };
   ftsSkipped?: boolean;
+  /** True when a server worker deferred Neo4j embedding repair to its parent process. */
+  embeddingRepairDeferred?: boolean;
   /**
    * Why FTS was skipped, when `ftsSkipped` is true (#2658 review L2):
    * `extension-unavailable` (the LadybugDB FTS extension could not load — the
@@ -1031,11 +1048,48 @@ export const PHASE_LABELS: Record<string, string> = {
   communities: 'Detecting communities',
   processes: 'Detecting processes',
   complete: 'Pipeline complete',
+  neo4j: 'Loading into Neo4j',
   lbug: 'Loading into LadybugDB',
   fts: 'Creating search indexes',
   embeddings: 'Generating embeddings',
   done: 'Done',
 };
+
+const NEO4J_WRITE_START_PERCENT = 60;
+const NEO4J_WRITE_END_PERCENT = 90;
+
+function neo4jProgressPercent(event: Neo4jGraphLoadProgress, previousPercent: number): number {
+  const candidate = (() => {
+    switch (event.operation) {
+      case 'schema':
+        return 60;
+      case 'clear':
+        return 65;
+      case 'nodes':
+        return 68 + Math.floor(((event.completedItems / (event.totalItems ?? 1)) * 12));
+      case 'relationships':
+        return 80 + Math.floor(((event.completedItems / (event.totalItems ?? 1)) * 9));
+      case 'relinkEmbeddings':
+        return 89;
+    }
+  })();
+  return Math.min(NEO4J_WRITE_END_PERCENT, Math.max(previousPercent, candidate));
+}
+
+function neo4jProgressMessage(event: Neo4jGraphLoadProgress): string {
+  switch (event.operation) {
+    case 'schema':
+      return 'Applying Neo4j schema...';
+    case 'clear':
+      return `Clearing Neo4j ${event.label ?? 'graph'} data (${event.completedItems} nodes deleted)...`;
+    case 'nodes':
+      return `Writing Neo4j nodes ${event.completedItems}/${event.totalItems ?? '?'} (${event.label ?? 'unknown'})...`;
+    case 'relationships':
+      return `Writing Neo4j relationships ${event.completedItems}/${event.totalItems ?? '?'} (${event.relationshipType ?? 'unknown'})...`;
+    case 'relinkEmbeddings':
+      return 'Re-linking preserved Neo4j embeddings...';
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Main orchestrator
@@ -1101,6 +1155,33 @@ export const collectBranchCacheKeys = async (
     }
   }
   return { keys, complete };
+};
+
+const persistParseCaches = async (
+  storagePath: string,
+  metaDir: string,
+  parseCache: Awaited<ReturnType<typeof loadParseCache>>,
+  log: (message: string) => void,
+): Promise<void> => {
+  try {
+    const { keys: siblingKeys, complete } = await collectBranchCacheKeys(storagePath, metaDir);
+    if (complete) {
+      for (const key of siblingKeys) parseCache.usedKeys.add(key);
+    } else {
+      log('Parse cache: a branch meta was unreadable — retaining all cached chunks (#2106).');
+      for (const key of parseCache.entries.keys()) parseCache.usedKeys.add(key);
+    }
+    const pruned = pruneCache(parseCache, parseCache.usedKeys);
+    if (pruned > 0) log(`Parse cache: pruned ${pruned} stale chunk entries`);
+    const savedKeys = await saveParseCache(storagePath, parseCache);
+    await pruneAndSaveDurableParsedFileStore(
+      getDurableParsedFileDir(storagePath),
+      parseCache.identity.base,
+      new Set(savedKeys),
+    );
+  } catch (err) {
+    log(`Warning: could not save parse cache (${(err as Error).message}); continuing.`);
+  }
 };
 
 /**
@@ -2175,10 +2256,15 @@ async function runFullAnalysisInner(
   // set from the built graph below, so a prior run's size can't leak in.
   setBufferPoolSizeHint(undefined);
 
-  // Clean up stale KuzuDB files from before the LadybugDB migration.
-  const kuzuResult = await cleanupOldKuzuFiles(storagePath);
-  if (kuzuResult.found && kuzuResult.needsReindex) {
-    log('Migrating from KuzuDB to LadybugDB — rebuilding index...');
+  const neo4jBackendEnabled = isNeo4jBackendEnabled();
+
+  // Old Kuzu files belong to the retired local graph backend. Neo4j stores
+  // graph data remotely and must not inspect or mutate local database files.
+  if (!neo4jBackendEnabled) {
+    const kuzuResult = await cleanupOldKuzuFiles(storagePath);
+    if (kuzuResult.found && kuzuResult.needsReindex) {
+      log('Migrating from KuzuDB to LadybugDB — rebuilding index...');
+    }
   }
 
   // Keep gitnexus.json and the legacy meta.json mirror in sync. Use the
@@ -2267,6 +2353,22 @@ async function runFullAnalysisInner(
     });
   }
 
+  // Neo4j 后端：远端图非空时才能短路“已是最新”或执行 FTS 修复。
+  const projectNameInitial =
+    options.registryName ??
+    getInferredRepoName(repoPath) ??
+    path.basename(resolveRepoIdentityRoot(repoPath));
+
+  let canReturnAlreadyUpToDate = true;
+  if (neo4jBackendEnabled) {
+    try {
+      const { countRepoGraphNodes } = await import('./neo4j/graph-loader.js');
+      canReturnAlreadyUpToDate = (await countRepoGraphNodes(projectNameInitial)) > 0;
+    } catch {
+      canReturnAlreadyUpToDate = false;
+    }
+  }
+
   // ── FTS-only repair path ────────────────────────────────────────────
   const requestedRepairFts = Boolean(options.repairFts);
   if (
@@ -2283,6 +2385,45 @@ async function runFullAnalysisInner(
     options = { ...options, repairFts: false };
   }
   if (options.repairFts) {
+    if (neo4jBackendEnabled) {
+      // Neo4j 后端:FULLTEXT 索引在 analyze 期间由 schema 管理,坏索引(如创建时
+      // population 中断遗留部分仓库数据)不会因 `IF NOT EXISTS` 自动重建。
+      // 逐对 DROP + CREATE 触发全量 population(避免全部 DROP 后 CREATE 中途失败
+      // 导致索引全毁),随后 awaitIndexes 等待 population 完成再报成功。
+      if (!canReturnAlreadyUpToDate) {
+        throw new Error(
+          'Cannot repair FTS indexes because this repository has not been analyzed yet. ' +
+            'Run `gitnexus analyze` first to create the initial index, then retry `--repair-fts`.',
+        );
+      }
+      const { getNeo4jSchemaStatements } = await import('./neo4j/schema.js');
+      const { withNeo4jSession } = await import('./neo4j/driver.js');
+      const fulltextStatements = getNeo4jSchemaStatements().indexes.filter((statement) =>
+        statement.includes('CREATE FULLTEXT INDEX'),
+      );
+      await withNeo4jSession(async (session) => {
+        for (const statement of fulltextStatements) {
+          const match = /CREATE FULLTEXT INDEX (\S+)/.exec(statement);
+          if (!match) continue;
+          await session.executeWrite(async (tx) => tx.run(`DROP INDEX ${match[1]} IF EXISTS`));
+          await session.executeWrite(async (tx) => tx.run(statement));
+        }
+        await session.executeWrite(async (tx) => tx.run('CALL db.awaitIndexes()'));
+      });
+      progress('fts', 90, 'Neo4j fulltext indexes rebuilt');
+      progress('done', 100, 'Done');
+      return {
+        repoName:
+          options.registryName ??
+          getInferredRepoName(repoPath) ??
+          path.basename(resolveRepoIdentityRoot(repoPath)),
+        repoPath,
+        storagePath,
+        stats: existingMeta?.stats ?? {},
+        ftsRepairedOnly: true,
+        rebuildReasons: collector.keys(),
+      };
+    }
     if (!existingMeta) {
       throw new Error(
         'Cannot repair FTS indexes because this repository has not been analyzed yet. ' +
@@ -3122,6 +3263,7 @@ async function runFullAnalysisInner(
     JSON.stringify(existingMeta?.indexCoverage?.includeDotDirs ?? []) !==
     JSON.stringify(getIncludeDotDirs());
   if (
+    canReturnAlreadyUpToDate &&
     existingMeta &&
     (!existingMeta.embeddingCheckpoint ||
       (options.graphPublication &&
@@ -3455,7 +3597,8 @@ async function runFullAnalysisInner(
   // moved (or removed) the crashed run's WAL/shadow; when neither was
   // possible the dirty block above already threw a LbugWipeError, so this
   // open is replay-free by construction (FIX 1 of this shipping review).
-  if (shouldLoadCache && existingMeta) {
+  // Neo4j 后端不读写本地图文件，跳过本地缓存加载与旧向量导出。
+  if (!neo4jBackendEnabled && shouldLoadCache && existingMeta) {
     if (
       options.graphPublication &&
       !options.dropEmbeddings &&
@@ -3739,6 +3882,173 @@ async function runFullAnalysisInner(
         `(parser ${parseCache.identity.base.slice(0, 19)}). ` +
         `Parser compatibility is derived automatically from the installed artifacts.`,
     );
+  }
+
+  if (neo4jBackendEnabled) {
+    const { runNeo4jEmbeddingRepair } = await import('../server/search.js');
+    const { countEmbeddings } = await import('./neo4j/embedding-adapter.js');
+    const { loadGraphToNeo4j } = await import('./neo4j/graph-loader.js');
+    const existingNeo4jEmbeddingCount = await countEmbeddings(projectNameInitial).catch(() => 0);
+
+    progress('neo4j', 60, 'Applying Neo4j schema...');
+    let lastNeo4jPercent = 60;
+    const reportNeo4jProgress = (event: Neo4jGraphLoadProgress) => {
+      const percent = neo4jProgressPercent(event, lastNeo4jPercent);
+      lastNeo4jPercent = percent;
+      progress('neo4j', percent, neo4jProgressMessage(event));
+    };
+    const graphStats = await loadGraphToNeo4j(projectNameInitial, pipelineResult.graph, {
+      preserveEmbeddings: !options.dropEmbeddings,
+      onProgress: reportNeo4jProgress,
+    });
+    progress('neo4j', 90, 'Neo4j graph write complete.');
+
+    const { skipForCap, nodeLimit } = deriveEmbeddingCap(
+      graphStats.nodes,
+      options.embeddingsNodeLimit,
+    );
+    const shouldRepairEmbeddings =
+      !options.dropEmbeddings &&
+      (shouldGenerateEmbeddings ||
+        existingNeo4jEmbeddingCount > 0 ||
+        (existingMeta?.stats?.embeddings ?? 0) > 0);
+    let embeddingCount = await countEmbeddings(projectNameInitial);
+
+    if (shouldRepairEmbeddings && !skipForCap && !options.deferEmbeddingRepair) {
+      progress('embeddings', 90, 'Connecting to embedding endpoint...');
+      await runNeo4jEmbeddingRepair(
+        projectNameInitial,
+        (embeddingProgress) => {
+          const scaled = 90 + Math.round((embeddingProgress.percent / 100) * 8);
+          const detail =
+            embeddingProgress.nodesProcessed !== undefined
+              ? `Embedding ${embeddingProgress.nodesProcessed}/${embeddingProgress.totalNodes ?? '?'}`
+              : embeddingProgress.phase;
+          progress('embeddings', scaled, detail);
+        },
+        repoPath,
+      );
+      embeddingCount = await countEmbeddings(projectNameInitial);
+    } else if (shouldRepairEmbeddings && !skipForCap && options.deferEmbeddingRepair) {
+      log('Neo4j embedding repair deferred until server-side analysis finalization.');
+    } else if (shouldRepairEmbeddings && skipForCap) {
+      log(
+        `Embeddings skipped: ${graphStats.nodes.toLocaleString()} nodes exceeds the ${nodeLimit.toLocaleString()}-node safety cap.`,
+      );
+    }
+
+    const allFilePaths: string[] = [];
+    pipelineResult.graph.forEachNode((node) => {
+      if (node.label === 'File') {
+        const filePath = node.properties?.filePath as string | undefined;
+        if (filePath) allFilePaths.push(filePath);
+      }
+    });
+    const newFileHashes = await computeFileHashes(repoPath, allFilePaths);
+    const newFileHashesRecord: Record<string, string> = {};
+    for (const [key, value] of newFileHashes) newFileHashesRecord[key] = value;
+    const runtimeCapabilities = await import('./platform/capabilities.js').then((m) =>
+      m.getRuntimeCapabilities(),
+    );
+    const meta: RepoMeta = {
+      repoPath,
+      storagePath,
+      lastCommit: currentCommit,
+      indexedAt: new Date().toISOString(),
+      branch: branchLabel ?? existingMeta?.branch,
+      remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+      stats: {
+        files: pipelineResult.totalFileCount,
+        nodes: graphStats.nodes,
+        edges: graphStats.edges,
+        communities: pipelineResult.communityResult?.stats.totalCommunities,
+        processes: pipelineResult.processResult?.stats.totalProcesses,
+        embeddings: embeddingCount,
+      },
+      capabilities: {
+        graph: { provider: 'neo4j', status: 'available' as const },
+        fts: { provider: 'neo4j-fulltext', status: 'available' },
+        vectorSearch: {
+          provider: 'neo4j-vector',
+          status: embeddingCount > 0 ? 'vector-index' : 'unavailable',
+          exactScanLimit: runtimeCapabilities.exactScanLimit,
+        },
+      },
+      runnerIdentity,
+      cjkSegmentation: getSearchFTSCjkSegmentation(),
+      fileHashes: hasGitDir(repoPath) ? newFileHashesRecord : undefined,
+      cacheKeys: [...parseCache.usedKeys],
+      incrementalInProgress: undefined as { startedAt: number; toWriteCount: number } | undefined,
+      pdg: resolvePdgConfig(options),
+    };
+
+    progress('done', 98, 'Saving metadata...');
+    await saveMeta(metaDir, meta);
+    await persistParseCaches(storagePath, metaDir, parseCache, log);
+    const projectName = await registerRepo(repoPath, meta, {
+      name: options.registryName,
+      allowDuplicateName: options.allowDuplicateName,
+      branch: placement.branch,
+    });
+    if (!placement.branch && branchLabel) {
+      try {
+        await adoptFlatBranchLabel(repoPath, branchLabel);
+      } catch (err) {
+        log(
+          `Warning: could not sync the workspace branch label (${(err as Error).message}); continuing.`,
+        );
+      }
+    }
+    await ensureGitNexusIgnored(repoPath);
+
+    let aggregatedClusterCount = 0;
+    if (pipelineResult.communityResult?.communities) {
+      const groups = new Map<string, number>();
+      for (const community of pipelineResult.communityResult.communities) {
+        const label = community.heuristicLabel || community.label || 'Unknown';
+        groups.set(label, (groups.get(label) || 0) + community.symbolCount);
+      }
+      aggregatedClusterCount = Array.from(groups.values()).filter((count) => count >= 5).length;
+    }
+    if (!placement.branch) {
+      try {
+        await generateAIContextFiles(
+          repoPath,
+          storagePath,
+          projectName,
+          {
+            files: pipelineResult.totalFileCount,
+            nodes: graphStats.nodes,
+            edges: graphStats.edges,
+            communities: pipelineResult.communityResult?.stats.totalCommunities,
+            clusters: aggregatedClusterCount,
+            processes: pipelineResult.processResult?.stats.totalProcesses,
+          },
+          undefined,
+          {
+            skipAgentsMd: options.skipAgentsMd,
+            skipSkills: options.skipSkills,
+            noStats: options.noStats,
+            defaultBranch: options.defaultBranch,
+            hasPdg: options.pdg === true,
+          },
+        );
+      } catch {
+        // AI context files are best-effort and must not invalidate the Neo4j index.
+      }
+    }
+
+    progress('done', 100, 'Done');
+    return {
+      repoName: projectName,
+      repoPath,
+      storagePath,
+      stats: meta.stats,
+      rebuildReasons: collector.keys(),
+      pipelineResult,
+      embeddingRepairDeferred: shouldRepairEmbeddings && !skipForCap && options.deferEmbeddingRepair,
+      isPrimaryBranch: !placement.branch,
+    };
   }
 
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────
