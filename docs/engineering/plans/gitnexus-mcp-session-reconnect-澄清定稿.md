@@ -4,6 +4,7 @@
 - 工作区：`D:\workplace\typescript\GitNexus`
 - 分支：`xiexiongkun/source-customization-v1.6.13-rc.182`
 - 依据：用户原始选择 `B+C(优化dev-spec-gen的技能,提示要用新的session-id来重试)`；grill-with-docs 第 1–3 轮确认（Q1–Q7）。
+- 2026-11-09 调整（task_tune）：允许复用 session-id，服务端在重新 initialize 时自动按原 id 重建会话，见 §9。
 - 配套产物：`gitnexus-mcp-session-reconnect-验收条件与必测场景清单.md`、`gitnexus-mcp-session-reconnect-测试数据.md`。
 
 ## 1. 背景与根因
@@ -34,7 +35,7 @@
 ### 2.3 不在范围
 
 - 修改 QODER_CLI / 执行器客户端代码（不可达，改由技能规则兜底）。
-- 方案 A：服务端对 `initialize` 忽略未知 session-id（需 SDK 兼容性评估，本次不做）。
+- 方案 A：服务端对 `initialize` 忽略未知 session-id（2026-11-09 task_tune 已实现为“复用旧 id 并重建会话”，见 §9；非 initialize 请求仍返回 404）。
 - 会话跨重启持久化、运维重启执行器等缓解措施。
 - 任何数据库、接口字段、缓存键、消息体或文件格式变更。
 
@@ -57,10 +58,11 @@
 
 1. **触发条件**：MCP 工具返回 `-32001 Session not found. Re-initialize.`（HTTP 404）。该错误表示服务端已丢弃该会话，继续携带同一 `mcp-session-id` 重试必然失败。
 2. **可控制会话的运行时**：
-   - 丢弃当前 `mcp-session-id`；
-   - 发起新的 `initialize`（请求不得携带旧 `mcp-session-id`），从响应头 `mcp-session-id` 取得新会话 id；
-   - 用新 id 重试原请求；
-   - 该重试计入现有「最多重试 3 次」上限；第 2、3 次重试前同样必须重新初始化并换用新 id，不得复用上一次的 id。
+   - 可复用当前 `mcp-session-id` 重新 `initialize`：服务端会为该未知 id 在后台自动重建会话，响应头返回同一 id；
+   - 也可丢弃当前 id、不带 `mcp-session-id` 重新 `initialize`，从响应头取得新 id；
+   - 以响应头 `mcp-session-id` 为准重试原请求；
+   - 非 initialize 请求不得直接携带旧 id 重试（服务端仍返回 404 `-32001`）；
+   - 该重试计入现有「最多重试 3 次」上限；第 2、3 次重试前同样必须重新初始化。
 3. **不可控制会话的运行时**（Agent 无法设置/重置 `mcp-session-id`）：不得继续原样退避重试；停止当前调用，明确报告「MCP 会话已失效，需重建」，并说明已尝试次数与恢复建议（重启执行器 / 重开对话 / 等待服务恢复），随后按当前节点既有失败处理继续。
 4. **禁止**：把 `-32001` 当作普通「服务错误」放进 1s/2s/4s 退避桶；在未更换 session-id 的情况下重复重试。
 5. **一致性的既有规则**：普通超时、连接失败、授权/能力错误仍按 1s、2s、4s 指数退避最多 3 次，行为不变。
@@ -70,20 +72,21 @@
 1. `/mcp` 未知会话分支与 `/sse` 未知会话分支各记录一条 `warn`。
 2. 日志字段：`method`（HTTP 方法）、`path`（请求路径）、`sessionId`（仅前 8 位，如 `550e8400`）。
 3. 消息文本需能直接检索到「session not found / re-initialize」语义。
-4. HTTP 响应体、状态码、JSON-RPC 错误码与消息保持原样，不得改变客户端可观察契约。
+4. 非 initialize 请求的 404 分支：HTTP 响应体、状态码、JSON-RPC 错误码与消息保持原样，不得改变客户端可观察契约。
 5. 已知会话的正常请求、401/400 等其它分支不得新增该 warn。
+6. 2026-11-09 调整后，未知 id 的 `initialize` 请求不再进入 404 分支，改记 `info`「MCP session regenerated for reused session id」，字段同 warn（`method`、`path`、`sessionId` 前 8 位）；非 initialize 的未知 id 请求仍走原 404 `warn`。
 
 ## 6. 数据流向与变动
 
 **数据流**
 
-- 规则 C：Agent → MCP 运行时（持有 `mcp-session-id`）→ `remote_gitnexus` `/api/mcp` → 服务端会话 Map → 404 `-32001` → 运行时重建会话（或停止上报）。
+- 规则 C：Agent → MCP 运行时（持有 `mcp-session-id`）→ `remote_gitnexus` `/api/mcp` → 服务端会话 Map → 404 `-32001` → 运行时重新 initialize → 服务端按旧 id 重建会话（或换新 id；不可控运行时停止上报）。
 - 日志 B：HTTP 请求 → `http-transport` 未知会话分支 → `logger.warn` → stdout。
 
 **变动清单**
 
 - 日志输出：无 → 新增 `warn`（`method`、`path`、`sessionId` 前 8 位），仅输出到 stdout。
-- 会话 id：运行时内存状态，不入库、不落盘；本次不改变其生命周期与 TTL。
+- 会话 id：运行时内存状态，不入库、不落盘；2026-11-09 调整新增“未知 id 的 initialize 按同一 id 重建会话”，TTL 与并发上限不变。
 - 表/字段、接口出入参、缓存键、消息体、文件格式：无变化。
 
 **判定**：本次不涉及持久化数据变动。依据：不读写数据库、缓存或业务配置行；不改变任何接口出入参与响应契约；新增内容仅为 stdout 日志与技能提示文本。
@@ -112,3 +115,23 @@
 2. **技能文件在工作区外**：技能改动无法进入 `task_files` / `output_files`，只能以 evidence 记录，show-me 的 git diff 不会显示；需在交付说明中显式列出。
 3. **规则三处同步**：任何一处遗漏都会产生冲突；验收清单包含一致性检查项。
 4. **日志无法覆盖客户端本地决策**：服务端只能记录到达服务端的 404；客户端是否重连仍需运行时自身日志。
+
+## 9. 调整记录：允许复用 session-id（2026-11-09，task_tune）
+
+### 9.1 调整内容
+
+- 服务端 `createStreamableHttpHandler`：未知/过期 `mcp-session-id` 若出现在 `initialize` 请求上，不再返回 404；按该 id 重建会话（`sessionIdGenerator` 返回旧 id），响应头返回同一 id，客户端可继续复用。
+- 非 initialize 请求携带未知 id 仍返回 404 `-32001`：没有 initialize 握手时无法安全重建会话。
+- `/sse` + `/messages`（旧 SSE）保持原 404：SSE 会话由 `GET /sse` 服务端生成，POST 无握手可重建，属有意差异。
+- 同步 5 处技能规则文本：允许复用旧 id 重新 initialize，也允许换新 id；非 initialize 重试仍禁止直接携带旧 id。
+- 新增 info 日志 `MCP session regenerated for reused session id`（`method`、`path`、`sessionId` 前 8 位）。
+
+### 9.2 证据
+
+- 生产实现：`gitnexus/src/mcp/http-transport.ts`（`/mcp` 与共享 `/api/mcp` 唯一实现）。
+- 单测：`gitnexus/test/unit/mcp-http-transport.test.ts` 新增“复用旧 id 重建会话”“非 initialize 未知 id 仍 404”两个用例；`./node_modules/.bin/vitest run test/unit/mcp-http-transport.test.ts` 51 项通过。
+- 影响分析：GitNexus CLI `impact` 返回 `UNKNOWN`（索引落后 1032 commits、遍历降级），调用方由文本检索确认：`http-transport.ts` 的 `startMcpHttpServer` 与 `server/mcp-http.ts` 的 `mountMCPEndpoints`。
+
+### 9.3 边界
+
+- 仅 `initialize` 请求可触发自动重建；非 initialize 的未知 id 请求仍按原协议返回 404，客户端需重新初始化后再重试。

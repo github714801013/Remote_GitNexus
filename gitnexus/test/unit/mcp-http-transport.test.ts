@@ -681,6 +681,107 @@ describe('createStreamableHttpHandler', () => {
     expect(res._status).toBe(400);
     await cleanup();
   });
+
+  it('keeps the 404 for a non-initialize request carrying an unknown session id', async () => {
+    const cap = _captureLogger();
+    try {
+      const backend = createMockBackend();
+      const { handler, cleanup } = createStreamableHttpHandler(backend as never);
+      const req = {
+        headers: { 'mcp-session-id': 'non-existent-session-id' },
+        method: 'POST',
+        path: '/mcp',
+        body: { jsonrpc: '2.0', method: 'tools/list', id: 2, params: {} },
+      } as unknown as Request;
+      const res = createMockRes();
+
+      await handler(req, res);
+
+      expect(res._status).toBe(404);
+      expect(res._body).toMatchObject({
+        jsonrpc: '2.0',
+        error: { code: -32001, message: 'Session not found. Re-initialize.' },
+      });
+      expect(
+        cap.records().filter((record) => record.msg === 'MCP session not found; client must re-initialize'),
+      ).toHaveLength(1);
+
+      await cleanup();
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('regenerates the session under an expired session id when the client re-initializes', async () => {
+    const backend = createMockBackend();
+    // First server instance creates a session, then drops it — simulates a restart
+    // or TTL eviction on the next instance.
+    const first = createStreamableHttpHandler(backend as never);
+    const firstApp = express();
+    firstApp.use(express.json());
+    firstApp.all('/mcp', (req, res) => void first.handler(req, res).catch(() => {}));
+    const firstServer = await listen(firstApp);
+    const initialized = await request(
+      firstServer.port,
+      'POST',
+      '/mcp',
+      { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+      JSON.stringify(validInitialize()),
+    );
+    const sessionId = String(initialized.headers['mcp-session-id']);
+    expect(initialized.status).toBe(200);
+    await firstServer.close();
+    await first.cleanup();
+
+    const second = createStreamableHttpHandler(backend as never);
+    const secondApp = express();
+    secondApp.use(express.json());
+    secondApp.all('/mcp', (req, res) => void second.handler(req, res).catch(() => {}));
+    const secondServer = await listen(secondApp);
+    const cap = _captureLogger();
+    try {
+      const reinitialized = await request(
+        secondServer.port,
+        'POST',
+        '/mcp',
+        {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          'mcp-session-id': sessionId,
+        },
+        JSON.stringify(validInitialize(2)),
+      );
+      expect(reinitialized.status).toBe(200);
+      expect(reinitialized.headers['mcp-session-id']).toBe(sessionId);
+
+      const followUp = await request(
+        secondServer.port,
+        'POST',
+        '/mcp',
+        {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          'mcp-session-id': sessionId,
+        },
+        JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', id: 3, params: {} }),
+      );
+      expect(followUp.status).toBe(200);
+
+      expect(cap.records()).toContainEqual(
+        expect.objectContaining({
+          level: 30, // pino info level
+          method: 'POST',
+          path: '/mcp',
+          sessionId: sessionId.slice(0, 8),
+          msg: 'MCP session regenerated for reused session id',
+        }),
+      );
+    } finally {
+      cap.restore();
+      await secondServer.close();
+      await second.cleanup();
+    }
+  });
 });
 
 // ─── createSseHandlers ────────────────────────────────────────────────

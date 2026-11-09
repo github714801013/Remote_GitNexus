@@ -288,8 +288,22 @@ export function createStreamableHttpHandler(
       const session = sessions.get(sessionId)!;
       session.lastActivity = Date.now();
       await session.transport.handleRequest(req, res, req.body);
-    } else if (sessionId) {
-      // Unknown / expired session ID — tell the client to re-initialize (per MCP spec).
+      return;
+    }
+
+    // Recognize initialize before rejecting an unknown ID: a client reconnecting
+    // after a restart or TTL eviction may re-initialize while still carrying its
+    // old `mcp-session-id`. The SDK assigns the ID only during initialize, so this
+    // is the one request that can transparently regenerate the session.
+    // Use the SDK's isInitializeRequest so a single-element JSON-RPC batch is
+    // recognised too, rather than a brittle `body.method === 'initialize'` check.
+    const body = req.body as unknown;
+    const messages = Array.isArray(body) ? body : [body];
+    const isInitialize = req.method === 'POST' && messages.some(isInitializeRequest);
+
+    if (sessionId && !isInitialize) {
+      // Unknown / expired session ID on a non-initialize request — there is no
+      // handshake to rebuild from, so tell the client to re-initialize (per MCP spec).
       logger.warn(
         { method: req.method, path: req.path, sessionId: sessionId.slice(0, 8) },
         'MCP session not found; client must re-initialize',
@@ -299,80 +313,83 @@ export function createStreamableHttpHandler(
         error: { code: -32001, message: 'Session not found. Re-initialize.' },
         id: null,
       });
-    } else if (req.method === 'POST') {
-      // No session ID — new client. Only accept initialize requests to avoid
-      // orphaned Server instances that can never be reclaimed by the TTL sweep.
-      // Use the SDK's isInitializeRequest so a single-element JSON-RPC batch is
-      // recognised too, rather than a brittle `body.method === 'initialize'` check.
-      const body = req.body as unknown;
-      const messages = Array.isArray(body) ? body : [body];
-      if (!messages.some(isInitializeRequest)) {
-        res.status(400).json({
-          jsonrpc: '2.0',
-          error: {
-            code: -32000,
-            message: 'First request must be initialize. No session ID provided.',
-          },
-          id: null,
-        });
-        return;
-      }
+      return;
+    }
 
-      // Reject when the session cap is reached — prevents memory exhaustion via
-      // an initialize flood (each session holds a live Server + Transport).
-      if (sessions.size >= MAX_SESSIONS) {
-        res.status(503).json({
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Server at session capacity. Try again later.' },
-          id: null,
-        });
-        return;
-      }
-
-      // Resolve and bind the request scope before allocating the transport or Server.
-      // A malformed or empty request scope must fail initialization without leaving
-      // an orphaned session object behind.
-      const sessionPolicy = (await getRepositoryPolicy()).forRequestScope({
-        projects: req.headers.projects,
-        env: req.headers.env,
-      });
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-        // Answer POST requests with a single JSON body instead of an SSE stream:
-        // JSON-only clients (e.g. the AutoWonder executor) cannot parse SSE.
-        enableJsonResponse: true,
-        ...dnsRebinding,
-      });
-      const server = opts.createServer
-        ? opts.createServer(sessionPolicy)
-        : createMCPServer(backend, {
-            repositoryPolicy: sessionPolicy,
-            refreshIndex: opts.refreshIndex,
-          });
-      await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-
-      if (transport.sessionId) {
-        sessions.set(transport.sessionId, { server, transport, lastActivity: Date.now() });
-        const sid = transport.sessionId;
-        transport.onclose = () => {
-          sessions.delete(sid);
-        };
-      } else {
-        // The SDK rejected this request (e.g. 406 on a missing/invalid Accept header,
-        // 415 on a bad Content-Type) before assigning a session id. The Server was
-        // already connected but will never be stored, so the TTL sweep and cleanup()
-        // can't reclaim it — close it now to avoid an orphaned-Server leak.
-        try {
-          await server.close();
-        } catch {}
-      }
-    } else {
+    if (!isInitialize) {
       res.status(400).json({
         jsonrpc: '2.0',
-        error: { code: -32000, message: 'No valid session. Send a POST to initialize.' },
+        error: {
+          code: -32000,
+          message:
+            req.method === 'POST'
+              ? 'First request must be initialize. No session ID provided.'
+              : 'No valid session. Send a POST to initialize.',
+        },
         id: null,
       });
+      return;
+    }
+
+    // New client, or a client re-initializing after its session expired. Reuse the
+    // client's ID when it supplied one so its retry can stay on the same ID;
+    // otherwise generate a fresh one. Only initialize requests can reach here, so
+    // the session is always rebuilt around a real handshake.
+    if (sessionId) {
+      logger.info(
+        { method: req.method, path: req.path, sessionId: sessionId.slice(0, 8) },
+        'MCP session regenerated for reused session id',
+      );
+    }
+
+    // Reject when the session cap is reached — prevents memory exhaustion via
+    // an initialize flood (each session holds a live Server + Transport).
+    if (sessions.size >= MAX_SESSIONS) {
+      res.status(503).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Server at session capacity. Try again later.' },
+        id: null,
+      });
+      return;
+    }
+
+    // Resolve and bind the request scope before allocating the transport or Server.
+    // A malformed or empty request scope must fail initialization without leaving
+    // an orphaned session object behind.
+    const sessionPolicy = (await getRepositoryPolicy()).forRequestScope({
+      projects: req.headers.projects,
+      env: req.headers.env,
+    });
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => sessionId ?? randomUUID(),
+      // Answer POST requests with a single JSON body instead of an SSE stream:
+      // JSON-only clients (e.g. the AutoWonder executor) cannot parse SSE.
+      enableJsonResponse: true,
+      ...dnsRebinding,
+    });
+    const server = opts.createServer
+      ? opts.createServer(sessionPolicy)
+      : createMCPServer(backend, {
+          repositoryPolicy: sessionPolicy,
+          refreshIndex: opts.refreshIndex,
+        });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+
+    if (transport.sessionId) {
+      sessions.set(transport.sessionId, { server, transport, lastActivity: Date.now() });
+      const sid = transport.sessionId;
+      transport.onclose = () => {
+        sessions.delete(sid);
+      };
+    } else {
+      // The SDK rejected this request (e.g. 406 on a missing/invalid Accept header,
+      // 415 on a bad Content-Type) before assigning a session id. The Server was
+      // already connected but will never be stored, so the TTL sweep and cleanup()
+      // can't reclaim it — close it now to avoid an orphaned-Server leak.
+      try {
+        await server.close();
+      } catch {}
     }
   };
 

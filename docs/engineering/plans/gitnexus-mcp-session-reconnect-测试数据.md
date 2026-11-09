@@ -2,6 +2,7 @@
 
 - 任务：`gitnexus-mcp-session-reconnect`
 - 依据：`gitnexus-mcp-session-reconnect-澄清定稿.md`、`gitnexus-mcp-session-reconnect-验收条件与必测场景清单.md`
+- 2026-11-09 调整（task_tune）：新增 T09 复用旧 id、T10 非 initialize 未知 id 仍 404。
 - 说明：本文件同时是本次需求的验收用例清单。测试阶段逐条执行用例并回填「结论」，取值：通过 / 失败 / 不适用。
 
 ## 0. 数据形态说明
@@ -9,7 +10,7 @@
 本任务不读写业务数据库，不存在业务 SQL 造数。测试数据形态为：
 
 - **模拟 MCP 服务端**：可配置的 HTTP 夹具，返回 404 `-32001`（`Session not found. Re-initialize.`）或 200 initialize（响应头 `mcp-session-id`）。
-- **会话 id 字面量**：`old-session-id`、`non-existent-session-id`、`new-id-1`、`new-id-2`、`new-id-3`；只用于请求头与断言，不入库。
+- **会话 id 字面量**：`old-session-id`、`non-existent-session-id`、`new-id-1`、`new-id-2`、`new-id-3`；只用于请求头与断言，不入库。2026-11-09 调整新增“同一 id 复用”场景（T09）。
 - **运行时能力夹具**：可控（允许 Agent 触发 initialize 并读取新 id）与不可控（工具调用始终携带内部旧 id）两种。
 - **日志捕获**：`vi.spyOn(logger, 'warn')`；断言调用次数与字段，不落盘。
 - **技能文本**：`SKILL.md`、`references/shared/general-specs.md`、`references/flow-catalog.yml` 三处规则片段，用文本检索核对。
@@ -50,7 +51,7 @@
 
 无。依据：本调整点不查询任何数据库。
 
-## 2. 调整点 B：服务端 404 `-32001` 日志
+## 2. 调整点 B：服务端会话 404 日志与 session-id 复用
 
 涉及库.表：无（内存会话表 + stdout 日志）。
 
@@ -61,18 +62,22 @@
 | T06 `/mcp` 未知会话 warn | `http-transport.ts` `/mcp` 未知会话分支 | `mcp-session-id: non-existent-session-id` | 404 与响应体不变；`logger.warn` 1 次；字段 method/path/sessionId 前 8 位；无完整 id | 通过 |
 | T07 `/sse` 未知会话 warn | `http-transport.ts` `/sse` 未知会话分支 | `POST /messages?sessionId=unknown` | 404 与响应体不变；`logger.warn` 1 次；字段同 T06 | 通过 |
 | T08 已知会话不产生 warn | 两个分支的既有正常路径 | 有效会话 id | `logger.warn` 0 次；响应与改动前一致 | 通过 |
+| T09 未知 id 的 initialize 重建会话 | `http-transport.ts` `/mcp` 未知会话分支 | 实例重启后携带旧 `mcp-session-id` 重新 initialize | 200；响应头返回同一 id；后续请求成功；info 日志 1 次 | 通过 |
+| T10 非 initialize 未知 id 仍 404 | 同上 | `mcp-session-id: non-existent-session-id` + `tools/list` | 404；`-32001`；warn 1 次 | 通过 |
 
 ### 2.2 五类内容
 
 - **存量数据**：无。依据：只读取内存会话表与请求头，不读取数据库或持久化配置。
 - **新增数据**：`logger.warn` 输出字段 `method`、`path`、`sessionId` 前 8 位。
-- **边界数据**：未知 id；空 id（`/mcp` 走既有 400 分支，不在本次范围；`/sse` 空 id 与未知 id 共用 404 分支，会记录 `sessionId: null` 的 warn）；已知 id；`/mcp` 与 `/sse` 两条路径；session-id 长度小于 8 位时的截断。
+- **边界数据**：未知 id；空 id（`/mcp` 走既有 400 分支，不在本次范围；`/sse` 空 id 与未知 id 共用 404 分支，会记录 `sessionId: null` 的 warn）；已知 id；`/mcp` 与 `/sse` 两条路径；session-id 长度小于 8 位时的截断；未知 id 的 initialize（复用原 id）；未知 id 的非 initialize 请求（保持 404）。
 - **权限数据**：不适用。依据：不改鉴权与 401 行为，无角色差异。
 - **清理方式**：单测结束后 `cleanup()` 关闭 handler 与临时 server；内存会话表随 handler 销毁。
 
 ### 2.3 读取点覆盖
 
 - `http-transport.ts` `/mcp` 未知会话分支 → T06、T08。
+- `http-transport.ts` 未知 id 的 initialize 重建分支 → T09。
+- `http-transport.ts` 非 initialize 未知 id 分支 → T10。
 - `http-transport.ts` `/sse` 未知会话分支 → T07、T08。
 - 既有 404 响应契约 → T06、T07。
 
