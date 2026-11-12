@@ -80,7 +80,11 @@ export function getNextStepHint(
   const repoParam = repo ? `, repo: "${repo}"` : '';
   const repoPath = repo || '{name}';
 
-  if ((toolName === 'query' || toolName === 'search') && Array.isArray(repo)) {
+  const aggregateResult =
+    toolResult !== null &&
+    typeof toolResult === 'object' &&
+    Array.isArray((toolResult as Record<string, unknown>).per_repo);
+  if ((toolName === 'query' || toolName === 'search') && (Array.isArray(repo) || aggregateResult)) {
     const failed =
       toolResult !== null &&
       typeof toolResult === 'object' &&
@@ -314,7 +318,9 @@ export function createMCPServer(
             // Read-only `rename` is preview-only, so it follows the read-tool rule.
             ((tool.name === 'rename' && !readOnly) || tool.name === MCP_REFRESH_TOOL
               ? mutatingRequiresRepo
-              : readOnlyRequiresRepo) && REPO_SCOPED_TOOLS.has(tool.name)
+              : readOnlyRequiresRepo) &&
+            tool.name !== 'query' &&
+            REPO_SCOPED_TOOLS.has(tool.name)
               ? {
                   ...tool.inputSchema,
                   required: [...new Set([...tool.inputSchema.required, 'repo'])],

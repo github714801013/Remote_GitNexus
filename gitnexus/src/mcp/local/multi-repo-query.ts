@@ -2,10 +2,13 @@ import { QUERY_CONTENT_MAX_CHARS, QUERY_MAX_REPOSITORIES } from '../tools.js';
 import { SYMBOL_IDENTITY_RECOVERY_SUGGESTION } from './query-result-integrity.js';
 
 /** Validate the complete selection before resolution or search. */
-export function parseQueryRepositories(value: unknown): string[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > QUERY_MAX_REPOSITORIES) {
+export function parseQueryRepositories(
+  value: unknown,
+  maxRepositories: number = QUERY_MAX_REPOSITORIES,
+): string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > maxRepositories) {
     throw new Error(
-      `query.repo must contain between 1 and ${QUERY_MAX_REPOSITORIES} repositories.`,
+      `query.repo must contain between 1 and ${maxRepositories} repositories.`,
     );
   }
   return value.map((repo) => {
@@ -56,6 +59,11 @@ export function mergeRepositoryQueries(
       };
     })
     .sort((a, b) => compare(a.repo, b.repo));
+  const warnings = members.flatMap(({ repo, name, result }) =>
+    result.error === undefined
+      ? []
+      : [{ code: 'repository_search_failed' as const, repo, name, message: result.error }],
+  );
   const corrupt = members.find(
     ({ result }) =>
       result.error !== undefined &&
@@ -68,11 +76,18 @@ export function mergeRepositoryQueries(
       repos,
       per_repo,
       partial: true,
+      warnings,
     };
   }
   const successful = members.filter(({ result }) => result.error === undefined);
   if (successful.length === 0) {
-    return { error: 'Search failed in every selected repository.', repos, per_repo, partial: true };
+    return {
+      error: 'Search failed in every selected repository.',
+      repos,
+      per_repo,
+      partial: true,
+      warnings,
+    };
   }
 
   const withoutPreview = (row: QueryRow): QueryRow => {
@@ -134,6 +149,7 @@ export function mergeRepositoryQueries(
     process.symbol_count = count;
   }
 
+  let contentTruncated = false;
   if (options.includeContent) {
     const firstRows = new Map<string, TaggedRow>();
     for (const row of [...process_symbols, ...definitions]) {
@@ -148,8 +164,10 @@ export function mergeRepositoryQueries(
       // A preview boundary must not split a UTF-16 surrogate pair.
       if (/[\uD800-\uDBFF]$/u.test(content)) content = content.slice(0, -1);
       if (content.length > 0) row.content = content;
-      if (preview.truncated || content.length < preview.content.length)
+      if (preview.truncated || content.length < preview.content.length) {
         row.content_truncated = true;
+        contentTruncated = true;
+      }
     }
   }
   const counts = new Map(per_repo.map((entry) => [entry.repo, entry.returned]));
@@ -168,5 +186,7 @@ export function mergeRepositoryQueries(
         result.partial === true ||
         (typeof result.warning === 'string' && result.warning.length > 0),
     ),
+    ...(warnings.length > 0 ? { warnings } : {}),
+    ...(contentTruncated ? { truncated: true } : {}),
   };
 }

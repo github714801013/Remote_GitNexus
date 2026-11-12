@@ -18,7 +18,7 @@ const repoPath = (name: string) => path.resolve('/repos', name);
 const alpha = repoPath('alpha');
 const beta = repoPath('beta');
 
-function harness() {
+function harness(repoNames: string[] = ['alpha', 'beta']) {
   const backend = new LocalBackend();
   const internals = backend as unknown as {
     query: (repo: Handle, args: Record<string, unknown>) => Promise<QueryResult>;
@@ -53,15 +53,31 @@ function harness() {
     return release;
   });
   vi.spyOn(backend, 'listRepos').mockResolvedValue(
-    ['alpha', 'beta'].map((name) => ({
+    repoNames.map((name) => ({
       name,
       path: repoPath(name),
       indexedAt: '2026-01-01',
       lastCommit: 'abc',
     })),
   );
-  vi.spyOn(backend, 'countRepos').mockResolvedValue(2);
-  vi.spyOn(backend, 'cachedRepoCount').mockReturnValue(2);
+  vi.spyOn(backend, 'countRepos').mockResolvedValue(repoNames.length);
+  vi.spyOn(backend, 'cachedRepoCount').mockReturnValue(repoNames.length);
+  // The omission branch reads this cache directly; populate it without touching
+  // the on-disk registry.
+  (backend as unknown as { repos: Map<string, unknown> }).repos = new Map(
+    repoNames.map((name) => [
+      name,
+      {
+        id: name,
+        name,
+        repoPath: repoPath(name),
+        storagePath: `${repoPath(name)}/.gitnexus`,
+        lbugPath: `${repoPath(name)}/.gitnexus/lbug`,
+        lastCommit: 'abc',
+        indexedAt: '2026-01-01',
+      },
+    ]),
+  );
   return { backend, selection, query, pin, releases };
 }
 
@@ -99,7 +115,7 @@ describe('array query routing', () => {
   );
 
   it.each(
-    [[], ['alpha', ''], ['alpha', 3], ['alpha', '@group'], Array(11).fill('alpha')].map((repo) => ({
+    [['alpha', ''], ['alpha', 3], ['alpha', '@group'], Array(11).fill('alpha')].map((repo) => ({
       repo,
     })),
   )('rejects malformed selections before repository I/O: %j', async ({ repo }) => {
@@ -110,6 +126,70 @@ describe('array query routing', () => {
     expect(h.selection).not.toHaveBeenCalled();
     expect(h.query).not.toHaveBeenCalled();
     expect(h.pin).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, '', []])(
+    'treats an empty query repo as an internal fan-out over every registered repository: %j',
+    async (repo) => {
+      const h = harness();
+      const result = await h.backend.callTool('query', { repo, search_query: 'auth' });
+      expect(result.repos).toEqual([alpha, beta]);
+      expect(h.query).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each([null, '   '])(
+    'rejects an invalid empty query repo without repository I/O: %j',
+    async (repo) => {
+      const h = harness();
+      await expect(
+        h.backend.callTool('query', { repo, search_query: 'auth' }),
+      ).resolves.toHaveProperty('error');
+      expect(h.query).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([10, 11])('fans out %i repositories when query omits repo', async (count) => {
+    const names = Array.from({ length: count }, (_, index) => `repo-${index + 1}`);
+    const h = harness(names);
+    const result = await h.backend.callTool('query', { search_query: 'auth' });
+    expect(result.repos).toHaveLength(count);
+    expect(h.query).toHaveBeenCalledTimes(count);
+  });
+
+  it('degrades a partial repository failure into warnings', async () => {
+    const h = harness();
+    h.query.mockImplementation(async (repo) => {
+      if (repo.name === 'beta') throw new Error('offline');
+      return {
+        processes: [{ id: 'proc:shared' }],
+        process_symbols: [],
+        definitions: [],
+      };
+    });
+    const result = await h.backend.callTool('query', {
+      repo: ['alpha', 'beta'],
+      search_query: 'auth',
+    });
+    expect(result.partial).toBe(true);
+    expect(result.processes.map((row: { _repo: string }) => row._repo)).toEqual([alpha]);
+    expect(result.warnings).toEqual([
+      expect.objectContaining({
+        code: 'repository_search_failed',
+        repo: beta,
+      }),
+    ]);
+  });
+
+  it('returns an error with warnings when every repository fails', async () => {
+    const h = harness();
+    h.query.mockRejectedValue(new Error('offline'));
+    const result = await h.backend.callTool('query', {
+      repo: ['alpha', 'beta'],
+      search_query: 'auth',
+    });
+    expect(result.error).toBeTruthy();
+    expect(result.warnings).toHaveLength(2);
   });
 
   it.each([{ search_query: '' }, { limit: 0 }, { max_symbols: 201 }, { chain_depth: -1 }])(
@@ -264,7 +344,7 @@ describe('MCP array query policy and wire contract', () => {
         await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
         const response = await client.callTool({
           name,
-          arguments: { repo: [], search_query: 'auth' },
+          arguments: { repo: ['alpha', ''], search_query: 'auth' },
         });
         const text = (response.content as { text: string }[])[0]!.text;
         const [body, legacyHint] = text.split('\n\n---\n**Next:** ');
@@ -338,6 +418,72 @@ describe('MCP array query policy and wire contract', () => {
     expect(raw).toHaveBeenLastCalledWith('query', { repo: [beta], search_query: 'auth' });
   });
 
+  it('aggregates every allowed repository when query omits repo and points follow-ups at _repo', async () => {
+    const names = Array.from({ length: 11 }, (_, index) => `repo-${index + 1}`);
+    const h = harness(names);
+    const repositoryPolicy = await createMcpRepositoryPolicy(h.backend, {
+      GITNEXUS_MCP_ALLOWED_REPOS: names.join(','),
+    });
+    const server = createMCPServer(h.backend, { repositoryPolicy });
+    const client = new Client({ name: 'multi-repo-omitted-repo-test', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      const response = await client.callTool({
+        name: 'query',
+        arguments: { search_query: 'auth' },
+      });
+      expect(response.isError).not.toBe(true);
+      const text = (response.content as { text: string }[])[0]!.text;
+      const result = JSON.parse(text);
+      expect(result.repos).toEqual(names.map(repoPath).sort());
+      expect(result.per_repo).toHaveLength(11);
+      expect(result.next).toContain('context({uid: "<id>", repo: "<row._repo>"})');
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('returns a no_authorized_repos result and keeps other tools closed for an empty scope', async () => {
+    const h = harness();
+    const base = await createMcpRepositoryPolicy(h.backend, {
+      GITNEXUS_MCP_ALLOWED_REPOS: 'beta',
+    });
+    const scoped = base.forRequestScope({ projects: 'alpha', env: 'pro' });
+    const server = createMCPServer(h.backend, { repositoryPolicy: scoped });
+    const client = new Client({ name: 'multi-repo-empty-scope-test', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      const response = await client.callTool({
+        name: 'query',
+        arguments: { search_query: 'auth' },
+      });
+      expect(response.isError).not.toBe(true);
+      const result = JSON.parse((response.content as { text: string }[])[0]!.text);
+      expect(result).toMatchObject({
+        repos: [],
+        processes: [],
+        process_symbols: [],
+        definitions: [],
+        per_repo: [],
+        warnings: [{ code: 'no_authorized_repos' }],
+      });
+      const contextResponse = await client.callTool({
+        name: 'context',
+        arguments: { name: 'auth' },
+      });
+      expect(contextResponse.isError).toBe(true);
+      expect((contextResponse.content as { text: string }[])[0]!.text).toContain(
+        'No repositories match the MCP request scope',
+      );
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it.each([false, true])(
     'advertises arrays and preserves provenance through SDK filtering (readOnly=%s)',
     async (readOnly) => {
@@ -356,10 +502,16 @@ describe('MCP array query policy and wire contract', () => {
         expect(schema).toMatchObject({
           type: ['string', 'array'],
           items: { type: 'string', minLength: 1 },
-          minItems: 1,
           maxItems: 10,
         });
+        expect(schema.minItems).toBeUndefined();
         expect(schema.description).toMatch(/list|array/i);
+        expect(
+          listing.tools.find((tool) => tool.name === 'query')!.inputSchema.required,
+        ).not.toContain('repo');
+        expect(
+          listing.tools.find((tool) => tool.name === 'context')!.inputSchema.required,
+        ).toContain('repo');
         expect(
           listing.tools.find((tool) => tool.name === 'context')!.inputSchema.properties!.repo,
         ).toMatchObject({ type: 'string' });

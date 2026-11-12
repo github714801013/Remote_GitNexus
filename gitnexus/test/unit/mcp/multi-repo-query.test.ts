@@ -53,6 +53,10 @@ describe('query repository list validation', () => {
   });
   it('accepts ten selectors', () =>
     expect(parseQueryRepositories(Array(10).fill('a'))).toHaveLength(10));
+  it('accepts an unbounded internal fan-out selection', () =>
+    expect(
+      parseQueryRepositories(Array(36).fill('a'), Number.POSITIVE_INFINITY),
+    ).toHaveLength(36));
 });
 
 describe('multi-repository query merge', () => {
@@ -199,6 +203,14 @@ describe('multi-repository query merge', () => {
     ]);
     expect(result.partial).toBe(true);
     expect(result.processes).toHaveLength(1);
+    expect(result.warnings).toEqual([
+      {
+        code: 'repository_search_failed',
+        repo: '/failed',
+        name: '/failed',
+        message: 'unavailable',
+      },
+    ]);
     expect(result.per_repo).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ repo: '/failed', status: 'error', error: 'unavailable' }),
@@ -237,7 +249,34 @@ describe('multi-repository query merge', () => {
       error: expect.any(String),
       partial: true,
       per_repo: [expect.objectContaining({ error: 'offline' })],
+      warnings: [
+        expect.objectContaining({
+          code: 'repository_search_failed',
+          repo: '/bad',
+          message: 'offline',
+        }),
+      ],
     });
+  });
+  it('omits warnings when every member searched successfully', () => {
+    expect(merged([member('/a')])).not.toHaveProperty('warnings');
+  });
+  it('marks a content preview cut by the shared budget as truncated', () => {
+    const longContent = 'x'.repeat(20_000);
+    const result = merged([
+      member('/a', {
+        process_symbols: [
+          { id: 'symbol', process_id: 'process', content: longContent },
+        ],
+      }),
+    ]);
+    expect(result.truncated).toBe(true);
+    expect(result.process_symbols[0]?.content!.length).toBeGreaterThan(0);
+    expect(result.process_symbols[0]?.content!.length).toBeLessThanOrEqual(16_000);
+    expect(result.process_symbols[0]?.content_truncated).toBe(true);
+  });
+  it('does not mark truncated when content fits the shared budget', () => {
+    expect(merged([member('/a')])).not.toHaveProperty('truncated');
   });
   it('fails the aggregate on symbol-identity corruption without publishing hits', () => {
     const result = mergeRepositoryQueries(

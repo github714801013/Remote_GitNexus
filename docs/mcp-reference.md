@@ -222,6 +222,13 @@ query({
 });
 ```
 
+Omitting `repo`, passing an empty string, or passing an empty array searches
+every repository in the current MCP authorization scope and aggregates the
+results the same way; `null` and whitespace-only values are rejected. When the
+scope authorizes no repositories, the response is an empty aggregate with
+`warnings: [{ code: "no_authorized_repos" }]`. Only `query` supports this
+cross-repository behavior; other tools still require one repository.
+
 Array mode returns `repos`, `processes`, `process_symbols`, `definitions`,
 `per_repo`, and `partial`, even for a one-element list. Each result row carries
 `_repo`, the canonical checkout path. Symbol and process IDs remain local to their
@@ -241,6 +248,9 @@ repository: join attachments using both `_repo` and `process_id`. A process's
   Successful peers remain available; if every member fails, the response has a
   top-level error. Corrupt symbol identity fails the entire aggregate with recovery
   guidance.
+- Aggregated responses expose `warnings` for failed members (`code`, `repo`,
+  `name`, `message`) and set `truncated: true` when the shared content budget cut
+  source previews.
 - `response_sections` filters the combined data sections while retaining repository
   metadata. `maxTokens` applies once to the complete formatted response; truncation
   can cut JSON, as with scalar queries.
@@ -252,9 +262,11 @@ resolve for every member before any search starts. Explicit lists override MCP
 defaults and work in MCP read-only mode, subject to the server's repository allowlist.
 
 Arrays cannot contain `@group` selectors and are supported only by `query` and its
-legacy `search` alias. Other tools still take one repository. Scalar and omitted
-selectors keep their existing behavior; no repository-group configuration is needed
-for an explicit list.
+legacy `search` alias. Other tools still take one repository. An omitted selector,
+`""`, or `[]` searches every repository in the current authorization scope (one
+authorized repository keeps the single-repository envelope); an explicit scalar
+keeps its existing single-repository behavior. No repository-group configuration is
+needed for an explicit list.
 
 ### Context (360-degree Symbol View)
 

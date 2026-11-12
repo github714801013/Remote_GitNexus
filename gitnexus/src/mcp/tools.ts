@@ -194,9 +194,9 @@ Returns results grouped by process (execution flow):
 
 Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank Fusion.
 
-ARRAY MODE: repo accepts 1-${QUERY_MAX_REPOSITORIES} names/paths without @ entries; checkout aliases deduplicate. Even one member returns { repos, processes, process_symbols, definitions, per_repo, partial }. Rows carry canonical-path _repo: join (_repo, process_id) and pass repo: "<row._repo>" to context. Chains inherit _repo. Local ranks merge under a global process limit and 20-definition cap. Errors, warnings, timing, content availability and staleness stay in per_repo; partial flags failed/degraded members. Arrays obey allowlists and work in read-only mode.
+ARRAY MODE: repo accepts 1-${QUERY_MAX_REPOSITORIES} names/paths without @ entries; checkout aliases deduplicate. Even one member returns { repos, processes, process_symbols, definitions, per_repo, partial }. Rows carry canonical-path _repo: join (_repo, process_id) and pass repo: "<row._repo>" to context. Chains inherit _repo. Local ranks merge under a global process limit and 20-definition cap. Errors, warnings, timing, content availability and staleness stay in per_repo; partial flags failed/degraded members. Aggregated results also expose warnings (per failed repository) and truncated:true when the shared content budget cut previews. Arrays obey allowlists and work in read-only mode.
 
-REPOSITORY SCOPE: repo is optional. When omitted, query searches and aggregates all repositories in the current MCP authorization scope; it never widens the allowlist. Only query supports this cross-repository aggregation. Tools such as context, impact, and read_file remain single-repository operations.
+REPOSITORY SCOPE: repo is optional. When omitted, an empty string, or an empty array, query searches and aggregates all repositories in the current MCP authorization scope; it never widens the allowlist. null and whitespace-only values are rejected. Only query supports this cross-repository aggregation. Tools such as context, impact, and read_file remain single-repository operations.
 
 When zoekt is provided, Zoekt exact/regex/file-filter matches are fused into the same ranking.
 
@@ -273,9 +273,8 @@ ${HOT_READ_STALENESS_NOTE}`,
         repo: {
           type: ['string', 'array'],
           items: { type: 'string', minLength: 1 },
-          minItems: 1,
           maxItems: QUERY_MAX_REPOSITORIES,
-          description: `Indexed repository name or path, or a list of 1-${QUERY_MAX_REPOSITORIES} names/paths. Array entries must not use @group routing. Scalar group mode remains "@<groupName>" / "@<groupName>/<memberPath>" (member path keys from group.yaml). ${CWD_AWARE_REPO_OMISSION} Omit to search all repositories in the current MCP authorization scope; this does not bypass the allowlist.`,
+          description: `Indexed repository name or path, or a list of up to ${QUERY_MAX_REPOSITORIES} names/paths (an empty list is treated as omitted). Array entries must not use @group routing. Scalar group mode remains "@<groupName>" / "@<groupName>/<memberPath>" (member path keys from group.yaml). ${CWD_AWARE_REPO_OMISSION} Omit to search all repositories in the current MCP authorization scope; this does not bypass the allowlist.`,
         },
         service: {
           type: 'string',

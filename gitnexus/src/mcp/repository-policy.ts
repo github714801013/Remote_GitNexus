@@ -1,7 +1,10 @@
 import path from 'node:path';
 import type { LocalBackend, McpToolCallContext, RepoListing } from './local/local-backend.js';
 import { getAllowedEnvironments } from '../config/environment-policy.js';
-import { parseListReposPagination } from './local/local-backend.js';
+import {
+  INVALID_QUERY_REPOSITORY_MESSAGE,
+  parseListReposPagination,
+} from './local/local-backend.js';
 import { parseQueryRepositories } from './local/multi-repo-query.js';
 import { scrubGroupDescription } from './read-only-policy.js';
 import { LIST_REPOS_DEFAULT_LIMIT, LIST_REPOS_MAX_LIMIT } from './tools.js';
@@ -11,6 +14,8 @@ type GitNexusTool = (typeof GITNEXUS_TOOLS)[number];
 
 const CANONICAL_ALLOWED = 'GITNEXUS_MCP_ALLOWED_REPOS';
 const CANONICAL_DEFAULT = 'GITNEXUS_MCP_DEFAULT_REPO';
+const NO_SCOPE_REPOSITORIES_MESSAGE =
+  'No repositories match the MCP request scope available through this server.';
 
 interface RawRepositoryPolicy {
   allowed?: string[];
@@ -152,6 +157,30 @@ function unavailableRepositoryError(): Error {
   return new Error('Repository is not available through this MCP server.');
 }
 
+function isEmptyQueryRepository(repo: unknown): boolean {
+  return repo === '' || (Array.isArray(repo) && repo.length === 0);
+}
+
+function omitRepository(
+  params: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!params) return params;
+  const { repo: _repo, ...rest } = params;
+  return rest;
+}
+
+function emptyAuthorizedQueryResult(): Record<string, unknown> {
+  return {
+    repos: [],
+    processes: [],
+    process_symbols: [],
+    definitions: [],
+    per_repo: [],
+    partial: false,
+    warnings: [{ code: 'no_authorized_repos' }],
+  };
+}
+
 export class McpRepositoryPolicy {
   readonly restricted: boolean;
   readonly configured: boolean;
@@ -224,7 +253,9 @@ export class McpRepositoryPolicy {
         requestedNames.has(repo.name.toLowerCase()) && this.allowedPathKeys.has(repo.pathKey),
     );
     if (allowed.length === 0) {
-      throw new Error('No repositories match the MCP request scope available through this server.');
+      // Keep the session addressable so query can report an empty authorized
+      // scope; every other repo-scoped entry point still fails closed.
+      return new McpRepositoryPolicy(this.registry, [], undefined);
     }
 
     const defaultRepo = this.defaultRepo && allowed.some((repo) => repo.pathKey === this.defaultRepo?.pathKey)
@@ -243,6 +274,9 @@ export class McpRepositoryPolicy {
 
   private repoForArgs(args: Record<string, unknown> | undefined): ResolvedRepository | undefined {
     const explicit = args?.repo;
+    if (explicit === undefined && this.restricted && this.allowed.length === 0) {
+      throw new Error(NO_SCOPE_REPOSITORIES_MESSAGE);
+    }
     if (explicit !== undefined) {
       if (typeof explicit !== 'string') throw unavailableRepositoryError();
       if (explicit.trim().startsWith('@')) {
@@ -381,23 +415,47 @@ export class McpRepositoryPolicy {
     params: Record<string, unknown> | undefined,
     ...context: [McpToolCallContext?]
   ): Promise<unknown> {
-    if (Array.isArray(params?.repo) && method !== 'query' && method !== 'search') {
+    // `""` and `[]` are adapter-materialized omissions for query, not explicit
+    // repository selections. Normalize them before any array or authorization
+    // handling; `null` and whitespace-only values stay invalid.
+    const normalizedParams =
+      method === 'query' && isEmptyQueryRepository(params?.repo)
+        ? omitRepository(params)
+        : params;
+    if (
+      this.restricted &&
+      method === 'query' &&
+      (normalizedParams?.repo === null ||
+        (typeof normalizedParams?.repo === 'string' && normalizedParams.repo.trim() === ''))
+    ) {
+      // Policy layer owns restricted-mode validation; keep the same message as
+      // the backend so null/blank rejections never surface as "unavailable".
+      throw new Error(INVALID_QUERY_REPOSITORY_MESSAGE);
+    }
+    if (Array.isArray(normalizedParams?.repo) && method !== 'query' && method !== 'search') {
       throw new Error('Repository arrays are supported only by query (and legacy search).');
     }
-    if (!this.configured) return backend.callTool(method, params, ...context);
-    if (method === 'list_repos') return this.listReposPage(backend, params);
+    if (!this.configured) return backend.callTool(method, normalizedParams, ...context);
+    if (method === 'list_repos') return this.listReposPage(backend, normalizedParams);
     if (this.restricted && method.startsWith('group_')) {
       throw new Error('Group tools are unavailable when an MCP repository allowlist is set.');
     }
-    if (method === 'query' && this.restricted && params?.repo === undefined && this.allowed.length > 1) {
-      // 个性化：省略 repo 时按授权范围聚合；复用官方数组模式，不再自行合并结果。
-      return backend.callTool(
-        method,
-        { ...(params ?? {}), repo: this.allowed.map((repo) => repo.path) },
-        ...context,
-      );
+    if (
+      method === 'query' &&
+      this.restricted &&
+      normalizedParams?.repo === undefined
+    ) {
+      if (this.allowed.length === 0) return emptyAuthorizedQueryResult();
+      if (this.allowed.length > 1) {
+        // 个性化：省略 repo 时按授权范围聚合；内部聚合不受客户端 1–10 上限约束。
+        return backend.callTool(
+          method,
+          { ...(normalizedParams ?? {}), repo: this.allowed.map((repo) => repo.path) },
+          { ...(context[0] ?? {}), internalRepositoryFanout: true },
+        );
+      }
     }
-    return backend.callTool(method, this.normalizeToolArgs(params), ...context);
+    return backend.callTool(method, this.normalizeToolArgs(normalizedParams), ...context);
   }
 
   private async resolveRepo(

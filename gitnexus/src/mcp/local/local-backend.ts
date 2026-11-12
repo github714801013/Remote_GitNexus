@@ -168,6 +168,7 @@ import {
   QUERY_DEFAULT_MAX_SYMBOLS,
   QUERY_MAX_LIMIT,
   QUERY_MAX_MAX_SYMBOLS,
+  QUERY_MAX_REPOSITORIES,
   QUERY_CONTENT_MAX_CHARS,
   CONTEXT_CHAIN_MAX_DEPTH,
   CHECKOUT_SOURCE_TOOLS,
@@ -458,6 +459,9 @@ const TOOL_STRING_ALIASES: Readonly<Record<string, readonly StringAliasDefinitio
   trace: [{ canonical: 'from_file', aliases: ['file'] }],
 };
 
+export const INVALID_QUERY_REPOSITORY_MESSAGE =
+  'query.repo must be a non-empty indexed repository name or path, or omitted for global search.';
+
 function normalizeToolParams(
   method: string,
   params: unknown,
@@ -498,6 +502,15 @@ function normalizeToolParams(
 
   const folded = foldNumericToolArgumentAliases(method, normalized);
   if ('error' in folded) return folded;
+
+  if (method === 'query') {
+    const repo = folded.params.repo;
+    if (repo === '' || (Array.isArray(repo) && repo.length === 0)) {
+      delete folded.params.repo;
+    } else if (repo === null || (typeof repo === 'string' && repo.trim() === '')) {
+      return { error: INVALID_QUERY_REPOSITORY_MESSAGE };
+    }
+  }
 
   if (
     method === 'impact' &&
@@ -1385,6 +1398,12 @@ async function callableValueReferenceBoundaries(
 export interface McpToolCallContext {
   /** `refresh_index` progress, as the analyze worker reports it (percent 0-100). */
   onProgress?: (percent: number, message: string) => void;
+  /**
+   * The repository array was expanded by the server after authorization, not
+   * supplied by the client. Internal fan-out is not subject to the client-side
+   * 1-10 array cap.
+   */
+  internalRepositoryFanout?: boolean;
 }
 
 /** An error's message as one sentence, so further sentences can follow it. */
@@ -3633,7 +3652,14 @@ export class LocalBackend {
     if ('error' in normalized) return { error: normalized.error };
     const p = normalized.params;
 
-    if (Array.isArray(p.repo)) return this.queryRepositories(p);
+    if (Array.isArray(p.repo)) {
+      return this.queryRepositories(
+        p,
+        context.internalRepositoryFanout === true
+          ? Number.POSITIVE_INFINITY
+          : QUERY_MAX_REPOSITORIES,
+      );
+    }
 
     // #2175: Claude Code drops a tool-call argument named exactly "query", so the
     // query/cypher tools advertise "search_query"/"statement" while still accepting the
@@ -3671,10 +3697,13 @@ export class LocalBackend {
     // 不再维护一份独立的跨仓库发现与合并实现。
     // The caller's policy layer may narrow this set before reaching this backend.
     if (method === 'query' && p.repo === undefined && this.repos.size > 1) {
-      return this.queryRepositories({
-        ...p,
-        repo: [...this.repos.values()].map((repo) => repo.repoPath),
-      });
+      return this.queryRepositories(
+        {
+          ...p,
+          repo: [...this.repos.values()].map((repo) => repo.repoPath),
+        },
+        Number.POSITIVE_INFINITY,
+      );
     }
     let repo: RepoHandle;
     try {
@@ -4342,10 +4371,13 @@ export class LocalBackend {
   }
 
   /** Resolve the whole selection before opening a database, then lease only active members. */
-  private async queryRepositories(params: Record<string, unknown>) {
+  private async queryRepositories(
+    params: Record<string, unknown>,
+    maxRepositories: number = QUERY_MAX_REPOSITORIES,
+  ) {
     let specifiers: string[];
     try {
-      specifiers = parseQueryRepositories(params.repo);
+      specifiers = parseQueryRepositories(params.repo, maxRepositories);
     } catch (error) {
       return { error: (error as Error).message };
     }

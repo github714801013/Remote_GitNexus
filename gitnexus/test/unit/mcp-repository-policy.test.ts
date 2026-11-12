@@ -207,7 +207,7 @@ describe('MCP request repository scope', () => {
     expect(() => policy.forRequestScope({ projects: '*' })).toThrow(/invalid/i);
   });
 
-  it('intersects request scope with the global allowlist and fails on an empty intersection', async () => {
+  it('intersects request scope with the global allowlist and keeps an empty intersection addressable', async () => {
     const backend = createBackend(MAPPED_REPOS);
     const policy = await createMcpRepositoryPolicy(backend, {
       GITNEXUS_MCP_ALLOWED_REPOS: 'dev-oanew,oa-stock',
@@ -218,9 +218,16 @@ describe('MCP request repository scope', () => {
       'oa-stock',
     ]);
 
-    expect(() =>
-      policy.forRequestScope({ projects: 'oanew', env: 'pro' }),
-    ).toThrow(/no repositories match/i);
+    const emptyScope = policy.forRequestScope({ projects: 'oanew', env: 'pro' }).scopeBackend(backend);
+    await expect(emptyScope.listRepos()).resolves.toEqual([]);
+    await expect(emptyScope.callTool('query', { search_query: 'auth' })).resolves.toMatchObject({
+      repos: [],
+      per_repo: [],
+      warnings: [{ code: 'no_authorized_repos' }],
+    });
+    await expect(emptyScope.callTool('context', { name: 'auth' })).rejects.toThrow(
+      /no repositories match/i,
+    );
   });
 
   it('lets list_repos(isAll=true) inspect all index entries without widening tool scope', async () => {
@@ -258,10 +265,14 @@ describe('MCP repository policy', () => {
     await scoped.callTool('query', { search_query: 'auth' });
     // 省略 repo 的 query 复用官方数组模式，一次调用传入去重后的授权仓库列表。
     expect(backend.callTool).toHaveBeenCalledTimes(1);
-    expect(backend.callTool).toHaveBeenCalledWith('query', {
-      search_query: 'auth',
-      repo: ['/repos/alpha', '/repos/beta'],
-    });
+    expect(backend.callTool).toHaveBeenCalledWith(
+      'query',
+      {
+        search_query: 'auth',
+        repo: ['/repos/alpha', '/repos/beta'],
+      },
+      { internalRepositoryFanout: true },
+    );
     await scoped.callTool('context', { name: 'auth', repo: ' beta ' });
     expect(backend.callTool).toHaveBeenLastCalledWith('context', {
       name: 'auth',
@@ -311,6 +322,23 @@ describe('MCP repository policy', () => {
     });
   });
 
+  it('treats an omitted query as the only allowed repository', async () => {
+    const backend = createBackend();
+    const policy = await createMcpRepositoryPolicy(backend, {
+      GITNEXUS_MCP_ALLOWED_REPOS: 'Beta',
+    });
+    const scoped = policy.scopeBackend(backend);
+    await scoped.callTool('query', { search_query: 'auth' });
+    await scoped.callTool('query', { search_query: 'auth', repo: 'Beta' });
+    expect(vi.mocked(backend.callTool).mock.calls[0]).toEqual(
+      vi.mocked(backend.callTool).mock.calls[1],
+    );
+    expect(backend.callTool).toHaveBeenNthCalledWith(1, 'query', {
+      search_query: 'auth',
+      repo: '/repos/beta',
+    });
+  });
+
   it('allows query without repo to aggregate all allowed repositories', async () => {
     const backend = createBackend();
     const policy = await createMcpRepositoryPolicy(backend, {
@@ -320,14 +348,59 @@ describe('MCP repository policy', () => {
 
     const result = await scoped.callTool('query', { search_query: 'auth' });
     expect(backend.callTool).toHaveBeenCalledTimes(1);
-    expect(backend.callTool).toHaveBeenCalledWith('query', {
-      search_query: 'auth',
-      repo: ['/repos/alpha', '/repos/beta'],
-    });
+    expect(backend.callTool).toHaveBeenCalledWith(
+      'query',
+      {
+        search_query: 'auth',
+        repo: ['/repos/alpha', '/repos/beta'],
+      },
+      { internalRepositoryFanout: true },
+    );
     expect(result).toMatchObject({
       name: 'query',
       args: { search_query: 'auth', repo: ['/repos/alpha', '/repos/beta'] },
     });
+  });
+
+  it.each(['', []])(
+    'treats an adapter-materialized empty query repo as authorization-wide aggregation: %j',
+    async (repo) => {
+      const backend = createBackend();
+      const policy = await createMcpRepositoryPolicy(backend, {
+        GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,Beta',
+      });
+      await policy.scopeBackend(backend).callTool('query', { search_query: 'auth', repo });
+      expect(backend.callTool).toHaveBeenCalledWith(
+        'query',
+        { search_query: 'auth', repo: ['/repos/alpha', '/repos/beta'] },
+        { internalRepositoryFanout: true },
+      );
+    },
+  );
+
+  it.each([null, '   '])('rejects an invalid empty query repo: %j', async (repo) => {
+    const backend = createBackend();
+    const policy = await createMcpRepositoryPolicy(backend, {
+      GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,Beta',
+    });
+    await expect(
+      policy.scopeBackend(backend).callTool('query', { search_query: 'auth', repo }),
+    ).rejects.toThrow(/query\.repo must be a non-empty indexed repository name or path/);
+    expect(backend.callTool).not.toHaveBeenCalled();
+  });
+
+  it('keeps the client-supplied array cap at ten entries', async () => {
+    const backend = createBackend();
+    const policy = await createMcpRepositoryPolicy(backend, {
+      GITNEXUS_MCP_ALLOWED_REPOS: 'Alpha,Beta',
+    });
+    await expect(
+      policy.scopeBackend(backend).callTool('query', {
+        search_query: 'auth',
+        repo: Array.from({ length: 11 }, (_, index) => `/repos/r${index}`),
+      }),
+    ).rejects.toThrow(/between 1 and 10/);
+    expect(backend.callTool).not.toHaveBeenCalled();
   });
 
   it('aligns unrestricted schema with the refreshed snapshot when count and cache diverge', async () => {
@@ -360,10 +433,14 @@ describe('MCP repository policy', () => {
     });
     // 列表收缩后，省略 repo 的 query 仍按当前授权范围走官方数组模式。
     await policy.scopeBackend(backend).callTool('query', { search_query: 'auth' });
-    expect(backend.callTool).toHaveBeenCalledWith('query', {
-      search_query: 'auth',
-      repo: ['/repos/alpha', '/repos/beta'],
-    });
+    expect(backend.callTool).toHaveBeenCalledWith(
+      'query',
+      {
+        search_query: 'auth',
+        repo: ['/repos/alpha', '/repos/beta'],
+      },
+      { internalRepositoryFanout: true },
+    );
   });
 
   it('fails startup when the default is outside the allowlist after canonical resolution', async () => {
